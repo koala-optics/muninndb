@@ -91,6 +91,13 @@ type EngineInterface interface {
 	// scanned from the 0x23 reverse index. Results are limited to limit entries.
 	FindByEntity(ctx context.Context, vault, entityName string, limit int) ([]*storage.Engram, error)
 
+	// FindByConcept returns engrams whose Concept exactly matches the given
+	// string, scanned from the 0x29 concept reverse index. Hash collisions
+	// are filtered by full-Concept comparison. Soft-deleted and archived
+	// engrams are excluded. Results are sorted newest-first by ULID and
+	// capped to limit (default 1, max 50).
+	FindByConcept(ctx context.Context, vault, concept string, limit int) ([]*storage.Engram, error)
+
 	// CheckIdempotency looks up an op_id receipt. Returns nil, nil if not found.
 	CheckIdempotency(ctx context.Context, opID string) (*storage.IdempotencyReceipt, error)
 

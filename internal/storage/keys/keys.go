@@ -771,3 +771,32 @@ func ContentHashKey(ws [8]byte, hash [32]byte) []byte {
 	copy(key[9:41], hash[:])
 	return key
 }
+
+// ConceptIndexKey constructs the concept-text secondary index key (0x29 prefix).
+// Vault-scoped reverse index mapping (FNV-1a hash of Concept) -> engram ID.
+// Mirrors TagIndexKey (0x0C) / CreatorIndexKey (0x0D) — secondary index style:
+// scan a prefix, then hydrate candidates and compare full Concept string to
+// filter hash collisions. Concepts are NOT unique in MuninnDB (multiple writes
+// with same concept create distinct ULIDs), so this is many-to-one capable.
+// Key: 0x29 | wsPrefix(8) | conceptHash(4) | id(16) = 29 bytes
+// Value: empty
+func ConceptIndexKey(ws [8]byte, conceptHash uint32, id [16]byte) []byte {
+	key := make([]byte, 1+8+4+16)
+	key[0] = 0x29
+	copy(key[1:9], ws[:])
+	binary.BigEndian.PutUint32(key[9:13], conceptHash)
+	copy(key[13:29], id[:])
+	return key
+}
+
+// ConceptIndexPrefix returns the 13-byte scan prefix for a specific concept hash
+// in a vault. Use with pebble iterator LowerBound to locate all candidate
+// engrams that may match a given Concept string.
+// Prefix: 0x29 | wsPrefix(8) | conceptHash(4) = 13 bytes
+func ConceptIndexPrefix(ws [8]byte, conceptHash uint32) []byte {
+	prefix := make([]byte, 1+8+4)
+	prefix[0] = 0x29
+	copy(prefix[1:9], ws[:])
+	binary.BigEndian.PutUint32(prefix[9:13], conceptHash)
+	return prefix
+}

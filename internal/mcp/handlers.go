@@ -1712,3 +1712,49 @@ func (s *MCPServer) handleEntityTimeline(ctx context.Context, w http.ResponseWri
 	}
 	sendResult(w, id, textContent(mustJSON(timeline)))
 }
+
+func (s *MCPServer) handleFindByConcept(ctx context.Context, w http.ResponseWriter, id json.RawMessage, vault string, args map[string]any) {
+	concept, ok := args["concept"].(string)
+	if !ok || concept == "" {
+		sendError(w, id, -32602, "invalid params: 'concept' is required")
+		return
+	}
+	limit := 1
+	if v, ok := args["limit"].(float64); ok {
+		limit = int(v)
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > 50 {
+		limit = 50
+	}
+	engrams, err := s.engine.FindByConcept(ctx, vault, concept, limit)
+	if err != nil {
+		sendError(w, id, -32000, "tool error: "+err.Error())
+		return
+	}
+	type engramEntry struct {
+		ID        string `json:"id"`
+		Concept   string `json:"concept"`
+		Summary   string `json:"summary,omitempty"`
+		State     string `json:"state"`
+		CreatedAt string `json:"created_at"`
+	}
+	entries := make([]engramEntry, 0, len(engrams))
+	for _, e := range engrams {
+		entries = append(entries, engramEntry{
+			ID:        e.ID.String(),
+			Concept:   e.Concept,
+			Summary:   e.Summary,
+			State:     lifecycleStateLabel(e.State),
+			CreatedAt: e.CreatedAt.Format(time.RFC3339),
+		})
+	}
+	out, _ := json.Marshal(map[string]any{
+		"concept": concept,
+		"engrams": entries,
+		"count":   len(entries),
+	})
+	sendResult(w, id, textContent(string(out)))
+}

@@ -199,6 +199,12 @@ type EngineStore interface {
 	// a non-nil error or the index is exhausted.
 	ScanEntityEngrams(ctx context.Context, entityName string, fn func(ws [8]byte, engramID ULID) error) error
 
+	// ScanConceptIndex scans the 0x29 concept index for a single (vault, conceptHash)
+	// pair, calling fn for each candidate engram ID. Hash collisions are NOT filtered
+	// here — the caller must hydrate each engram and compare the full Concept string.
+	// Matches the pattern of TagIndex (0x0C) and CreatorIndex (0x0D).
+	ScanConceptIndex(ctx context.Context, wsPrefix [8]byte, conceptHash uint32, fn func(engramID ULID) error) error
+
 	// ScanEngramEntities scans the 0x20 forward index for all entities mentioned
 	// by the given engram in vault ws. Calls fn for each entity name.
 	ScanEngramEntities(ctx context.Context, ws [8]byte, engramID ULID, fn func(entityName string) error) error

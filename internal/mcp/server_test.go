@@ -121,6 +121,9 @@ func (f *fakeEngine) WhereLeftOff(_ context.Context, _ string, _ int) ([]WhereLe
 func (f *fakeEngine) FindByEntity(_ context.Context, _, _ string, _ int) ([]*storage.Engram, error) {
 	return nil, nil
 }
+func (f *fakeEngine) FindByConcept(_ context.Context, _, _ string, _ int) ([]*storage.Engram, error) {
+	return nil, nil
+}
 func (f *fakeEngine) CheckIdempotency(_ context.Context, _ string) (*storage.IdempotencyReceipt, error) {
 	return nil, nil
 }
@@ -278,8 +281,8 @@ func TestListTools(t *testing.T) {
 	var result map[string]any
 	json.NewDecoder(w.Body).Decode(&result)
 	tools, _ := result["tools"].([]any)
-	if len(tools) != 38 {
-		t.Errorf("expected 38 tools, got %d", len(tools))
+	if len(tools) != 39 {
+		t.Errorf("expected 39 tools, got %d", len(tools))
 	}
 }
 

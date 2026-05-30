@@ -910,10 +910,14 @@ func (s *MCPServer) handleFindByEntity(ctx context.Context, w http.ResponseWrite
 	if limit < 1 {
 		limit = 1
 	}
-	if limit > 50 {
-		limit = 50
+	if limit > 500 {
+		limit = 500 // raised from 50: callers (operator model builder) request up to 4000
 	}
-	engrams, err := s.engine.FindByEntity(ctx, vault, entityName, limit)
+	offset := 0
+	if v, ok := args["offset"].(float64); ok && v > 0 {
+		offset = int(v)
+	}
+	res, err := s.engine.FindByEntityPaged(ctx, vault, entityName, limit, offset)
 	if err != nil {
 		sendError(w, id, -32000, "tool error: "+err.Error())
 		return
@@ -924,8 +928,8 @@ func (s *MCPServer) handleFindByEntity(ctx context.Context, w http.ResponseWrite
 		Summary string `json:"summary,omitempty"`
 		State   string `json:"state"`
 	}
-	entries := make([]engramEntry, 0, len(engrams))
-	for _, e := range engrams {
+	entries := make([]engramEntry, 0, len(res.Engrams))
+	for _, e := range res.Engrams {
 		entries = append(entries, engramEntry{
 			ID:      e.ID.String(),
 			Concept: e.Concept,
@@ -933,10 +937,16 @@ func (s *MCPServer) handleFindByEntity(ctx context.Context, w http.ResponseWrite
 			State:   lifecycleStateLabel(e.State),
 		})
 	}
+	// Response is newest-first. `total` is the count of vault-scoped index
+	// entries for the entity (upper bound on live engrams); a client paginates
+	// by requesting offset += len(engrams) until offset >= total or a short page.
 	out, _ := json.Marshal(map[string]any{
 		"entity":  entityName,
 		"engrams": entries,
 		"count":   len(entries),
+		"total":   res.Total,
+		"offset":  res.Offset,
+		"limit":   res.Limit,
 	})
 	sendResult(w, id, textContent(string(out)))
 }

@@ -121,6 +121,9 @@ func (f *fakeEngine) WhereLeftOff(_ context.Context, _ string, _ int) ([]WhereLe
 func (f *fakeEngine) FindByEntity(_ context.Context, _, _ string, _ int) ([]*storage.Engram, error) {
 	return nil, nil
 }
+func (f *fakeEngine) FindByEntityPaged(_ context.Context, _, _ string, limit, offset int) (*engine.FindByEntityResult, error) {
+	return &engine.FindByEntityResult{Engrams: nil, Total: 0, Offset: offset, Limit: limit}, nil
+}
 func (f *fakeEngine) FindByConcept(_ context.Context, _, _ string, _ int) ([]*storage.Engram, error) {
 	return nil, nil
 }

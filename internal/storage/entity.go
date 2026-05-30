@@ -282,8 +282,25 @@ func (ps *PebbleStore) DeleteEntityEngramLink(ctx context.Context, ws [8]byte, e
 }
 
 // ScanEntityEngrams scans the 0x23 reverse index for all vault-scoped engrams
-// that mention the given entity name. Calls fn for each (ws, engramID) pair.
+// that mention the given entity name, in ascending engramID (oldest-first)
+// order. Calls fn for each (ws, engramID) pair.
 func (ps *PebbleStore) ScanEntityEngrams(ctx context.Context, entityName string, fn func(ws [8]byte, engramID ULID) error) error {
+	return ps.scanEntityEngrams(ctx, entityName, false, fn)
+}
+
+// ScanEntityEngramsReverse is identical to ScanEntityEngrams but walks the
+// reverse index in descending engramID order. Because engram IDs are ULIDs
+// (lexicographically time-sortable), this yields newest-first - the order a
+// "what's the latest about this entity" read wants. Added so FindByEntity can
+// return recent observations instead of being stuck on the oldest N behind a
+// fixed result cap.
+func (ps *PebbleStore) ScanEntityEngramsReverse(ctx context.Context, entityName string, fn func(ws [8]byte, engramID ULID) error) error {
+	return ps.scanEntityEngrams(ctx, entityName, true, fn)
+}
+
+// scanEntityEngrams is the shared implementation for the forward/reverse
+// variants above. reverse=true iterates Last()->Prev() instead of First()->Next().
+func (ps *PebbleStore) scanEntityEngrams(ctx context.Context, entityName string, reverse bool, fn func(ws [8]byte, engramID ULID) error) error {
 	nameHash := keys.EntityNameHash(entityName)
 	prefix := keys.EntityReverseIndexPrefix(nameHash)
 	upperBound := make([]byte, len(prefix))
@@ -301,18 +318,37 @@ func (ps *PebbleStore) ScanEntityEngrams(ctx context.Context, entityName string,
 	}
 	defer iter.Close()
 
-	for valid := iter.First(); valid; valid = iter.Next() {
+	decode := func() (proceed bool, err error) {
 		k := iter.Key()
 		if len(k) != 33 { // 1 + 8 + 8 + 16
-			continue
+			return true, nil
 		}
 		var ws [8]byte
 		copy(ws[:], k[9:17])
 		var idBytes [16]byte
 		copy(idBytes[:], k[17:33])
 		id := ULID(idBytes)
-		if err := fn(ws, id); err != nil {
+		if ferr := fn(ws, id); ferr != nil {
+			return false, ferr
+		}
+		return true, nil
+	}
+
+	if reverse {
+		for valid := iter.Last(); valid; valid = iter.Prev() {
+			if proceed, err := decode(); err != nil {
+				return err
+			} else if !proceed {
+				return nil
+			}
+		}
+		return nil
+	}
+	for valid := iter.First(); valid; valid = iter.Next() {
+		if proceed, err := decode(); err != nil {
 			return err
+		} else if !proceed {
+			return nil
 		}
 	}
 	return nil

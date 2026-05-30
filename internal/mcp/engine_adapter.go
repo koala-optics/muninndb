@@ -319,6 +319,10 @@ func (a *mcpEngineAdapter) FindByEntity(ctx context.Context, vault, entityName s
 	return a.eng.FindByEntity(ctx, vault, entityName, limit)
 }
 
+func (a *mcpEngineAdapter) FindByEntityPaged(ctx context.Context, vault, entityName string, limit, offset int) (*engine.FindByEntityResult, error) {
+	return a.eng.FindByEntityPaged(ctx, vault, entityName, limit, offset)
+}
+
 func (a *mcpEngineAdapter) FindByConcept(ctx context.Context, vault, concept string, limit int) ([]*storage.Engram, error) {
 	return a.eng.FindByConcept(ctx, vault, concept, limit)
 }

@@ -1221,6 +1221,21 @@ func (f *findByEntityEngine) FindByEntity(_ context.Context, _, name string, _ i
 	return nil, nil
 }
 
+// FindByEntityPaged mirrors FindByEntity for the PostgreSQL fixture. The handler
+// calls the paged variant, so this is the method the find_by_entity tests exercise.
+func (f *findByEntityEngine) FindByEntityPaged(_ context.Context, _, name string, limit, offset int) (*engine.FindByEntityResult, error) {
+	if name == "PostgreSQL" {
+		id := storage.NewULID()
+		return &engine.FindByEntityResult{
+			Engrams: []*storage.Engram{{ID: id, Concept: "DB choice", Summary: "Chose PostgreSQL"}},
+			Total:   1,
+			Offset:  offset,
+			Limit:   limit,
+		}, nil
+	}
+	return &engine.FindByEntityResult{Engrams: nil, Total: 0, Offset: offset, Limit: limit}, nil
+}
+
 func TestHandleFindByEntity_HappyPath(t *testing.T) {
 	srv := newTestServerWith(&findByEntityEngine{})
 	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_find_by_entity","arguments":{"vault":"default","entity_name":"PostgreSQL"}}}`
@@ -1287,7 +1302,8 @@ func TestHandleFindByEntity_NoResults(t *testing.T) {
 
 type findByEntityCapturingEngine struct {
 	fakeEngine
-	lastLimit int
+	lastLimit  int
+	lastOffset int
 }
 
 func (f *findByEntityCapturingEngine) FindByEntity(_ context.Context, _, _ string, limit int) ([]*storage.Engram, error) {
@@ -1295,14 +1311,33 @@ func (f *findByEntityCapturingEngine) FindByEntity(_ context.Context, _, _ strin
 	return []*storage.Engram{}, nil
 }
 
+func (f *findByEntityCapturingEngine) FindByEntityPaged(_ context.Context, _, _ string, limit, offset int) (*engine.FindByEntityResult, error) {
+	f.lastLimit = limit
+	f.lastOffset = offset
+	return &engine.FindByEntityResult{Engrams: []*storage.Engram{}, Total: 0, Offset: offset, Limit: limit}, nil
+}
+
 func TestHandleFindByEntity_LimitCapped(t *testing.T) {
 	eng := &findByEntityCapturingEngine{}
 	srv := newTestServerWith(eng)
-	// Request limit=999; handler must cap to 50 before calling engine.
+	// Request limit=999; handler must cap to 500 before calling engine.
 	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_find_by_entity","arguments":{"vault":"default","entity_name":"TestEntity","limit":999}}}`
 	postRPC(t, srv, body)
-	if eng.lastLimit != 50 {
-		t.Errorf("expected engine to receive limit=50 after capping, got %d", eng.lastLimit)
+	if eng.lastLimit != 500 {
+		t.Errorf("expected engine to receive limit=500 after capping, got %d", eng.lastLimit)
+	}
+}
+
+func TestHandleFindByEntity_OffsetPassed(t *testing.T) {
+	eng := &findByEntityCapturingEngine{}
+	srv := newTestServerWith(eng)
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_find_by_entity","arguments":{"vault":"default","entity_name":"TestEntity","limit":10,"offset":30}}}`
+	postRPC(t, srv, body)
+	if eng.lastOffset != 30 {
+		t.Errorf("expected engine to receive offset=30, got %d", eng.lastOffset)
+	}
+	if eng.lastLimit != 10 {
+		t.Errorf("expected engine to receive limit=10, got %d", eng.lastLimit)
 	}
 }
 
@@ -1648,6 +1683,9 @@ func (e *slowIdempotentEngine) WhereLeftOff(ctx context.Context, vault string, l
 }
 func (e *slowIdempotentEngine) FindByEntity(ctx context.Context, vault, entityName string, limit int) ([]*storage.Engram, error) {
 	return (&fakeEngine{}).FindByEntity(ctx, vault, entityName, limit)
+}
+func (e *slowIdempotentEngine) FindByEntityPaged(ctx context.Context, vault, entityName string, limit, offset int) (*engine.FindByEntityResult, error) {
+	return (&fakeEngine{}).FindByEntityPaged(ctx, vault, entityName, limit, offset)
 }
 func (e *slowIdempotentEngine) SetEntityState(ctx context.Context, entityName, state, mergedInto, entityType string) error {
 	return (&fakeEngine{}).SetEntityState(ctx, entityName, state, mergedInto, entityType)

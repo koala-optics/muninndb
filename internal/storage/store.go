@@ -195,9 +195,14 @@ type EngineStore interface {
 	RelinkEntityEngramLink(ctx context.Context, ws [8]byte, engramID ULID, fromEntity, toEntity string) error
 
 	// ScanEntityEngrams scans the 0x23 reverse index for all vault-scoped (ws, engramID)
-	// pairs that mention the given entity name. Calls fn for each pair until fn returns
-	// a non-nil error or the index is exhausted.
+	// pairs that mention the given entity name, oldest-first. Calls fn for each pair until
+	// fn returns a non-nil error or the index is exhausted.
 	ScanEntityEngrams(ctx context.Context, entityName string, fn func(ws [8]byte, engramID ULID) error) error
+
+	// ScanEntityEngramsReverse is ScanEntityEngrams in descending (newest-first) engramID
+	// order. Used by FindByEntity so a capped read returns the most recent observations
+	// rather than the oldest.
+	ScanEntityEngramsReverse(ctx context.Context, entityName string, fn func(ws [8]byte, engramID ULID) error) error
 
 	// ScanConceptIndex scans the 0x29 concept index for a single (vault, conceptHash)
 	// pair, calling fn for each candidate engram ID. Hash collisions are NOT filtered

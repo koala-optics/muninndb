@@ -87,9 +87,15 @@ type EngineInterface interface {
 	// LastAccess descending. limit caps results (default 10, max 50).
 	WhereLeftOff(ctx context.Context, vault string, limit int) ([]WhereLeftOffEntry, error)
 
-	// FindByEntity returns all engrams that mention the given entity name,
-	// scanned from the 0x23 reverse index. Results are limited to limit entries.
+	// FindByEntity returns engrams that mention the given entity name, scanned
+	// newest-first from the 0x23 reverse index, capped to limit entries.
 	FindByEntity(ctx context.Context, vault, entityName string, limit int) ([]*storage.Engram, error)
+
+	// FindByEntityPaged is FindByEntity with offset-based pagination and a total
+	// count. Results are newest-first; offset entries are skipped before limit
+	// are returned. Total is the count of vault-scoped index entries for the
+	// entity (upper bound on live engrams), letting a caller detect more pages.
+	FindByEntityPaged(ctx context.Context, vault, entityName string, limit, offset int) (*engine.FindByEntityResult, error)
 
 	// FindByConcept returns engrams whose Concept exactly matches the given
 	// string, scanned from the 0x29 concept reverse index. Hash collisions

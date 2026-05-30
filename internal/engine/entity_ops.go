@@ -47,11 +47,14 @@ func (e *Engine) GetEntityAggregate(ctx context.Context, vault, entityName strin
 
 	ws := e.store.ResolveVaultPrefix(vault)
 
-	// 2. Engrams that mention this entity (vault-scoped via ScanEntityEngrams reverse index)
+	// 2. Engrams that mention this entity (vault-scoped). Scan NEWEST-first so a
+	// capped entity profile surfaces the most RECENT mentions, not the oldest.
+	// (Previously used the forward/oldest-first scan despite the comment claiming
+	// "reverse" - so profiles of high-mention entities showed only stale history.)
 	var engrams []*storage.Engram
-	scanErr := e.store.ScanEntityEngrams(ctx, entityName, func(gotWS [8]byte, id storage.ULID) error {
+	scanErr := e.store.ScanEntityEngramsReverse(ctx, entityName, func(gotWS [8]byte, id storage.ULID) error {
 		if gotWS != ws {
-			return nil // different vault — skip
+			return nil // different vault - skip
 		}
 		if len(engrams) >= limit {
 			return fmt.Errorf("limit reached") // sentinel to stop scanning

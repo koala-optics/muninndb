@@ -27,9 +27,12 @@ type EntityTimeline struct {
 }
 
 // GetEntityTimeline returns a chronological view of when an entity first appeared
-// in memory and how it has evolved. Scans the entity reverse index (0x23) to find
-// all engrams mentioning the entity, then collects timeline entries sorted by
-// creation time (oldest first). Results are capped at limit.
+// in memory and how it has evolved. Scans the entity reverse index (0x23)
+// NEWEST-first so that when the result is capped at limit we keep the most
+// RECENT `limit` mentions (then present them oldest-first for display). The
+// earlier implementation scanned oldest-first and capped during the scan, so an
+// entity with more than `limit` mentions only ever showed its oldest events and
+// hid all recent history - the same truncation class as the find_by_entity bug.
 func (e *Engine) GetEntityTimeline(ctx context.Context, vault string, entityName string, limit int) (*EntityTimeline, error) {
 	if entityName == "" {
 		return nil, fmt.Errorf("entity_name is required")
@@ -53,11 +56,12 @@ func (e *Engine) GetEntityTimeline(ctx context.Context, vault string, entityName
 	// Resolve the vault prefix.
 	ws := e.store.ResolveVaultPrefix(vault)
 
-	// Scan all engrams mentioning this entity.
+	// Scan engrams mentioning this entity NEWEST-first, so the cap below keeps
+	// the most recent `limit` mentions rather than the oldest.
 	var entries []TimelineEntry
-	err = e.store.ScanEntityEngrams(ctx, entityName, func(gotWS [8]byte, id storage.ULID) error {
+	err = e.store.ScanEntityEngramsReverse(ctx, entityName, func(gotWS [8]byte, id storage.ULID) error {
 		if gotWS != ws {
-			return nil // different vault — skip
+			return nil // different vault - skip
 		}
 		if len(entries) >= limit {
 			return fmt.Errorf("limit reached") // sentinel to stop scanning

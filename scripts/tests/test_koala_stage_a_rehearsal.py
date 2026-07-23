@@ -199,6 +199,20 @@ class StageAContractTests(unittest.TestCase):
         command = runtime.popen.call_args.args[0]
         self.assertEqual(command[command.index("--bind-addr") + 1], "127.0.0.1")
 
+    def test_initialize_waits_for_proxy_readiness_and_then_succeeds(self):
+        client = stage.MCPClient("http://127.0.0.1:18750/mcp", "synthetic")
+        client._post = mock.Mock(side_effect=[stage.RehearsalUnknown("not ready"), {}])
+        with mock.patch.object(stage.time, "sleep"):
+            client.initialize(timeout_s=10)
+        self.assertEqual(client._post.call_count, 2)
+
+    def test_initialize_fails_closed_at_readiness_deadline(self):
+        client = stage.MCPClient("http://127.0.0.1:18750/mcp", "synthetic")
+        client._post = mock.Mock(side_effect=stage.RehearsalUnknown("not ready"))
+        with mock.patch.object(stage.time, "monotonic", side_effect=[0, 0, 2]), mock.patch.object(stage.time, "sleep"):
+            with self.assertRaisesRegex(stage.RehearsalUnknown, "readiness deadline"):
+                client.initialize(timeout_s=1)
+
     def test_dry_run_makes_no_runtime_or_network_calls(self):
         with mock.patch.object(stage, "FlyRuntime", side_effect=AssertionError("runtime constructed")), mock.patch.object(stage.urllib.request, "urlopen", side_effect=AssertionError("network")):
             self.assertEqual(stage.main(["--run-id", "dry-run-test", "--json"]), 0)

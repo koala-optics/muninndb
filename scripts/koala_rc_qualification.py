@@ -396,7 +396,8 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
     candidate = validate_image_ref(args.candidate_image)
     baseline = validate_image_ref(args.baseline_image, BASELINE_REPOSITORIES)
     work_dir, temporary = prepare_work_directory(args.work_dir)
-    data_dir, backup_dir = work_dir / "data", work_dir / "backup"
+    data_dir = work_dir / "data"
+    backup_parent, backup_dir = work_dir / "backup-output", work_dir / "backup-output" / "backup"
     env_file, logs_dir = work_dir / "synthetic.env", work_dir / "logs"
     token, network = secrets.token_urlsafe(32), f"koala-rc-{secrets.token_hex(6)}"
     manifest = synthetic_manifest()
@@ -511,10 +512,10 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         gate(receipt, "hard_delete_cleanup",
             command_output_sha256=hashlib.sha256(hard_delete.stdout.encode()).hexdigest())
 
-        backup_dir.mkdir(mode=0o700)
-        backup_dir.chmod(0o777)
+        backup_parent.mkdir(mode=0o700)
+        backup_parent.chmod(0o777)
         backup = offline_command(candidate, work_dir, [
-            "backup", "--data-dir", "/work/data", "--output", "/work/backup"])
+            "backup", "--data-dir", "/work/data", "--output", "/work/backup-output/backup"])
         if not (backup_dir / "pebble").is_dir():
             raise QualificationError("offline backup did not produce a Pebble checkpoint")
         active = new_container(name="koala-rc-restore", image=candidate, data_dir=backup_dir,

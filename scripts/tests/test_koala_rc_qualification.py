@@ -193,11 +193,12 @@ class QualificationSafetyTests(unittest.TestCase):
 
     def test_backup_destination_is_container_writable_before_offline_backup(self) -> None:
         source = MODULE_PATH.read_text(encoding="utf-8")
-        prepare = source.index("backup_dir.mkdir(mode=0o700)")
-        chmod = source.index("backup_dir.chmod(0o777)", prepare)
+        prepare = source.index("backup_parent.mkdir(mode=0o700)")
+        chmod = source.index("backup_parent.chmod(0o777)", prepare)
         invoke = source.index("backup = offline_command", chmod)
         self.assertLess(prepare, chmod)
         self.assertLess(chmod, invoke)
+        self.assertIn('"--output", "/work/backup-output/backup"', source[invoke:])
 
     def test_explicit_work_directory_must_be_empty(self) -> None:
         with tempfile.TemporaryDirectory() as root:

@@ -1,0 +1,176 @@
+name: Koala RC Qualify
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: Non-v Koala source tag to qualify
+        required: true
+        default: koala-v0.9.0-rc.1
+        type: string
+      source_commit:
+        description: Exact 40-character source commit
+        required: true
+        type: string
+      baseline_image:
+        description: Digest-pinned stock v0.9 baseline image
+        required: true
+        default: ghcr.io/scrypster/muninndb@sha256:1c4995f489bbb21590190bf9bcc45b5ed25cd4f24c50b46d0297fcd8fdc37053
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: koala-rc-qualify-${{ inputs.source_tag }}
+  cancel-in-progress: false
+
+env:
+  RC_TAG: koala-v0.9.0-rc.1
+  RC_IMAGE: ghcr.io/koala-optics/muninndb:koala-v0.9.0-rc.1-amd64
+  QUALIFICATION_DIR: /tmp/koala-rc-qualification
+
+jobs:
+  qualify:
+    name: Build and qualify immutable amd64 candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Validate immutable source inputs
+        shell: bash
+        env:
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_TAG: ${{ inputs.source_tag }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          BASELINE_IMAGE: ${{ inputs.baseline_image }}
+        run: |
+          set -euo pipefail
+          [[ "$REPOSITORY" == "koala-optics/muninndb" ]]
+          [[ "$SOURCE_TAG" == "$RC_TAG" ]]
+          [[ "$SOURCE_TAG" != v* ]]
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$BASELINE_IMAGE" =~ ^ghcr.io/(scrypster|koala-optics)/muninndb@sha256:[0-9a-f]{64}$ ]]
+
+      - name: Check out dispatched workflow ref
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Verify source tag and commit
+        shell: bash
+        env:
+          SOURCE_TAG: ${{ inputs.source_tag }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          git fetch --force --no-tags origin "refs/tags/$SOURCE_TAG:refs/tags/$SOURCE_TAG"
+          test "$(git rev-parse "$SOURCE_TAG^{commit}")" = "$SOURCE_COMMIT"
+
+      - name: Run harness contract tests
+        run: python3 scripts/tests/test_koala_rc_qualification.py
+
+      - name: Run source checks
+        shell: bash
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          set -euo pipefail
+          python3 -m py_compile scripts/koala_rc_qualification.py scripts/tests/test_koala_rc_qualification.py
+          git diff --check "$SOURCE_COMMIT^" "$SOURCE_COMMIT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+
+      - name: Log in to Koala GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish explicit candidate tag
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: ${{ env.RC_IMAGE }}
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=koala-rc-amd64
+          cache-to: type=gha,mode=max,scope=koala-rc-amd64
+          labels: |
+            org.opencontainers.image.revision=${{ inputs.source_commit }}
+            org.opencontainers.image.version=${{ inputs.source_tag }}
+            org.opencontainers.image.source=https://github.com/koala-optics/muninndb
+
+      - name: Resolve immutable image and asset receipts
+        id: receipt
+        shell: bash
+        env:
+          BUILD_DIGEST: ${{ steps.build.outputs.digest }}
+          BASELINE_IMAGE: ${{ inputs.baseline_image }}
+        run: |
+          set -euo pipefail
+          [[ "$BUILD_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          candidate_ref="ghcr.io/koala-optics/muninndb@$BUILD_DIGEST"
+          docker pull "$candidate_ref"
+          test "$(docker buildx imagetools inspect "$RC_IMAGE" --format '{{json .Manifest.Digest}}' | tr -d '"')" = "$BUILD_DIGEST"
+          mkdir -p "$QUALIFICATION_DIR"
+          printf '%s\n' "$candidate_ref" > "$QUALIFICATION_DIR/candidate-image.txt"
+          printf '%s\n' "$BASELINE_IMAGE" > "$QUALIFICATION_DIR/baseline-image.txt"
+          printf 'candidate_ref=%s\n' "$candidate_ref" >> "$GITHUB_OUTPUT"
+          printf 'go_version=%s\n' "$(awk '/^FROM golang:/{sub(/^golang:/, "", $2); sub(/-.*/, "", $2); print $2; exit}' Dockerfile)" >> "$GITHUB_OUTPUT"
+          make fetch-model _ort-linux-amd64
+          sha256sum internal/plugin/embed/assets/model_int8.onnx | awk '{print $1}' > "$QUALIFICATION_DIR/model.sha256"
+          sha256sum internal/plugin/embed/assets/tokenizer.json | awk '{print $1}' > "$QUALIFICATION_DIR/tokenizer.sha256"
+          sha256sum internal/plugin/embed/assets/libonnxruntime_linux_amd64.so | awk '{print $1}' > "$QUALIFICATION_DIR/onnxruntime.sha256"
+
+      - name: Run synthetic migration and durability qualification
+        shell: bash
+        env:
+          CANDIDATE_IMAGE: ${{ steps.receipt.outputs.candidate_ref }}
+          BASELINE_IMAGE: ${{ inputs.baseline_image }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          SOURCE_TAG: ${{ inputs.source_tag }}
+          GO_VERSION: ${{ steps.receipt.outputs.go_version }}
+        run: |
+          set -euo pipefail
+          python3 scripts/koala_rc_qualification.py \
+            --candidate-image "$CANDIDATE_IMAGE" \
+            --baseline-image "$BASELINE_IMAGE" \
+            --source-commit "$SOURCE_COMMIT" \
+            --source-tag "$SOURCE_TAG" \
+            --go-version "$GO_VERSION" \
+            --model-sha256 "$(<"$QUALIFICATION_DIR/model.sha256")" \
+            --tokenizer-sha256 "$(<"$QUALIFICATION_DIR/tokenizer.sha256")" \
+            --onnxruntime-sha256 "$(<"$QUALIFICATION_DIR/onnxruntime.sha256")" \
+            --work-dir "$QUALIFICATION_DIR/work" \
+            --keep-work-dir \
+            --output "$QUALIFICATION_DIR/receipt.json"
+          python3 - <<'PY'
+          import hashlib
+          from pathlib import Path
+          path = Path("/tmp/koala-rc-qualification/receipt.json")
+          Path("/tmp/koala-rc-qualification/receipt.sha256").write_text(
+              hashlib.sha256(path.read_bytes()).hexdigest() + "\n", encoding="utf-8"
+          )
+          PY
+
+      - name: Upload qualification receipts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: koala-v0.9.0-rc.1-amd64-qualification
+          path: |
+            /tmp/koala-rc-qualification/receipt.json
+            /tmp/koala-rc-qualification/receipt.sha256
+            /tmp/koala-rc-qualification/candidate-image.txt
+            /tmp/koala-rc-qualification/baseline-image.txt
+            /tmp/koala-rc-qualification/*.sha256
+            /tmp/koala-rc-qualification/work/logs/*.log
+          if-no-files-found: warn
+          retention-days: 30

@@ -52,9 +52,11 @@ jobs:
           [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
           [[ "$BASELINE_IMAGE" =~ ^ghcr.io/(scrypster|koala-optics)/muninndb@sha256:[0-9a-f]{64}$ ]]
 
-      - name: Check out dispatched workflow ref
+      - name: Check out exact source commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
+          ref: ${{ inputs.source_commit }}
+          fetch-depth: 2
           persist-credentials: false
 
       - name: Verify source tag and commit

@@ -74,7 +74,10 @@ class Container:
                 if state.startswith(("exited", "dead")):
                     raise QualificationError(f"container {self.name} exited before readiness: {state}")
                 try:
-                    with urllib.request.urlopen(f"{self.mcp_url}/health", timeout=1.0) as response:
+                    request = urllib.request.Request(f"{self.mcp_url}/health")
+                    with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(
+                        request, timeout=1.0,
+                    ) as response:
                         body = json.loads(response.read().decode("utf-8"))
                     if body.get("status") == "ok":
                         return
@@ -125,7 +128,9 @@ class MCPClient:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(
+                request, timeout=self.timeout,
+            ) as response:
                 parsed = json.loads(response.read().decode("utf-8"))
         except (OSError, ValueError, urllib.error.URLError) as exc:
             raise QualificationError(f"MCP transport failure: {exc}") from exc

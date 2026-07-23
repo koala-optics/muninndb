@@ -79,6 +79,17 @@ class QualificationSafetyTests(unittest.TestCase):
         for marker in qualification.PRODUCTION_MARKERS:
             self.assertNotIn(marker, encoded)
 
+    def test_loopback_http_disables_environment_proxies(self) -> None:
+        client = qualification.MCPClient("http://127.0.0.1:43123/mcp", "synthetic", 1)
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"jsonrpc":"2.0","id":1,"result":{}}'
+        opener = mock.MagicMock()
+        opener.open.return_value = response
+        with mock.patch.object(qualification.urllib.request, "build_opener", return_value=opener) as build:
+            client._post({"jsonrpc": "2.0", "id": 1, "method": "initialize"})
+        proxy_handler = build.call_args.args[0]
+        self.assertEqual(proxy_handler.proxies, {})
+
     def test_mcp_client_rejects_non_loopback_endpoint(self) -> None:
         with self.assertRaises(qualification.QualificationError):
             qualification.MCPClient("https://production.example/mcp", "synthetic", 1)

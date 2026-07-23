@@ -516,8 +516,6 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         backup_parent.chmod(0o777)
         backup = offline_command(candidate, work_dir, [
             "backup", "--data-dir", "/work/data", "--output", "/work/backup-output/backup"])
-        if not (backup_dir / "pebble").is_dir():
-            raise QualificationError("offline backup did not produce a Pebble checkpoint")
         active = new_container(name="koala-rc-restore", image=candidate, data_dir=backup_dir,
             network=network, env_file=env_file, logs_dir=logs_dir)
         client = start_client(active, token, args)

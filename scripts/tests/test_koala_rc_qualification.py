@@ -200,6 +200,13 @@ class QualificationSafetyTests(unittest.TestCase):
         self.assertLess(chmod, invoke)
         self.assertIn('"--output", "/work/backup-output/backup"', source[invoke:])
 
+    def test_backup_validation_uses_restore_container_not_host_traversal(self) -> None:
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        self.assertNotIn('(backup_dir / "pebble").is_dir()', source)
+        restore = source.index('name="koala-rc-restore"')
+        verification = source.index("verify_lookup_state", restore)
+        self.assertLess(restore, verification)
+
     def test_explicit_work_directory_must_be_empty(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             occupied = Path(root) / "occupied"

@@ -64,6 +64,16 @@ class Container:
             name=self.name, image=self.image, data_dir=self.data_dir,
             network=self.network, host_port=self.host_port, env_file=self.env_file,
         ))
+        mapping = run_command(
+            ["docker", "port", self.name, "8750/tcp"], check=False,
+        ).stdout.strip()
+        expected_mapping = f"127.0.0.1:{self.host_port}"
+        if expected_mapping not in mapping.splitlines():
+            self.capture_logs()
+            self.remove(force=True)
+            raise QualificationError(
+                f"host loopback publish missing for {self.name}: {mapping!r}"
+            )
         deadline = time.monotonic() + timeout
         try:
             while time.monotonic() < deadline:

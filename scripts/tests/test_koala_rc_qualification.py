@@ -92,10 +92,41 @@ class QualificationSafetyTests(unittest.TestCase):
                     mock.patch.object(qualification.socket, "create_connection", return_value=connection) as connect:
                 run.side_effect = [
                     subprocess.CompletedProcess([], 0, "container-id\n", ""),
+                    subprocess.CompletedProcess([], 0, "127.0.0.1:43123\n", ""),
                     subprocess.CompletedProcess([], 0, "running 0\n", ""),
                 ]
                 container.start(timeout=1)
+            self.assertEqual(
+                run.call_args_list[1].args[0],
+                ["docker", "port", "rc-test", "8750/tcp"],
+            )
             connect.assert_called_once_with(("127.0.0.1", 43123), timeout=1.0)
+
+    def test_container_start_fails_immediately_without_loopback_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            container = qualification.Container(
+                "rc-test", "ghcr.io/koala-optics/muninndb@sha256:" + "a" * 64,
+                Path(root), "network", 43123,
+                Path(root) / "env", Path(root) / "container.log",
+            )
+            responses = [
+                subprocess.CompletedProcess([], 0, "container-id\n", ""),
+                subprocess.CompletedProcess([], 0, "", ""),
+                subprocess.CompletedProcess([], 0, "startup log\n", ""),
+                subprocess.CompletedProcess([], 0, "", ""),
+            ]
+            with mock.patch.object(qualification, "run_command", side_effect=responses) as run, \
+                    mock.patch.object(qualification.socket, "create_connection") as connect:
+                with self.assertRaisesRegex(
+                    qualification.QualificationError,
+                    "host loopback publish missing",
+                ):
+                    container.start(timeout=1)
+            connect.assert_not_called()
+            self.assertEqual(
+                run.call_args_list[1].args[0],
+                ["docker", "port", "rc-test", "8750/tcp"],
+            )
 
     def test_loopback_http_disables_environment_proxies(self) -> None:
         client = qualification.MCPClient("http://127.0.0.1:43123/mcp", "synthetic", 1)

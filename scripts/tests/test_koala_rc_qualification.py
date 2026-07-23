@@ -79,6 +79,24 @@ class QualificationSafetyTests(unittest.TestCase):
         for marker in qualification.PRODUCTION_MARKERS:
             self.assertNotIn(marker, encoded)
 
+    def test_container_readiness_uses_direct_loopback_tcp(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            container = qualification.Container(
+                "rc-test", "ghcr.io/koala-optics/muninndb@sha256:" + "a" * 64,
+                Path(root), "network", 43123,
+                Path(root) / "env", Path(root) / "container.log",
+            )
+            connection = mock.MagicMock()
+            connection.__enter__.return_value = connection
+            with mock.patch.object(qualification, "run_command") as run, \
+                    mock.patch.object(qualification.socket, "create_connection", return_value=connection) as connect:
+                run.side_effect = [
+                    subprocess.CompletedProcess([], 0, "container-id\n", ""),
+                    subprocess.CompletedProcess([], 0, "running 0\n", ""),
+                ]
+                container.start(timeout=1)
+            connect.assert_called_once_with(("127.0.0.1", 43123), timeout=1.0)
+
     def test_loopback_http_disables_environment_proxies(self) -> None:
         client = qualification.MCPClient("http://127.0.0.1:43123/mcp", "synthetic", 1)
         response = mock.MagicMock()

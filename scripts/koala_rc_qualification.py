@@ -74,14 +74,9 @@ class Container:
                 if state.startswith(("exited", "dead")):
                     raise QualificationError(f"container {self.name} exited before readiness: {state}")
                 try:
-                    request = urllib.request.Request(f"{self.mcp_url}/health")
-                    with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(
-                        request, timeout=1.0,
-                    ) as response:
-                        body = json.loads(response.read().decode("utf-8"))
-                    if body.get("status") == "ok":
+                    with socket.create_connection(("127.0.0.1", self.host_port), timeout=1.0):
                         return
-                except (OSError, ValueError, urllib.error.URLError):
+                except OSError:
                     time.sleep(0.25)
             raise QualificationError(f"container {self.name} readiness timed out after {timeout}s")
         except Exception:

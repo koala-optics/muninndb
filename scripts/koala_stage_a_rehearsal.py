@@ -36,7 +36,8 @@ MIGRATION_LIMIT_S, READINESS_LIMIT_S = 45 * 60, 5 * 60
 QUERY_P95_LIMIT_MS, STATUS_LIMIT_S = 250.0, 30.0
 RESTORE_LIMIT_S, ROLLBACK_LIMIT_S = 45 * 60, 30 * 60
 FLY_REGION, FLY_ORG, MCP_PORT = "ewr", "personal", 8750
-BASELINE_IMAGE = "ghcr.io/koalaoptics/muninndb@sha256:c06842e1452f2aab4c1f01207adf9406bfe757b4984da516568006f1f5c8ad86"
+BASELINE_IMAGE = "registry.fly.io/koala-muninndb:deployment-01KSWRX9GKW5M94MQQCBZSJZHS"
+BASELINE_DIGEST = "sha256:c06842e1452f2aab4c1f01207adf9406bfe757b4984da516568006f1f5c8ad86"
 CANDIDATE_IMAGE = "ghcr.io/koala-optics/muninndb@sha256:e46c96ac5359707970692070b2298a4b4be877bdfc918c30231da2663d5d06b8"
 SOURCE_COMMIT, SOURCE_TAG = "7251eca0dbfda2cd5e459a174a61322d82562f0b", "koala-v0.9.0-rc.1"
 PRODUCTION_APP = "koala-muninndb"
@@ -157,7 +158,7 @@ def assert_owned(value: str, identity: RunIdentity, kind: str) -> None:
 
 def validate_image(ref: str, role: str) -> str:
     expected = BASELINE_IMAGE if role == "baseline" else CANDIDATE_IMAGE
-    if not DIGEST_REF.fullmatch(ref) or ref != expected:
+    if ref != expected or (role != "baseline" and not DIGEST_REF.fullmatch(ref)):
         raise RehearsalUnknown(f"{role} image differs from qualified immutable identity")
     return ref
 
@@ -582,7 +583,8 @@ def plan(identity: RunIdentity, spec: CorpusSpec) -> dict[str, Any]:
     validate_spec(spec); validate_image(BASELINE_IMAGE, "baseline"); validate_image(CANDIDATE_IMAGE, "candidate")
     return {"mode": "dry-run", "run_id": identity.run_id, "confirmation_required_for_execute": identity.confirmation,
             "source_commit": SOURCE_COMMIT, "source_tag": SOURCE_TAG, "baseline_image": BASELINE_IMAGE,
-            "candidate_image": CANDIDATE_IMAGE, "record_count": spec.count, "batch_size": spec.batch_size,
+            "baseline_digest": BASELINE_DIGEST, "candidate_image": CANDIDATE_IMAGE,
+            "record_count": spec.count, "batch_size": spec.batch_size,
             "payload_bytes": spec.payload_bytes, "volume_gb": VOLUME_SIZE_GB,
             "generated_resources": {"app": identity.app_name, "source_volume": identity.volume_name,
                                     "backup_volume": identity.backup_volume_name, "restore_volume": identity.restore_volume_name,
@@ -690,7 +692,8 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
         if detail == "all measured Stage A phases completed": status, exit_code = computed, 0 if computed == "PASSED" else (1 if computed == "FAILED" else 2)
         if orphans: status, exit_code, detail = "UNKNOWN", 2, "cleanup uncertainty or orphaned resources"
         receipt = {"schema_version": SCHEMA_VERSION, "status": status, "exit_code": exit_code, "run_id": identity.run_id,
-            "source": {"commit": SOURCE_COMMIT, "tag": SOURCE_TAG}, "images": {"baseline": BASELINE_IMAGE, "candidate": CANDIDATE_IMAGE},
+            "source": {"commit": SOURCE_COMMIT, "tag": SOURCE_TAG},
+            "images": {"baseline": BASELINE_IMAGE, "baseline_digest": BASELINE_DIGEST, "candidate": CANDIDATE_IMAGE},
             "corpus": ({"schema_version": CORPUS_SCHEMA_VERSION, "seed": spec.seed, "requested_count": spec.count, "payload_bytes": spec.payload_bytes,
                         "submitted": corpus_receipt.submitted, "accepted": corpus_receipt.accepted, "batches": corpus_receipt.batches,
                         "manifest_sha256": corpus_receipt.manifest_sha256, "batch_latency": latency_summary(corpus_receipt.batch_latencies_ms)}

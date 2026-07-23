@@ -29,10 +29,15 @@ class StageAContractTests(unittest.TestCase):
     def small_spec(self, count=53):
         return stage.CorpusSpec(count=count, batch_size=50, payload_bytes=1000, seed="test-seed")
 
-    def test_qualified_identities_are_digest_pinned(self):
+    def test_qualified_identities_are_immutable(self):
         self.assertEqual(stage.validate_image(stage.BASELINE_IMAGE, "baseline"), stage.BASELINE_IMAGE)
         self.assertEqual(stage.validate_image(stage.CANDIDATE_IMAGE, "candidate"), stage.CANDIDATE_IMAGE)
-        for role, bad in (("baseline", stage.CANDIDATE_IMAGE), ("candidate", "ghcr.io/koala-optics/muninndb:latest")):
+        self.assertRegex(stage.BASELINE_DIGEST, r"^sha256:[0-9a-f]{64}$")
+        for role, bad in (
+            ("baseline", stage.CANDIDATE_IMAGE),
+            ("baseline", f"registry.fly.io/koala-muninndb@{stage.BASELINE_DIGEST}"),
+            ("candidate", "ghcr.io/koala-optics/muninndb:latest"),
+        ):
             with self.assertRaises(stage.RehearsalUnknown): stage.validate_image(bad, role)
 
     def test_identity_is_run_owned_and_production_name_is_refused(self):

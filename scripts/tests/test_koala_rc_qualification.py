@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "koala_rc_qualification.py"
@@ -118,6 +120,22 @@ class QualificationSafetyTests(unittest.TestCase):
             (occupied / "keep.txt").write_text("do not overwrite", encoding="utf-8")
             with self.assertRaises(qualification.QualificationError):
                 qualification.prepare_work_directory(occupied)
+
+    def test_log_capture_preserves_first_failure_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            log_path = Path(root) / "container.log"
+            container = qualification.Container(
+                "rc-test", "image", Path(root), "network", 43123,
+                Path(root) / "env", log_path,
+            )
+            responses = [
+                subprocess.CompletedProcess([], 0, "startup failure\n", ""),
+                subprocess.CompletedProcess([], 1, "", "No such container\n"),
+            ]
+            with mock.patch.object(qualification, "run_command", side_effect=responses):
+                self.assertEqual(container.capture_logs(), "startup failure\n")
+                self.assertEqual(container.capture_logs(), "startup failure\n")
+            self.assertEqual(log_path.read_text(encoding="utf-8"), "startup failure\n")
 
     def test_receipt_validation_rejects_missing_gate(self) -> None:
         receipt = {

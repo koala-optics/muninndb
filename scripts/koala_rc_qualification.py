@@ -89,6 +89,8 @@ class Container:
     def capture_logs(self) -> str:
         completed = run_command(["docker", "logs", self.name], check=False)
         text = completed.stdout + completed.stderr
+        if completed.returncode != 0 and self.log_path.exists():
+            return self.log_path.read_text(encoding="utf-8")
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self.log_path.write_text(text, encoding="utf-8")
         return text

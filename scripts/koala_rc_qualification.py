@@ -16,7 +16,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -51,28 +51,40 @@ class Container:
     image: str
     data_dir: Path
     network: str
-    host_port: int
     env_file: Path
     log_path: Path
+    container_ip: str = field(default="", init=False)
 
     @property
     def mcp_url(self) -> str:
-        return f"http://127.0.0.1:{self.host_port}/mcp"
+        if not self.container_ip:
+            raise QualificationError(f"container {self.name} has no verified internal address")
+        return f"http://{self.container_ip}:8750/mcp"
 
     def start(self, timeout: float = 90.0) -> None:
         run_command(build_container_command(
             name=self.name, image=self.image, data_dir=self.data_dir,
-            network=self.network, host_port=self.host_port, env_file=self.env_file,
+            network=self.network, env_file=self.env_file,
         ))
-        mapping = run_command(
-            ["docker", "port", self.name, "8750/tcp"], check=False,
-        ).stdout.strip()
-        expected_mapping = f"127.0.0.1:{self.host_port}"
-        if expected_mapping not in mapping.splitlines():
+        network_info = json.loads(run_command([
+            "docker", "network", "inspect", self.network,
+        ]).stdout)[0]
+        if network_info.get("Internal") is not True:
+            self.capture_logs()
+            self.remove(force=True)
+            raise QualificationError(f"Docker network {self.network} is not internal")
+        container_info = network_info.get("Containers", {}).get(
+            run_command([
+                "docker", "inspect", "--format", "{{.Id}}", self.name,
+            ]).stdout.strip(),
+            {},
+        )
+        self.container_ip = str(container_info.get("IPv4Address", "")).split("/", 1)[0]
+        if not self.container_ip:
             self.capture_logs()
             self.remove(force=True)
             raise QualificationError(
-                f"host loopback publish missing for {self.name}: {mapping!r}"
+                f"container {self.name} has no address on internal network {self.network}"
             )
         deadline = time.monotonic() + timeout
         try:
@@ -84,7 +96,7 @@ class Container:
                 if state.startswith(("exited", "dead")):
                     raise QualificationError(f"container {self.name} exited before readiness: {state}")
                 try:
-                    with socket.create_connection(("127.0.0.1", self.host_port), timeout=1.0):
+                    with socket.create_connection((self.container_ip, 8750), timeout=1.0):
                         return
                 except OSError:
                     time.sleep(0.25)
@@ -121,9 +133,9 @@ class Container:
 
 
 class MCPClient:
-    def __init__(self, url: str, token: str, timeout: float):
-        if not is_loopback_url(url):
-            raise QualificationError(f"refusing non-loopback MCP URL: {url}")
+    def __init__(self, url: str, token: str, timeout: float, *, internal_address: str = ""):
+        if not is_harness_url(url, internal_address):
+            raise QualificationError(f"refusing unverified MCP URL: {url}")
         self.url, self.token, self.timeout, self.request_id = url, token, timeout, 0
 
     def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -177,8 +189,14 @@ class MCPClient:
         return self.decode_tool_result(method, result), latency_ms
 
 
-def is_loopback_url(url: str) -> bool:
-    return url.startswith("http://127.0.0.1:") or url.startswith("http://localhost:")
+def is_harness_url(url: str, internal_address: str = "") -> bool:
+    match = re.fullmatch(r"http://(?P<host>[^/:]+):(?P<port>[0-9]+)/mcp", url)
+    if not match:
+        return False
+    host = match.group("host")
+    if host in {"127.0.0.1", "localhost"}:
+        return True
+    return bool(internal_address) and host == internal_address and match.group("port") == "8750"
 
 
 def validate_image_ref(ref: str, repositories: set[str] | None = None) -> str:
@@ -202,23 +220,17 @@ def run_command(command: list[str], *, check: bool = True, timeout: float = 600.
     return completed
 
 
-def build_container_command(*, name: str, image: str, data_dir: Path, network: str, host_port: int, env_file: Path) -> list[str]:
+def build_container_command(*, name: str, image: str, data_dir: Path, network: str, env_file: Path) -> list[str]:
     validate_image_ref(image, BASELINE_REPOSITORIES)
     return [
         "docker", "run", "--detach", "--name", name, "--network", network,
-        "--publish", f"127.0.0.1:{host_port}:8750", "--env-file", str(env_file.resolve()),
+        "--env-file", str(env_file.resolve()),
         "--mount", f"type=bind,src={data_dir.resolve()},dst=/data", "--read-only",
         "--tmpfs", "/tmp:rw,noexec,nosuid,size=256m", "--security-opt", "no-new-privileges:true",
         "--cap-drop", "ALL", image, "--daemon", "--data", "/data", "--listen-host", "0.0.0.0",
         "--mbp-addr", "0.0.0.0:8474", "--rest-addr", "0.0.0.0:8475",
         "--ui-addr", "0.0.0.0:8476", "--grpc-addr", "0.0.0.0:8477", "--mcp-addr", "0.0.0.0:8750",
     ]
-
-
-def reserve_loopback_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
 
 
 def prepare_work_directory(path: Path | None) -> tuple[Path, bool]:
@@ -337,7 +349,11 @@ def validate_receipt(receipt: dict[str, Any]) -> None:
     if receipt.get("schema_version") != 1 or receipt.get("status") != "passed":
         raise QualificationError("receipt is not a passing schema-v1 qualification")
     isolation = receipt.get("isolation", {})
-    if isolation.get("synthetic_only") is not True or isolation.get("host_bind") != "127.0.0.1" or isolation.get("internal_network") is not True:
+    if (
+        isolation.get("synthetic_only") is not True
+        or isolation.get("host_ports_published") != []
+        or isolation.get("internal_network") is not True
+    ):
         raise QualificationError("receipt does not prove synthetic network isolation")
     for role in ("candidate", "baseline"):
         if "@sha256:" not in receipt.get("images", {}).get(role, {}).get("ref", ""):
@@ -361,13 +377,16 @@ def gate(receipt: dict[str, Any], name: str, **details: Any) -> None:
 
 def new_container(*, name: str, image: str, data_dir: Path, network: str,
                   env_file: Path, logs_dir: Path) -> Container:
-    return Container(name, image, data_dir, network, reserve_loopback_port(),
-                     env_file, logs_dir / f"{name}.log")
+    return Container(name, image, data_dir, network, env_file,
+                     logs_dir / f"{name}.log")
 
 
 def start_client(container: Container, token: str, args: argparse.Namespace) -> MCPClient:
     container.start(args.startup_timeout)
-    client = MCPClient(container.mcp_url, token, args.call_timeout)
+    client = MCPClient(
+        container.mcp_url, token, args.call_timeout,
+        internal_address=container.container_ip,
+    )
     client.initialize()
     return client
 
@@ -396,7 +415,8 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
             "onnxruntime_sha256": args.onnxruntime_sha256,
         },
         "isolation": {
-            "synthetic_only": True, "host_bind": "127.0.0.1", "internal_network": True,
+            "synthetic_only": True, "host_ports_published": [], "internal_network": True,
+            "runner_access": "verified Docker-internal bridge address",
             "production_environment_keys_removed": sorted(PRODUCTION_ENV_KEYS),
         },
         "fixture": {"count": len(manifest), "manifest_sha256": manifest_hash(manifest)},

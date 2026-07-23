@@ -33,17 +33,14 @@ class QualificationSafetyTests(unittest.TestCase):
                 with self.assertRaises(qualification.QualificationError):
                     qualification.validate_image_ref(invalid)
 
-    def test_container_command_only_publishes_mcp_on_loopback(self) -> None:
+    def test_container_command_publishes_no_host_ports(self) -> None:
         image = "ghcr.io/koala-optics/muninndb@sha256:" + "b" * 64
         command = qualification.build_container_command(
             name="rc-test", image=image, data_dir=Path("/tmp/rc-data"),
-            network="rc-internal", host_port=43123, env_file=Path("/tmp/rc.env"),
+            network="rc-internal", env_file=Path("/tmp/rc.env"),
         )
-        self.assertIn("127.0.0.1:43123:8750", command)
-        self.assertNotIn("0.0.0.0:43123:8750", command)
+        self.assertNotIn("--publish", command)
         self.assertEqual(command[command.index("--network") + 1], "rc-internal")
-        published = [command[index + 1] for index, value in enumerate(command) if value == "--publish"]
-        self.assertEqual(published, ["127.0.0.1:43123:8750"])
         self.assertIn("--listen-host", command)
         self.assertEqual(command[command.index("--listen-host") + 1], "0.0.0.0")
 
@@ -51,7 +48,7 @@ class QualificationSafetyTests(unittest.TestCase):
         image = "ghcr.io/scrypster/muninndb@sha256:" + "c" * 64
         command = qualification.build_container_command(
             name="baseline", image=image, data_dir=Path("/tmp/rc-data"),
-            network="rc-internal", host_port=43124, env_file=Path("/tmp/rc.env"),
+            network="rc-internal", env_file=Path("/tmp/rc.env"),
         )
         self.assertIn(image, command)
 
@@ -79,53 +76,57 @@ class QualificationSafetyTests(unittest.TestCase):
         for marker in qualification.PRODUCTION_MARKERS:
             self.assertNotIn(marker, encoded)
 
-    def test_container_readiness_uses_direct_loopback_tcp(self) -> None:
+    def test_container_readiness_uses_verified_internal_address(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             container = qualification.Container(
                 "rc-test", "ghcr.io/koala-optics/muninndb@sha256:" + "a" * 64,
-                Path(root), "network", 43123,
-                Path(root) / "env", Path(root) / "container.log",
+                Path(root), "network", Path(root) / "env", Path(root) / "container.log",
             )
             connection = mock.MagicMock()
             connection.__enter__.return_value = connection
+            network = [{
+                "Internal": True,
+                "Containers": {"container-id": {"IPv4Address": "172.20.0.2/16"}},
+            }]
             with mock.patch.object(qualification, "run_command") as run, \
                     mock.patch.object(qualification.socket, "create_connection", return_value=connection) as connect:
                 run.side_effect = [
                     subprocess.CompletedProcess([], 0, "container-id\n", ""),
-                    subprocess.CompletedProcess([], 0, "127.0.0.1:43123\n", ""),
+                    subprocess.CompletedProcess([], 0, qualification.json.dumps(network), ""),
+                    subprocess.CompletedProcess([], 0, "container-id\n", ""),
                     subprocess.CompletedProcess([], 0, "running 0\n", ""),
                 ]
                 container.start(timeout=1)
-            self.assertEqual(
-                run.call_args_list[1].args[0],
-                ["docker", "port", "rc-test", "8750/tcp"],
-            )
-            connect.assert_called_once_with(("127.0.0.1", 43123), timeout=1.0)
+            self.assertEqual(container.container_ip, "172.20.0.2")
+            connect.assert_called_once_with(("172.20.0.2", 8750), timeout=1.0)
 
-    def test_container_start_fails_immediately_without_loopback_mapping(self) -> None:
+    def test_container_start_rejects_non_internal_network(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             container = qualification.Container(
                 "rc-test", "ghcr.io/koala-optics/muninndb@sha256:" + "a" * 64,
-                Path(root), "network", 43123,
-                Path(root) / "env", Path(root) / "container.log",
+                Path(root), "network", Path(root) / "env", Path(root) / "container.log",
             )
             responses = [
                 subprocess.CompletedProcess([], 0, "container-id\n", ""),
-                subprocess.CompletedProcess([], 0, "", ""),
+                subprocess.CompletedProcess([], 0, '[{"Internal": false}]', ""),
                 subprocess.CompletedProcess([], 0, "startup log\n", ""),
                 subprocess.CompletedProcess([], 0, "", ""),
             ]
-            with mock.patch.object(qualification, "run_command", side_effect=responses) as run, \
+            with mock.patch.object(qualification, "run_command", side_effect=responses), \
                     mock.patch.object(qualification.socket, "create_connection") as connect:
-                with self.assertRaisesRegex(
-                    qualification.QualificationError,
-                    "host loopback publish missing",
-                ):
+                with self.assertRaisesRegex(qualification.QualificationError, "is not internal"):
                     container.start(timeout=1)
             connect.assert_not_called()
-            self.assertEqual(
-                run.call_args_list[1].args[0],
-                ["docker", "port", "rc-test", "8750/tcp"],
+
+    def test_internal_mcp_url_requires_exact_verified_address(self) -> None:
+        qualification.MCPClient(
+            "http://172.20.0.2:8750/mcp", "synthetic", 1,
+            internal_address="172.20.0.2",
+        )
+        with self.assertRaises(qualification.QualificationError):
+            qualification.MCPClient(
+                "http://172.20.0.3:8750/mcp", "synthetic", 1,
+                internal_address="172.20.0.2",
             )
 
     def test_loopback_http_disables_environment_proxies(self) -> None:
@@ -202,7 +203,7 @@ class QualificationSafetyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             log_path = Path(root) / "container.log"
             container = qualification.Container(
-                "rc-test", "image", Path(root), "network", 43123,
+                "rc-test", "image", Path(root), "network",
                 Path(root) / "env", log_path,
             )
             responses = [
@@ -218,7 +219,7 @@ class QualificationSafetyTests(unittest.TestCase):
         receipt = {
             "schema_version": 1,
             "status": "passed",
-            "isolation": {"synthetic_only": True, "host_bind": "127.0.0.1", "internal_network": True},
+            "isolation": {"synthetic_only": True, "host_ports_published": [], "internal_network": True},
             "images": {"candidate": {"ref": "x@sha256:" + "a" * 64}, "baseline": {"ref": "y@sha256:" + "b" * 64}},
             "gates": {name: {"passed": True} for name in qualification.REQUIRED_GATES},
         }

@@ -1,0 +1,170 @@
+name: Koala Stage A Rehearsal
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Plan only by default; execute requires separate authorization and exact confirmation
+        required: true
+        default: plan
+        type: choice
+        options:
+          - plan
+          - execute
+      run_id:
+        description: Unique lowercase run ID (4-32 characters)
+        required: true
+        default: rehearsal-plan
+        type: string
+      confirmation:
+        description: Exact run-specific confirmation printed by plan mode; required only for execute
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: koala-stage-a-${{ inputs.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  contract:
+    name: Validate harness contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Validate repository
+        shell: bash
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          test "$REPOSITORY" = "koala-optics/muninndb"
+
+      - name: Check out workflow ref
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Run static and contract checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m py_compile scripts/koala_stage_a_rehearsal.py scripts/tests/test_koala_stage_a_rehearsal.py
+          python3 scripts/tests/test_koala_stage_a_rehearsal.py
+          git diff --check
+
+      - name: Render non-mutating plan
+        shell: bash
+        env:
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/koala-stage-a
+          python3 scripts/koala_stage_a_rehearsal.py \
+            --dry-run --run-id "$RUN_ID" --json \
+            > /tmp/koala-stage-a/plan.json
+
+      - name: Upload plan receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: koala-stage-a-${{ inputs.run_id }}-plan
+          path: /tmp/koala-stage-a/plan.json
+          if-no-files-found: error
+          retention-days: 30
+
+  execute:
+    name: Execute disposable Fly rehearsal
+    if: inputs.mode == 'execute'
+    needs: contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    environment: koala-stage-a-rehearsal
+    steps:
+      - name: Check out workflow ref
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Install pinned flyctl
+        shell: bash
+        env:
+          FLYCTL_VERSION: v0.4.52
+          FLYCTL_SHA256: f1d02cd67b328b69649b68648de6d67b18a0bd0acc862fc0a809862ee5e0e919
+        run: |
+          set -euo pipefail
+          archive="flyctl_${FLYCTL_VERSION#v}_Linux_x86_64.tar.gz"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            "https://github.com/superfly/flyctl/releases/download/${FLYCTL_VERSION}/${archive}" \
+            --output "/tmp/${archive}"
+          printf '%s  %s\n' "$FLYCTL_SHA256" "/tmp/${archive}" | sha256sum --check --strict
+          tar -xzf "/tmp/${archive}" -C /usr/local/bin flyctl
+          flyctl version
+
+      - name: Validate authorized repository and source ref
+        shell: bash
+        env:
+          REPOSITORY: ${{ github.repository }}
+          AUTHORIZED_SHA: ${{ vars.AUTHORIZED_STAGE_A_SHA }}
+          AUTHORIZED_REF: ${{ vars.AUTHORIZED_STAGE_A_REF }}
+          DISPATCH_SHA: ${{ github.sha }}
+          DISPATCH_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          test "$REPOSITORY" = "koala-optics/muninndb"
+          test -n "$AUTHORIZED_SHA"
+          test -n "$AUTHORIZED_REF"
+          test "$DISPATCH_SHA" = "$AUTHORIZED_SHA"
+          test "$DISPATCH_REF" = "$AUTHORIZED_REF"
+          test "$(git rev-parse HEAD)" = "$AUTHORIZED_SHA"
+
+      - name: Validate exact execute confirmation
+        shell: bash
+        env:
+          RUN_ID: ${{ inputs.run_id }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          set -euo pipefail
+          required="$(python3 scripts/koala_stage_a_rehearsal.py --dry-run --run-id "$RUN_ID" --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["confirmation_required_for_execute"])')"
+          test -n "$CONFIRMATION"
+          test "$CONFIRMATION" = "$required"
+
+      - name: Run disposable Stage A rehearsal
+        id: rehearsal
+        shell: bash
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          RUN_ID: ${{ inputs.run_id }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          set +e
+          mkdir -p /tmp/koala-stage-a
+          python3 scripts/koala_stage_a_rehearsal.py \
+            --execute --run-id "$RUN_ID" --confirm "$CONFIRMATION" \
+            --receipt /tmp/koala-stage-a/receipt.json
+          code=$?
+          printf 'exit_code=%s\n' "$code" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Upload redacted evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: koala-stage-a-${{ inputs.run_id }}-evidence
+          path: |
+            /tmp/koala-stage-a/receipt.json
+            /tmp/koala-stage-a/receipt.json.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Enforce rehearsal verdict
+        if: always()
+        shell: bash
+        env:
+          REHEARSAL_EXIT_CODE: ${{ steps.rehearsal.outputs.exit_code }}
+        run: |
+          set -euo pipefail
+          test -n "$REHEARSAL_EXIT_CODE"
+          test "$REHEARSAL_EXIT_CODE" = "0"

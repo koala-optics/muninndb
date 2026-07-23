@@ -358,3 +358,198 @@ def start_client(container: Container, token: str, args: argparse.Namespace) -> 
     client = MCPClient(container.mcp_url, token, args.call_timeout)
     client.initialize()
     return client
+
+
+
+def qualify(args: argparse.Namespace) -> dict[str, Any]:
+    candidate = validate_image_ref(args.candidate_image)
+    baseline = validate_image_ref(args.baseline_image, BASELINE_REPOSITORIES)
+    work_dir, temporary = prepare_work_directory(args.work_dir)
+    data_dir, backup_dir = work_dir / "data", work_dir / "backup"
+    env_file, logs_dir = work_dir / "synthetic.env", work_dir / "logs"
+    token, network = secrets.token_urlsafe(32), f"koala-rc-{secrets.token_hex(6)}"
+    manifest = synthetic_manifest()
+    concept, entity = manifest[0]["concept"], manifest[0]["entities"][0]["name"]
+    data_dir.mkdir(mode=0o700)
+    logs_dir.mkdir(mode=0o700)
+    write_env_file(env_file, token)
+    receipt: dict[str, Any] = {
+        "schema_version": 1, "status": "running",
+        "source": {"commit": args.source_commit, "tag": args.source_tag},
+        "images": {},
+        "assets": {
+            "go_version": args.go_version, "model_sha256": args.model_sha256,
+            "tokenizer_sha256": args.tokenizer_sha256,
+            "onnxruntime_sha256": args.onnxruntime_sha256,
+        },
+        "isolation": {
+            "synthetic_only": True, "host_bind": "127.0.0.1", "internal_network": True,
+            "production_environment_keys_removed": sorted(PRODUCTION_ENV_KEYS),
+        },
+        "fixture": {"count": len(manifest), "manifest_sha256": manifest_hash(manifest)},
+        "gates": {},
+        "limitations": [
+            "Synthetic durability qualification is not production-load qualification.",
+            "No production data, credentials, URLs, volumes, backups, or retained forensic volumes were used.",
+        ],
+    }
+    active: Container | None = None
+    started = time.monotonic()
+    run_command(["docker", "network", "create", "--internal", network])
+    try:
+        receipt["images"]["candidate"] = ensure_image(candidate, {CANDIDATE_REPOSITORY})
+        receipt["images"]["baseline"] = ensure_image(baseline, BASELINE_REPOSITORIES)
+
+        active = new_container(name="koala-rc-baseline", image=baseline, data_dir=data_dir,
+            network=network, env_file=env_file, logs_dir=logs_dir)
+        baseline_client = start_client(active, token, args)
+        missing = sorted((REQUIRED_TOOLS - {"muninn_find_by_concept"}) - baseline_client.list_tools())
+        if missing:
+            raise QualificationError(f"baseline is missing tools: {', '.join(missing)}")
+        ids_oldest, write_ms = remember_fixture(baseline_client, manifest)
+        for memory_id in ids_oldest:
+            baseline_client.call("muninn_read", {"vault": "rc-synthetic", "id": memory_id})
+        active.stop()
+        active = None
+        gate(receipt, "baseline_fixture", ids_oldest_first=ids_oldest,
+            write_samples_ms=[round(value, 3) for value in write_ms])
+
+        expected = list(reversed(ids_oldest))
+        active = new_container(name="koala-rc-migration", image=candidate, data_dir=data_dir,
+            network=network, env_file=env_file, logs_dir=logs_dir)
+        client = start_client(active, token, args)
+        missing = sorted(REQUIRED_TOOLS - client.list_tools())
+        if missing:
+            raise QualificationError(f"candidate is missing tools: {', '.join(missing)}")
+        timings = verify_lookup_state(client, concept=concept, entity=entity, expected_ids=expected)
+        migration_logs = active.stop()
+        active = None
+        if "migrations applied" not in migration_logs:
+            raise QualificationError("candidate startup did not report applying migration v4")
+        gate(receipt, "migration_v4", backfilled_ids=expected,
+            startup_log_sha256=hashlib.sha256(migration_logs.encode()).hexdigest())
+        gate(receipt, "exact_concept", latency_ms=timings["concept_ms"])
+        gate(receipt, "newest_first_entity", latency_ms=timings["entity_ms"])
+
+        active = new_container(name="koala-rc-idempotent", image=candidate, data_dir=data_dir,
+            network=network, env_file=env_file, logs_dir=logs_dir)
+        client = start_client(active, token, args)
+        verify_lookup_state(client, concept=concept, entity=entity, expected_ids=expected)
+        idempotent_logs = active.stop()
+        active = None
+        if "migrations applied" in idempotent_logs:
+            raise QualificationError("migration unexpectedly re-applied on second candidate start")
+        gate(receipt, "migration_idempotence")
+        gate(receipt, "clean_restart")
+
+        active = new_container(name="koala-rc-lifecycle", image=candidate, data_dir=data_dir,
+            network=network, env_file=env_file, logs_dir=logs_dir)
+        client = start_client(active, token, args)
+        newest, middle, oldest = expected
+        client.call("muninn_state", {"vault": "rc-synthetic", "id": newest,
+            "state": "archived", "reason": "synthetic RC gate"})
+        verify_lookup_state(client, concept=concept, entity=entity, expected_ids=[middle, oldest])
+        client.call("muninn_forget", {"vault": "rc-synthetic", "id": middle})
+        verify_lookup_state(client, concept=concept, entity=entity, expected_ids=[oldest])
+        restored, _ = client.call("muninn_restore", {"vault": "rc-synthetic", "id": middle})
+        if not isinstance(restored, dict) or restored.get("restored") is not True:
+            raise QualificationError(f"restore did not report success: {restored}")
+        verify_lookup_state(client, concept=concept, entity=entity, expected_ids=[middle, oldest])
+        gate(receipt, "lifecycle_filtering")
+        active.kill()
+        active = None
+
+        active = new_container(name="koala-rc-crash-restart", image=candidate, data_dir=data_dir,
+            network=network, env_file=env_file, logs_dir=logs_dir)
+        client = start_client(active, token, args)
+        verify_lookup_state(client, concept=concept, entity=entity, expected_ids=[middle, oldest])
+        active.stop()
+        active = None
+        gate(receipt, "crash_restart")
+
+        hard_delete = offline_command(candidate, work_dir, [
+            "exec", "forget", "--data-dir", "/work/data", "--vault", "rc-synthetic", "--id", oldest])
+        active = new_container(name="koala-rc-hard-delete", image=candidate, data_dir=data_dir,
+            network=network, env_file=env_file, logs_dir=logs_dir)
+        client = start_client(active, token, args)
+        verify_lookup_state(client, concept=concept, entity=entity, expected_ids=[middle])
+        active.stop()
+        active = None
+        gate(receipt, "hard_delete_cleanup",
+            command_output_sha256=hashlib.sha256(hard_delete.stdout.encode()).hexdigest())
+
+        backup = offline_command(candidate, work_dir, [
+            "backup", "--data-dir", "/work/data", "--output", "/work/backup"])
+        if not (backup_dir / "pebble").is_dir():
+            raise QualificationError("offline backup did not produce a Pebble checkpoint")
+        active = new_container(name="koala-rc-restore", image=candidate, data_dir=backup_dir,
+            network=network, env_file=env_file, logs_dir=logs_dir)
+        client = start_client(active, token, args)
+        verify_lookup_state(client, concept=concept, entity=entity, expected_ids=[middle])
+        read_result, _ = client.call("muninn_read", {"vault": "rc-synthetic", "id": middle})
+        if result_id(read_result) != middle:
+            raise QualificationError("restored read returned the wrong engram")
+        active.stop()
+        active = None
+        gate(receipt, "backup_restore",
+            backup_output_sha256=hashlib.sha256(backup.stdout.encode()).hexdigest())
+
+        receipt["duration_seconds"] = round(time.monotonic() - started, 3)
+        receipt["status"] = "passed"
+        validate_receipt(receipt)
+        atomic_write_json(args.output.resolve(), receipt)
+        return receipt
+    except Exception as exc:
+        receipt["status"] = "failed"
+        receipt["failure"] = {"type": type(exc).__name__, "message": str(exc)}
+        receipt["duration_seconds"] = round(time.monotonic() - started, 3)
+        atomic_write_json(args.output.resolve(), receipt)
+        raise
+    finally:
+        if active is not None:
+            active.capture_logs()
+            active.remove(force=True)
+        run_command(["docker", "network", "rm", network], check=False)
+        env_file.unlink(missing_ok=True)
+        if temporary and not args.keep_work_dir:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+
+
+def sha256_arg(value: str) -> str:
+    if value and (len(value) != 64 or any(ch not in "0123456789abcdef" for ch in value)):
+        raise argparse.ArgumentTypeError("must be an empty string or lowercase SHA-256 digest")
+    return value
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--candidate-image", required=True)
+    parser.add_argument("--baseline-image", required=True)
+    parser.add_argument("--source-commit", required=True)
+    parser.add_argument("--source-tag", required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--work-dir", type=Path)
+    parser.add_argument("--keep-work-dir", action="store_true")
+    parser.add_argument("--startup-timeout", type=float, default=120.0)
+    parser.add_argument("--call-timeout", type=float, default=30.0)
+    parser.add_argument("--go-version", default="")
+    parser.add_argument("--model-sha256", type=sha256_arg, default="")
+    parser.add_argument("--tokenizer-sha256", type=sha256_arg, default="")
+    parser.add_argument("--onnxruntime-sha256", type=sha256_arg, default="")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        receipt = qualify(args)
+    except QualificationError as exc:
+        print(f"RC qualification failed: {exc}", file=os.sys.stderr)
+        return 1
+    print(json.dumps({"status": receipt["status"], "output": str(args.output.resolve())}, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -113,6 +113,23 @@ class QualificationSafetyTests(unittest.TestCase):
                 ["new", "old"],
             )
 
+    def test_disposable_data_directory_is_container_writable(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            args = mock.Mock(
+                candidate_image="ghcr.io/koala-optics/muninndb@sha256:" + "a" * 64,
+                baseline_image="ghcr.io/scrypster/muninndb@sha256:" + "b" * 64,
+                work_dir=Path(root) / "work",
+                source_commit="c" * 40,
+                source_tag="koala-v0.9.0-rc.1",
+                go_version="", model_sha256="", tokenizer_sha256="",
+                onnxruntime_sha256="", startup_timeout=1, call_timeout=1,
+                keep_work_dir=True, output=Path(root) / "receipt.json",
+            )
+            with mock.patch.object(qualification, "run_command", side_effect=qualification.QualificationError("stop")):
+                with self.assertRaises(qualification.QualificationError):
+                    qualification.qualify(args)
+            self.assertEqual((args.work_dir / "data").stat().st_mode & 0o777, 0o777)
+
     def test_explicit_work_directory_must_be_empty(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             occupied = Path(root) / "occupied"

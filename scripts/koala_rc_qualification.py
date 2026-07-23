@@ -373,6 +373,7 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
     manifest = synthetic_manifest()
     concept, entity = manifest[0]["concept"], manifest[0]["entities"][0]["name"]
     data_dir.mkdir(mode=0o700)
+    data_dir.chmod(0o777)
     logs_dir.mkdir(mode=0o700)
     write_env_file(env_file, token)
     receipt: dict[str, Any] = {

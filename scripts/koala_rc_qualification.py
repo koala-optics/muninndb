@@ -511,6 +511,8 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         gate(receipt, "hard_delete_cleanup",
             command_output_sha256=hashlib.sha256(hard_delete.stdout.encode()).hexdigest())
 
+        backup_dir.mkdir(mode=0o700)
+        backup_dir.chmod(0o777)
         backup = offline_command(candidate, work_dir, [
             "backup", "--data-dir", "/work/data", "--output", "/work/backup"])
         if not (backup_dir / "pebble").is_dir():

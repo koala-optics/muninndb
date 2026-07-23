@@ -315,9 +315,17 @@ class MCPClient:
         except (OSError, ValueError, urllib.error.URLError) as exc: raise RehearsalUnknown(f"MCP transport failed: {type(exc).__name__}") from exc
         if parsed.get("error"): raise RehearsalFailed("MCP JSON-RPC error")
         return parsed
-    def initialize(self) -> None:
-        self.request_id += 1
-        self._post({"jsonrpc": "2.0", "method": "initialize", "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "koala-stage-a", "version": "1"}}, "id": self.request_id})
+    def initialize(self, timeout_s: float = READINESS_LIMIT_S) -> None:
+        deadline = time.monotonic() + timeout_s
+        while True:
+            self.request_id += 1
+            try:
+                self._post({"jsonrpc": "2.0", "method": "initialize", "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "koala-stage-a", "version": "1"}}, "id": self.request_id})
+                return
+            except RehearsalUnknown:
+                if time.monotonic() >= deadline:
+                    raise RehearsalUnknown("MCP readiness deadline expired")
+                time.sleep(1)
     def call(self, method: str, arguments: dict[str, Any]) -> tuple[Any, float]:
         self.request_id += 1; started = time.monotonic()
         response = self._post({"jsonrpc": "2.0", "method": "tools/call", "params": {"name": method, "arguments": arguments}, "id": self.request_id})

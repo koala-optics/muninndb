@@ -45,6 +45,7 @@ PRODUCTION_VOLUME_IDS = frozenset({"vol_vgn3o017zm3gkgz4"})
 COLLISION_CONCEPTS = ("stage-a/collision/1162789", "stage-a/collision/1379192")
 DIGEST_REF = re.compile(r"[a-z0-9./-]+@sha256:[0-9a-f]{64}")
 RUN_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{3,31}")
+FLY_VOLUME_NAME_RE = re.compile(r"[a-z0-9_]{1,30}")
 SENSITIVE_TEXT = re.compile(r"https?://|(?i:authorization|bearer|password|secret|token|x-amz-|fly_api)")
 RECEIPT_KEYS = frozenset({"schema_version", "status", "exit_code", "run_id", "source", "images", "corpus", "resources", "measurements", "gates", "cleanup", "orphans", "detail", "limitations"})
 
@@ -115,20 +116,43 @@ def build_identity(run_id: str) -> RunIdentity:
     if not RUN_ID_RE.fullmatch(run_id):
         raise RehearsalUnknown("invalid run ID")
     digest = hashlib.sha256(f"koala-stage-a:{run_id}".encode()).hexdigest()[:10]
-    prefix = f"koala-stage-a-{run_id}"
-    identity = RunIdentity(run_id, prefix, f"{prefix}-source", f"{prefix}-backup", f"{prefix}-restore", f"{prefix}-rollback", f"STAGE-A-{run_id}-{digest}")
+    app_name = f"koala-stage-a-{run_id}"
+    volume_prefix = f"ksa_{digest}"
+    identity = RunIdentity(
+        run_id,
+        app_name,
+        f"{volume_prefix}_src",
+        f"{volume_prefix}_bak",
+        f"{volume_prefix}_rst",
+        f"{volume_prefix}_rbk",
+        f"STAGE-A-{run_id}-{digest}",
+    )
     assert_not_production(identity)
     return identity
 
 def assert_not_production(identity: RunIdentity) -> None:
-    names = (identity.app_name, identity.volume_name, identity.backup_volume_name, identity.restore_volume_name, identity.rollback_volume_name)
-    if any(name == PRODUCTION_APP or not name.startswith("koala-stage-a-") for name in names):
-        raise RehearsalUnknown("refusing production or non-Stage-A resource name")
+    volumes = (identity.volume_name, identity.backup_volume_name, identity.restore_volume_name, identity.rollback_volume_name)
+    if identity.app_name == PRODUCTION_APP or not identity.app_name.startswith("koala-stage-a-"):
+        raise RehearsalUnknown("refusing production or non-Stage-A app name")
+    if len(set(volumes)) != len(volumes) or any(
+        name in PRODUCTION_VOLUME_IDS or not FLY_VOLUME_NAME_RE.fullmatch(name)
+        for name in volumes
+    ):
+        raise RehearsalUnknown("refusing production or invalid Stage-A volume name")
 
 def assert_owned(value: str, identity: RunIdentity, kind: str) -> None:
     if value in PRODUCTION_MACHINE_IDS or value in PRODUCTION_VOLUME_IDS or value == PRODUCTION_APP:
         raise RehearsalUnknown(f"refusing preserved production {kind}")
-    if kind.endswith("name") and identity.run_id not in value:
+    names = {
+        "app-name": {identity.app_name},
+        "volume-name": {
+            identity.volume_name,
+            identity.backup_volume_name,
+            identity.restore_volume_name,
+            identity.rollback_volume_name,
+        },
+    }
+    if kind in names and value not in names[kind]:
         raise RehearsalUnknown(f"refusing unowned {kind}")
 
 def validate_image(ref: str, role: str) -> str:

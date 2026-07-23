@@ -39,8 +39,58 @@ class StageAContractTests(unittest.TestCase):
         identity = stage.build_identity("contract-123")
         self.assertTrue(identity.app_name.startswith("koala-stage-a-contract-123"))
         self.assertEqual(identity.confirmation, stage.build_identity("contract-123").confirmation)
-        bad = stage.RunIdentity("x", stage.PRODUCTION_APP, "koala-stage-a-x-source", "koala-stage-a-x-backup", "koala-stage-a-x-restore", "koala-stage-a-x-rollback", "x")
+        bad = stage.RunIdentity("x", stage.PRODUCTION_APP, "ksa_1234567890_src", "ksa_1234567890_bak", "ksa_1234567890_rst", "ksa_1234567890_rbk", "x")
         with self.assertRaises(stage.RehearsalUnknown): stage.assert_not_production(bad)
+
+    def test_volume_names_follow_fly_contract_and_are_deterministic(self):
+        first = stage.build_identity("contract-123")
+        repeated = stage.build_identity("contract-123")
+        other = stage.build_identity("contract-456")
+        first_names = (
+            first.volume_name,
+            first.backup_volume_name,
+            first.restore_volume_name,
+            first.rollback_volume_name,
+        )
+        other_names = (
+            other.volume_name,
+            other.backup_volume_name,
+            other.restore_volume_name,
+            other.rollback_volume_name,
+        )
+        self.assertEqual(first_names, (
+            repeated.volume_name,
+            repeated.backup_volume_name,
+            repeated.restore_volume_name,
+            repeated.rollback_volume_name,
+        ))
+        self.assertEqual(len(set(first_names)), 4)
+        self.assertNotEqual(first_names, other_names)
+        self.assertTrue(all(stage.FLY_VOLUME_NAME_RE.fullmatch(name) for name in first_names))
+
+    def test_volume_name_guard_rejects_invalid_duplicate_and_unowned_names(self):
+        identity = stage.build_identity("contract-123")
+        invalid = stage.RunIdentity(
+            identity.run_id,
+            identity.app_name,
+            "koala-stage-a-invalid-source",
+            identity.backup_volume_name,
+            identity.restore_volume_name,
+            identity.rollback_volume_name,
+            identity.confirmation,
+        )
+        duplicate = stage.RunIdentity(
+            identity.run_id,
+            identity.app_name,
+            identity.volume_name,
+            identity.volume_name,
+            identity.restore_volume_name,
+            identity.rollback_volume_name,
+            identity.confirmation,
+        )
+        with self.assertRaises(stage.RehearsalUnknown): stage.assert_not_production(invalid)
+        with self.assertRaises(stage.RehearsalUnknown): stage.assert_not_production(duplicate)
+        with self.assertRaises(stage.RehearsalUnknown): stage.assert_owned("ksa_deadbeef00_src", identity, "volume-name")
 
     def test_defaults_are_production_scale_and_twenty_gb(self):
         self.assertEqual(stage.DEFAULT_RECORD_COUNT, 502_385)

@@ -6,7 +6,7 @@ on:
       source_tag:
         description: Non-v Koala source tag to qualify
         required: true
-        default: koala-v0.9.0-rc.1
+        default: koala-v0.9.0-rc.2
         type: string
       source_commit:
         description: Exact 40-character source commit
@@ -27,8 +27,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  RC_TAG: koala-v0.9.0-rc.1
-  RC_IMAGE: ghcr.io/koala-optics/muninndb:koala-v0.9.0-rc.1-amd64
+  RC_TAG: koala-v0.9.0-rc.2
+  RC_IMAGE: ghcr.io/koala-optics/muninndb:koala-v0.9.0-rc.2-amd64
   QUALIFICATION_DIR: /tmp/koala-rc-qualification
 
 jobs:
@@ -166,7 +166,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: koala-v0.9.0-rc.1-amd64-qualification
+          name: koala-v0.9.0-rc.2-amd64-qualification
           path: |
             /tmp/koala-rc-qualification/receipt.json
             /tmp/koala-rc-qualification/receipt.sha256

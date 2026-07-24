@@ -326,35 +326,42 @@ def require_disk_safety(sample: DiskSample) -> None:
         )
 
 def calibration_projection(
-    empty: DiskSample,
-    low: DiskSample,
-    high: DiskSample,
+    low_empty: DiskSample,
+    low_populated: DiskSample,
+    high_empty: DiskSample,
+    high_populated: DiskSample,
     sample_count: int = CALIBRATION_SAMPLE_COUNT,
 ) -> dict[str, Any]:
     if sample_count != CALIBRATION_SAMPLE_COUNT:
         raise RehearsalUnknown("calibration sample count differs from fixed pilot contract")
-    low_net, high_increment = low.used_bytes - empty.used_bytes, high.used_bytes - low.used_bytes
-    if low_net <= 0 or high_increment <= 0:
-        raise RehearsalUnknown("calibration store did not grow across both samples")
+    low_net = low_populated.used_bytes - low_empty.used_bytes
+    high_net = high_populated.used_bytes - high_empty.used_bytes
+    if low_net <= 0 or high_net <= 0:
+        raise RehearsalUnknown("calibration store did not grow across both independent samples")
     payload_delta = CALIBRATION_HIGH_PAYLOAD_BYTES - CALIBRATION_LOW_PAYLOAD_BYTES
     low_bytes_per_record = low_net / sample_count
-    high_bytes_per_record = high_increment / sample_count
+    high_bytes_per_record = high_net / sample_count
     bytes_per_payload_byte = (high_bytes_per_record - low_bytes_per_record) / payload_delta
     fixed_bytes_per_record = low_bytes_per_record - bytes_per_payload_byte * CALIBRATION_LOW_PAYLOAD_BYTES
     if bytes_per_payload_byte <= 0 or fixed_bytes_per_record < 0:
         raise RehearsalUnknown("calibration slope or fixed overhead invalid")
-    projected_minimum = empty.used_bytes + DEFAULT_RECORD_COUNT * (
+    empty_used_bytes = max(low_empty.used_bytes, high_empty.used_bytes)
+    projected_minimum = empty_used_bytes + DEFAULT_RECORD_COUNT * (
         fixed_bytes_per_record + bytes_per_payload_byte * MIN_PAYLOAD_BYTES
     )
     recommended = round(
-        (TARGET_STORE_BYTES - empty.used_bytes - DEFAULT_RECORD_COUNT * fixed_bytes_per_record)
+        (TARGET_STORE_BYTES - empty_used_bytes - DEFAULT_RECORD_COUNT * fixed_bytes_per_record)
         / (DEFAULT_RECORD_COUNT * bytes_per_payload_byte)
     )
     recommendation = recommended if MIN_PAYLOAD_BYTES <= recommended <= MAX_PAYLOAD_BYTES else None
     return {
-        "empty_used_bytes": empty.used_bytes,
-        "low_sample_used_bytes": low.used_bytes,
-        "high_sample_used_bytes": high.used_bytes,
+        "low_empty_used_bytes": low_empty.used_bytes,
+        "low_sample_used_bytes": low_populated.used_bytes,
+        "low_net_growth_bytes": low_net,
+        "high_empty_used_bytes": high_empty.used_bytes,
+        "high_sample_used_bytes": high_populated.used_bytes,
+        "high_net_growth_bytes": high_net,
+        "projection_empty_used_bytes": empty_used_bytes,
         "sample_count_each": sample_count,
         "bytes_per_payload_byte": round(bytes_per_payload_byte, 6),
         "fixed_bytes_per_record": round(fixed_bytes_per_record, 3),
@@ -856,41 +863,57 @@ def calibrate(
     try:
         validate_calibration_spec(spec); validate_image(BASELINE_IMAGE, "baseline"); runtime.preflight(identity)
         ledger.app = runtime.create_app(identity); runtime.install_auth(identity, auth_value)
-        ledger.volume_id = runtime.create_volume(identity, identity.volume_name)
-        ledger.machine_id = runtime.create_machine(identity, ledger.volume_id, BASELINE_IMAGE, "baseline")
-        runtime.wait_ready(identity, ledger.machine_id, READINESS_LIMIT_S)
-        empty = runtime.disk_sample(identity, ledger.machine_id, "calibration-empty")
-        measurements["disk_samples"].append(asdict(empty) | {"free_percent": empty.free_percent})
-        proxy = runtime.proxy(identity, ledger.machine_id, local_port)
-        client = client_factory(f"http://127.0.0.1:{local_port}/mcp", auth_value); client.initialize()
-        def checkpoint(progress: IngestProgress) -> None:
-            nonlocal corpus_receipt
-            corpus_receipt = progress
-            sample = runtime.disk_sample(identity, ledger.machine_id or "", "calibration-ingestion")
-            require_disk_safety(sample)
-            measurements["latest_disk_sample"] = asdict(sample) | {"free_percent": sample.free_percent}
-            write_receipt(receipt_path, receipt_document(
-                identity, spec, status="UNKNOWN", exit_code=2, detail="calibration ingestion in progress",
-                ledger=ledger, measurements=measurements, gates=gates, cleanup_result={}, orphans=[],
-                corpus=progress, mode="calibrate",
-            ))
-        corpus_receipt = ingest_corpus(
-            client, spec, minimum_count=CALIBRATION_SAMPLE_COUNT, progress=checkpoint,
-        )
-        low = runtime.disk_sample(identity, ledger.machine_id, "calibration-low-payload")
-        require_disk_safety(low)
-        measurements["disk_samples"].append(asdict(low) | {"free_percent": low.free_percent})
+
+        def ingest_independent_cohort(
+            cohort_spec: CorpusSpec,
+            cohort: str,
+            port: int,
+        ) -> tuple[DiskSample, DiskSample, CorpusReceipt]:
+            nonlocal corpus_receipt, proxy
+            ledger.volume_id = runtime.create_volume(identity, identity.volume_name)
+            ledger.machine_id = runtime.create_machine(identity, ledger.volume_id, BASELINE_IMAGE, "baseline")
+            runtime.wait_ready(identity, ledger.machine_id, READINESS_LIMIT_S)
+            empty = runtime.disk_sample(identity, ledger.machine_id, f"calibration-{cohort}-empty")
+            measurements["disk_samples"].append(asdict(empty) | {"free_percent": empty.free_percent})
+            proxy = runtime.proxy(identity, ledger.machine_id, port)
+            client = client_factory(f"http://127.0.0.1:{port}/mcp", auth_value); client.initialize()
+
+            def checkpoint(progress: IngestProgress) -> None:
+                nonlocal corpus_receipt
+                corpus_receipt = progress
+                sample = runtime.disk_sample(identity, ledger.machine_id or "", f"calibration-{cohort}-ingestion")
+                require_disk_safety(sample)
+                measurements["latest_disk_sample"] = asdict(sample) | {"free_percent": sample.free_percent}
+                write_receipt(receipt_path, receipt_document(
+                    identity, spec, status="UNKNOWN", exit_code=2,
+                    detail=f"calibration {cohort} ingestion in progress",
+                    ledger=ledger, measurements=measurements, gates=gates, cleanup_result={}, orphans=[],
+                    corpus=progress, mode="calibrate",
+                ))
+
+            cohort_receipt = ingest_corpus(
+                client, cohort_spec, minimum_count=CALIBRATION_SAMPLE_COUNT, progress=checkpoint,
+            )
+            corpus_receipt = cohort_receipt
+            populated = runtime.disk_sample(identity, ledger.machine_id, f"calibration-{cohort}-populated")
+            require_disk_safety(populated)
+            measurements["disk_samples"].append(asdict(populated) | {"free_percent": populated.free_percent})
+            terminate_proxy(proxy); proxy = None
+            return empty, populated, cohort_receipt
+
+        low_empty, low_populated, low_receipt = ingest_independent_cohort(spec, "low", local_port)
+        measurements["low_sample"] = corpus_evidence(spec, low_receipt)
+        runtime.destroy_machine(identity, ledger.machine_id or ""); ledger.machine_id = None
+        runtime.destroy_volume(identity, ledger.volume_id or ""); ledger.volume_id = None
+
         high_spec = CorpusSpec(
             CALIBRATION_SAMPLE_COUNT, spec.batch_size, CALIBRATION_HIGH_PAYLOAD_BYTES,
             f"{spec.seed}-high",
         )
-        high_receipt = ingest_corpus(
-            client, high_spec, minimum_count=CALIBRATION_SAMPLE_COUNT, progress=checkpoint,
+        high_empty, high_populated, high_receipt = ingest_independent_cohort(
+            high_spec, "high", local_port + 1,
         )
-        populated = runtime.disk_sample(identity, ledger.machine_id, "calibration-high-payload")
-        require_disk_safety(populated)
-        measurements["disk_samples"].append(asdict(populated) | {"free_percent": populated.free_percent})
-        projection = calibration_projection(empty, low, populated)
+        projection = calibration_projection(low_empty, low_populated, high_empty, high_populated)
         measurements["calibration"] = projection
         measurements["high_sample"] = corpus_evidence(high_spec, high_receipt)
         if projection["projected_minimum_bytes"] > MAX_STORE_BYTES:

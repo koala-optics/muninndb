@@ -120,26 +120,39 @@ class StageAContractTests(unittest.TestCase):
         with self.assertRaises(stage.RehearsalUnknown):
             stage.validate_calibration_spec(stage.CorpusSpec(spec.count, 50, spec.payload_bytes + 1, spec.seed))
 
-    def test_calibration_projection_separates_fixed_and_payload_costs(self):
+    def test_calibration_projection_separates_independent_store_costs(self):
         gib = 1024**3
         sample = stage.CALIBRATION_SAMPLE_COUNT
-        empty = stage.DiskSample("empty", 100 * 1024**2, 19 * gib, 20 * gib)
+        low_empty = stage.DiskSample("low-empty", 100 * 1024**2, 19 * gib, 20 * gib)
+        high_empty = stage.DiskSample("high-empty", 110 * 1024**2, 19 * gib, 20 * gib)
         fixed, amplification = 7000, 1.0
-        low_used = empty.used_bytes + round(sample * (fixed + amplification * stage.CALIBRATION_LOW_PAYLOAD_BYTES))
-        high_used = low_used + round(sample * (fixed + amplification * stage.CALIBRATION_HIGH_PAYLOAD_BYTES))
+        low_used = low_empty.used_bytes + round(sample * (fixed + amplification * stage.CALIBRATION_LOW_PAYLOAD_BYTES))
+        high_used = high_empty.used_bytes + round(sample * (fixed + amplification * stage.CALIBRATION_HIGH_PAYLOAD_BYTES))
         projection = stage.calibration_projection(
-            empty,
+            low_empty,
             stage.DiskSample("low", low_used, 18 * gib, 20 * gib),
+            high_empty,
             stage.DiskSample("high", high_used, 17 * gib, 20 * gib),
         )
         self.assertAlmostEqual(projection["fixed_bytes_per_record"], fixed, places=2)
         self.assertAlmostEqual(projection["bytes_per_payload_byte"], amplification, places=4)
+        self.assertEqual(projection["low_net_growth_bytes"], low_used - low_empty.used_bytes)
+        self.assertEqual(projection["high_net_growth_bytes"], high_used - high_empty.used_bytes)
+        self.assertEqual(projection["projection_empty_used_bytes"], high_empty.used_bytes)
         self.assertIsInstance(projection["recommended_payload_bytes"], int)
 
     def test_calibration_projection_rejects_non_growth(self):
         sample = stage.DiskSample("same", 1000, 9000, 10000)
         with self.assertRaises(stage.RehearsalUnknown):
-            stage.calibration_projection(sample, sample, sample)
+            stage.calibration_projection(sample, sample, sample, sample)
+
+    def test_calibration_projection_rejects_non_positive_independent_slope(self):
+        low_empty = stage.DiskSample("low-empty", 1000, 9000, 10000)
+        low = stage.DiskSample("low", 3000, 7000, 10000)
+        high_empty = stage.DiskSample("high-empty", 2000, 8000, 10000)
+        high = stage.DiskSample("high", 3500, 6500, 10000)
+        with self.assertRaises(stage.RehearsalUnknown):
+            stage.calibration_projection(low_empty, low, high_empty, high)
 
     def test_records_are_deterministic_valid_and_synthetic(self):
         spec = self.small_spec()
@@ -543,14 +556,18 @@ class StageAContractTests(unittest.TestCase):
         )
         runtime = mock.Mock()
         runtime.create_app.return_value = identity.app_name
-        runtime.create_volume.return_value = "vol_owned"
-        runtime.create_machine.return_value = "machine_owned"
-        runtime.proxy.return_value = mock.Mock(poll=mock.Mock(return_value=0))
+        runtime.create_volume.side_effect = ["vol_low", "vol_high"]
+        runtime.create_machine.side_effect = ["machine_low", "machine_high"]
+        runtime.proxy.side_effect = [
+            mock.Mock(poll=mock.Mock(return_value=0)),
+            mock.Mock(poll=mock.Mock(return_value=0)),
+        ]
         gib = 1024**3
         runtime.disk_sample.side_effect = [
-            stage.DiskSample("empty", 100 * 1024**2, 19 * gib, 20 * gib),
+            stage.DiskSample("low-empty", 100 * 1024**2, 19 * gib, 20 * gib),
             stage.DiskSample("low", 300 * 1024**2, 18 * gib, 20 * gib),
-            stage.DiskSample("high", 575 * 1024**2, 17 * gib, 20 * gib),
+            stage.DiskSample("high-empty", 110 * 1024**2, 19 * gib, 20 * gib),
+            stage.DiskSample("high", 385 * 1024**2, 17 * gib, 20 * gib),
         ]
         runtime.list_owned_resources.return_value = []
         client = mock.Mock()
@@ -571,14 +588,27 @@ class StageAContractTests(unittest.TestCase):
             ), 0)
             document = json.loads(path.read_text())
         self.assertEqual([item.payload_bytes for item in seen_specs], [1000, 4000])
-        runtime.create_machine.assert_called_once_with(
-            identity, "vol_owned", stage.BASELINE_IMAGE, "baseline",
-        )
+        self.assertEqual(runtime.create_volume.call_args_list, [
+            mock.call(identity, identity.volume_name),
+            mock.call(identity, identity.volume_name),
+        ])
+        self.assertEqual(runtime.create_machine.call_args_list, [
+            mock.call(identity, "vol_low", stage.BASELINE_IMAGE, "baseline"),
+            mock.call(identity, "vol_high", stage.BASELINE_IMAGE, "baseline"),
+        ])
         self.assertNotIn(stage.CANDIDATE_IMAGE, repr(runtime.mock_calls))
         self.assertEqual(document["status"], "PASSED")
         self.assertEqual(document["measurements"]["mode"], "calibrate")
-        runtime.destroy_machine.assert_called_once_with(identity, "machine_owned")
-        runtime.destroy_volume.assert_called_once_with(identity, "vol_owned")
+        self.assertEqual(document["measurements"]["calibration"]["low_empty_used_bytes"], 100 * 1024**2)
+        self.assertEqual(document["measurements"]["calibration"]["high_empty_used_bytes"], 110 * 1024**2)
+        self.assertEqual(runtime.destroy_machine.call_args_list, [
+            mock.call(identity, "machine_low"),
+            mock.call(identity, "machine_high"),
+        ])
+        self.assertEqual(runtime.destroy_volume.call_args_list, [
+            mock.call(identity, "vol_low"),
+            mock.call(identity, "vol_high"),
+        ])
         runtime.destroy_app.assert_called_once_with(identity)
 
     def test_workflow_reserves_cleanup_headroom_and_uploads_both_receipts(self):

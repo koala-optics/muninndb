@@ -148,6 +148,44 @@ class StageAContractTests(unittest.TestCase):
         self.assertTrue(json.loads(one["memory"]["content"])["synthetic"])
         self.assertNotIn("padding", one["memory"]["content"].lower())
 
+    def test_bulk_records_are_lean_and_probe_records_are_rich(self):
+        spec = self.small_spec()
+        bulk = stage.record_for(spec, 44)
+        probe = stage.record_for(spec, 42)
+        self.assertIsNone(bulk["probe_kind"])
+        self.assertFalse({"summary", "tags", "entities"} & bulk["memory"].keys())
+        self.assertEqual(probe["probe_kind"], "ordering")
+        self.assertTrue({"summary", "tags", "entities"} <= probe["memory"].keys())
+
+    def test_probe_contract_is_sparse_and_covers_semantic_targets(self):
+        self.assertEqual([stage.probe_kind(i) for i in (0, 1)], ["collision", "collision"])
+        self.assertEqual(stage.probe_kind(43), "hard-delete")
+        self.assertEqual(stage.probe_kind(97), "isolation")
+        self.assertEqual(stage.probe_kind(42), "ordering")
+        self.assertEqual([stage.probe_kind(i) for i in (50, 51, 57)], ["fuzzy", "fuzzy", "fuzzy"])
+        counts = stage.shape_counts(stage.DEFAULT_RECORD_COUNT)
+        self.assertEqual(counts["shape_version"], stage.CORPUS_SHAPE_VERSION)
+        self.assertEqual(counts["bulk_records"] + counts["probe_records"], stage.DEFAULT_RECORD_COUNT)
+        self.assertLess(counts["probe_records"], stage.DEFAULT_RECORD_COUNT // 500)
+
+    def test_calibration_and_full_generation_share_shape_selection(self):
+        for index in (0, 42, 43, 44, 50, 51, 57, 97, 10042):
+            low = stage.record_for(stage.CorpusSpec(25000, 50, 1000, "low"), index)
+            high = stage.record_for(stage.CorpusSpec(25000, 50, 4000, "high"), index)
+            full = stage.record_for(stage.CorpusSpec(), index)
+            self.assertEqual(low["probe_kind"], high["probe_kind"])
+            self.assertEqual(low["probe_kind"], full["probe_kind"])
+            self.assertEqual(low["vault"], full["vault"])
+
+    def test_fuzzy_probe_entities_cover_runtime_queries(self):
+        spec = self.small_spec()
+        entity_names = {
+            entity["name"]
+            for index in (50, 51, 57)
+            for entity in stage.record_for(spec, index)["memory"]["entities"]
+        }
+        self.assertTrue({"Stage A Entity 00", "Stage A Entity 07", "Stage A Group 2"} <= entity_names)
+
     def test_collision_pair_has_same_fnv_hash_but_different_strings(self):
         left, right = stage.COLLISION_CONCEPTS
         self.assertNotEqual(left, right); self.assertEqual(stage.fnv1a_32(left), stage.fnv1a_32(right))

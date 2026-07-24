@@ -11,6 +11,7 @@ import base64
 import hashlib
 import json
 import math
+from functools import lru_cache
 import os
 import re
 import secrets
@@ -26,7 +27,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Sequence
 
 SCHEMA_VERSION = 1
-CORPUS_SCHEMA_VERSION = 1
+CORPUS_SCHEMA_VERSION = 2
+CORPUS_SHAPE_VERSION = "lean-bulk-probes-v1"
 DEFAULT_RECORD_COUNT = MIN_RECORD_COUNT = 502_385
 DEFAULT_BATCH_SIZE = MAX_BATCH_SIZE = 50
 DEFAULT_PAYLOAD_BYTES = 10_900
@@ -197,18 +199,37 @@ def deterministic_payload(seed: str, index: int, length: int) -> str:
     raw = hashlib.shake_256(f"{seed}:{index}".encode()).digest(math.ceil(length * 3 / 4))
     return base64.b64encode(raw).decode()[:length]
 
+def probe_kind(index: int) -> str | None:
+    if index < 2: return "collision"
+    if index == 43: return "hard-delete"
+    if index in (97, 194, 291, 388, 485, 582, 679, 776, 873, 970): return "isolation"
+    if index % 1000 == 42: return "ordering"
+    if index in (50, 51, 57): return "fuzzy"
+    return None
+
 def record_for(spec: CorpusSpec, index: int) -> dict[str, Any]:
-    cohort, seconds = index % 1000, index % 2_419_200
-    vault = "stage-a-isolation" if index % 97 == 0 and index > 1 else "stage-a-primary"
-    concept = COLLISION_CONCEPTS[index] if index < 2 else f"stage-a/concept/{cohort:04d}"
-    if vault == "stage-a-isolation":
-        concept = f"stage-a/isolation/{index:07d}"
+    cohort, seconds, kind = index % 1000, index % 2_419_200, probe_kind(index)
+    vault = "stage-a-isolation" if kind == "isolation" else "stage-a-primary"
+    concept = COLLISION_CONCEPTS[index] if kind == "collision" else f"stage-a/concept/{cohort:04d}"
+    if kind == "isolation": concept = f"stage-a/isolation/{index:07d}"
     content = json.dumps({"schema": CORPUS_SCHEMA_VERSION, "synthetic": True, "index": index, "payload": deterministic_payload(spec.seed, index, spec.payload_bytes)}, sort_keys=True, separators=(",", ":"))
-    return {"vault": vault, "key": f"record-{index:07d}", "memory": {
-        "concept": concept, "content": content, "summary": f"Synthetic Stage A record {index}",
+    memory: dict[str, Any] = {
+        "concept": concept, "content": content,
         "created_at": f"2025-01-{1 + seconds // 86400:02d}T{seconds // 3600 % 24:02d}:{seconds // 60 % 60:02d}:{seconds % 60:02d}Z",
-        "confidence": 1.0, "tags": ["koala-stage-a", "synthetic-only", f"cohort-{cohort:04d}"],
-        "entities": [{"name": f"Stage A Entity {cohort % 50:02d}", "type": "synthetic"}, {"name": f"Stage A Group {cohort % 7}", "type": "group"}]}}
+        "confidence": 1.0,
+    }
+    if kind:
+        memory.update({
+            "summary": f"Synthetic Stage A probe {index}",
+            "tags": ["koala-stage-a", "synthetic-only", f"probe-{kind}"],
+            "entities": [{"name": f"Stage A Entity {cohort % 50:02d}", "type": "synthetic"}, {"name": f"Stage A Group {cohort % 7}", "type": "group"}],
+        })
+    return {"vault": vault, "key": f"record-{index:07d}", "probe_kind": kind, "memory": memory}
+
+@lru_cache(maxsize=4)
+def shape_counts(count: int) -> dict[str, int]:
+    probes = sum(probe_kind(index) is not None for index in range(count))
+    return {"shape_version": CORPUS_SHAPE_VERSION, "bulk_records": count - probes, "probe_records": probes}
 
 def iter_records(spec: CorpusSpec, *, minimum_count: int = MIN_RECORD_COUNT) -> Iterator[dict[str, Any]]:
     validate_spec(spec, minimum_count=minimum_count)
@@ -383,6 +404,7 @@ def corpus_evidence(spec: CorpusSpec, receipt: CorpusReceipt | IngestProgress | 
         "seed": spec.seed,
         "requested_count": spec.count,
         "payload_bytes": spec.payload_bytes,
+        **shape_counts(spec.count),
     }
     if isinstance(receipt, CorpusReceipt):
         evidence.update({

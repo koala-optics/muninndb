@@ -383,6 +383,36 @@ class StageAContractTests(unittest.TestCase):
         sample = runtime.resource_sample(identity, "machine", "migration")
         self.assertEqual(sample, stage.ResourceSample("migration", 37.5, 2 * 1024 * 1024))
 
+    def test_json_retries_malformed_output_with_fresh_invocation(self):
+        responses = [
+            subprocess.CompletedProcess([], 0, "temporary warning\n", ""),
+            subprocess.CompletedProcess([], 0, json.dumps([{"id": "vol_test"}]), ""),
+        ]
+        runtime = stage.FlyRuntime(runner=mock.Mock(side_effect=responses))
+        with mock.patch.object(stage.time, "sleep") as sleep:
+            result = runtime.json(["volumes", "list", "-a", "test-app"])
+        self.assertEqual(result, [{"id": "vol_test"}])
+        self.assertEqual(runtime.runner.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+    def test_json_fails_after_three_malformed_responses(self):
+        runner = mock.Mock(return_value=subprocess.CompletedProcess([], 0, "not-json\n", ""))
+        runtime = stage.FlyRuntime(runner=runner)
+        with mock.patch.object(stage.time, "sleep") as sleep:
+            with self.assertRaisesRegex(stage.RehearsalUnknown, "returned invalid JSON"):
+                runtime.json(["volumes", "list", "-a", "test-app"])
+        self.assertEqual(runner.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2])
+
+    def test_json_does_not_retry_command_failure(self):
+        runner = mock.Mock(return_value=subprocess.CompletedProcess([], 1, "", "permission denied"))
+        runtime = stage.FlyRuntime(runner=runner)
+        with mock.patch.object(stage.time, "sleep") as sleep:
+            with self.assertRaisesRegex(stage.RehearsalUnknown, "flyctl volumes failed"):
+                runtime.json(["volumes", "list", "-a", "test-app"])
+        runner.assert_called_once()
+        sleep.assert_not_called()
+
     def test_disk_sample_retries_only_transient_408(self):
         identity = stage.build_identity("disk-retry")
         responses = [

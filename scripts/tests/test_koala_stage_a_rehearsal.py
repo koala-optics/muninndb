@@ -103,6 +103,44 @@ class StageAContractTests(unittest.TestCase):
         self.assertEqual(stage.VOLUME_SIZE_GB, 20)
         with self.assertRaises(stage.RehearsalUnknown): stage.validate_spec(self.small_spec())
 
+    def test_calibration_contract_is_fixed_and_two_point(self):
+        spec = stage.CorpusSpec(
+            stage.CALIBRATION_SAMPLE_COUNT,
+            50,
+            stage.CALIBRATION_LOW_PAYLOAD_BYTES,
+            "test-seed",
+        )
+        stage.validate_calibration_spec(spec)
+        self.assertEqual(
+            (stage.CALIBRATION_LOW_PAYLOAD_BYTES, stage.CALIBRATION_HIGH_PAYLOAD_BYTES),
+            (1000, 4000),
+        )
+        with self.assertRaises(stage.RehearsalUnknown):
+            stage.validate_calibration_spec(stage.CorpusSpec(spec.count + 1, 50, spec.payload_bytes, spec.seed))
+        with self.assertRaises(stage.RehearsalUnknown):
+            stage.validate_calibration_spec(stage.CorpusSpec(spec.count, 50, spec.payload_bytes + 1, spec.seed))
+
+    def test_calibration_projection_separates_fixed_and_payload_costs(self):
+        gib = 1024**3
+        sample = stage.CALIBRATION_SAMPLE_COUNT
+        empty = stage.DiskSample("empty", 100 * 1024**2, 19 * gib, 20 * gib)
+        fixed, amplification = 7000, 1.0
+        low_used = empty.used_bytes + round(sample * (fixed + amplification * stage.CALIBRATION_LOW_PAYLOAD_BYTES))
+        high_used = low_used + round(sample * (fixed + amplification * stage.CALIBRATION_HIGH_PAYLOAD_BYTES))
+        projection = stage.calibration_projection(
+            empty,
+            stage.DiskSample("low", low_used, 18 * gib, 20 * gib),
+            stage.DiskSample("high", high_used, 17 * gib, 20 * gib),
+        )
+        self.assertAlmostEqual(projection["fixed_bytes_per_record"], fixed, places=2)
+        self.assertAlmostEqual(projection["bytes_per_payload_byte"], amplification, places=4)
+        self.assertIsInstance(projection["recommended_payload_bytes"], int)
+
+    def test_calibration_projection_rejects_non_growth(self):
+        sample = stage.DiskSample("same", 1000, 9000, 10000)
+        with self.assertRaises(stage.RehearsalUnknown):
+            stage.calibration_projection(sample, sample, sample)
+
     def test_records_are_deterministic_valid_and_synthetic(self):
         spec = self.small_spec()
         one, two = stage.record_for(spec, 42), stage.record_for(spec, 42)
@@ -143,6 +181,43 @@ class StageAContractTests(unittest.TestCase):
         with mock.patch.object(stage, "validate_spec"):
             second = stage.ingest_corpus(client2, spec)
         self.assertEqual(first.manifest_sha256, second.manifest_sha256)
+
+    def test_streaming_ingest_emits_bounded_progress(self):
+        progress = []
+        spec = self.small_spec()
+        with mock.patch.object(stage, "validate_spec"):
+            receipt = stage.ingest_corpus(
+                FakeClient(), spec, progress=progress.append, progress_interval=1,
+            )
+        self.assertGreaterEqual(len(progress), 2)
+        self.assertEqual(progress[-1].accepted, receipt.accepted)
+        self.assertEqual(progress[-1].batch_latency["count"], receipt.batches)
+        self.assertFalse(hasattr(progress[-1], "retained_ids"))
+        with self.assertRaises(stage.RehearsalUnknown):
+            stage.ingest_corpus(FakeClient(), spec, progress_interval=0)
+
+    def test_progress_receipt_is_unknown_bounded_and_incomplete(self):
+        identity = stage.build_identity("progress-test")
+        spec = stage.CorpusSpec()
+        progress = stage.IngestProgress(5000, 5000, 100, 12.3, {"count": 100, "p50_ms": 1.0, "p95_ms": 2.0, "max_ms": 3.0})
+        document = stage.receipt_document(
+            identity, spec, status="UNKNOWN", exit_code=2, detail="baseline ingestion in progress",
+            ledger=stage.ResourceLedger(app=identity.app_name, volume_id="vol_owned"),
+            measurements={"latest_disk_sample": {"used_bytes": 123}}, gates={},
+            cleanup_result={}, orphans=[], corpus=progress,
+        )
+        self.assertEqual(document["status"], "UNKNOWN")
+        self.assertFalse(document["corpus"]["complete"])
+        self.assertNotIn("manifest_sha256", document["corpus"])
+        self.assertNotIn("retained_ids", document["corpus"])
+
+    def test_ingestion_disk_safety_fails_fast(self):
+        safe = stage.DiskSample("safe", stage.MAX_PEAK_BYTES, 7, 10)
+        stage.require_disk_safety(safe)
+        with self.assertRaises(stage.RehearsalFailed):
+            stage.require_disk_safety(stage.DiskSample("peak", stage.MAX_PEAK_BYTES + 1, 7, 10))
+        with self.assertRaises(stage.RehearsalFailed):
+            stage.require_disk_safety(stage.DiskSample("free", 1, 2, 10))
 
     def test_partial_batch_error_fails_closed(self):
         with mock.patch.object(stage, "validate_spec"):
@@ -287,5 +362,199 @@ class StageAContractTests(unittest.TestCase):
         runtime.destroy_machine.side_effect = RuntimeError("fail"); runtime.list_owned_resources.return_value = []
         _, orphans = stage.cleanup(runtime, identity, stage.ResourceLedger(machine_id="owned-machine"))
         self.assertEqual(orphans, ["owned-machine"])
+
+    def test_cleanup_discovery_is_exact_and_absent_is_idempotent(self):
+        identity = stage.build_identity("discover-test")
+        absent = stage.FlyRuntime(runner=lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 1, "", "missing"))
+        self.assertEqual(absent.discover_owned_resources(identity), stage.ResourceLedger())
+
+        calls = []
+        def runner(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[1] == "status": return subprocess.CompletedProcess(cmd, 0, "ok", "")
+            if "machines" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, json.dumps([{
+                    "id": "ownedmachine", "config": {"metadata": {"koala_stage_a_run": identity.run_id}},
+                }]), "")
+            if "volumes" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, json.dumps([{
+                    "id": "vol_owned", "name": identity.volume_name,
+                }]), "")
+            raise AssertionError(cmd)
+        discovered = stage.FlyRuntime(runner=runner).discover_owned_resources(identity)
+        self.assertEqual(discovered.machine_id, "ownedmachine")
+        self.assertEqual(discovered.volume_id, "vol_owned")
+        self.assertEqual(discovered.app, identity.app_name)
+
+    def test_cleanup_discovery_refuses_wrong_metadata_or_volume_name(self):
+        identity = stage.build_identity("discover-bad")
+        def wrong_machine(cmd, **kwargs):
+            if cmd[1] == "status": return subprocess.CompletedProcess(cmd, 0, "ok", "")
+            if "machines" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, json.dumps([{
+                    "id": "ownedmachine", "config": {"metadata": {"koala_stage_a_run": "other"}},
+                }]), "")
+            return subprocess.CompletedProcess(cmd, 0, "[]", "")
+        with self.assertRaises(stage.RehearsalUnknown):
+            stage.FlyRuntime(runner=wrong_machine).discover_owned_resources(identity)
+
+        def wrong_volume(cmd, **kwargs):
+            if cmd[1] == "status": return subprocess.CompletedProcess(cmd, 0, "ok", "")
+            if "machines" in cmd: return subprocess.CompletedProcess(cmd, 0, "[]", "")
+            return subprocess.CompletedProcess(cmd, 0, json.dumps([{"id": "vol_owned", "name": "not_owned"}]), "")
+        with self.assertRaises(stage.RehearsalUnknown):
+            stage.FlyRuntime(runner=wrong_volume).discover_owned_resources(identity)
+
+    def test_cleanup_only_writes_pass_for_absent_app(self):
+        identity = stage.build_identity("cleanup-only")
+        runtime = mock.Mock()
+        runtime.discover_owned_resources.return_value = stage.ResourceLedger()
+        runtime.list_owned_resources.return_value = []
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "cleanup.json"
+            self.assertEqual(stage.cleanup_only(identity, path, runtime=runtime), 0)
+            receipt = json.loads(path.read_text())
+        self.assertEqual(receipt["status"], "PASSED")
+        self.assertEqual(receipt["measurements"]["mode"], "cleanup-only")
+        self.assertEqual(receipt["orphans"], [])
+
+    def test_calibration_plan_is_fixed_and_non_mutating(self):
+        identity = stage.build_identity("calibrate-plan")
+        spec = stage.CorpusSpec(
+            stage.CALIBRATION_SAMPLE_COUNT, 50,
+            stage.CALIBRATION_LOW_PAYLOAD_BYTES, "test-seed",
+        )
+        with mock.patch.object(stage, "FlyRuntime", side_effect=AssertionError("runtime constructed")):
+            rendered = stage.plan(identity, spec, mode="calibrate")
+        self.assertEqual(rendered["mode"], "calibrate-plan")
+        self.assertEqual(rendered["record_count"], stage.CALIBRATION_SAMPLE_COUNT)
+        self.assertEqual(rendered["payload_bytes"], stage.CALIBRATION_LOW_PAYLOAD_BYTES)
+
+    def test_calibration_plan_cli_uses_calibration_validation_without_mutation(self):
+        with mock.patch.object(stage, "FlyRuntime", side_effect=AssertionError("runtime constructed")):
+            self.assertEqual(stage.main([
+                "--dry-run", "--plan-mode", "calibrate", "--run-id", "calibrate-cli",
+                "--record-count", "25000", "--payload-bytes", "1000", "--json",
+            ]), 0)
+
+    def test_calibration_interruption_writes_unknown_receipt_and_cleans_up(self):
+        identity = stage.build_identity("calibrate-stop")
+        spec = stage.CorpusSpec(
+            stage.CALIBRATION_SAMPLE_COUNT, 50,
+            stage.CALIBRATION_LOW_PAYLOAD_BYTES, "test-seed",
+        )
+        runtime = mock.Mock()
+        runtime.create_app.return_value = identity.app_name
+        runtime.create_volume.return_value = "vol_owned"
+        runtime.create_machine.return_value = "machine_owned"
+        runtime.proxy.return_value = mock.Mock(poll=mock.Mock(return_value=0))
+        runtime.disk_sample.return_value = stage.DiskSample("empty", 100, 900, 1000)
+        runtime.list_owned_resources.return_value = []
+        client = mock.Mock()
+        client.initialize.side_effect = stage.RehearsalUnknown("rehearsal terminated by signal 15")
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "interrupted.json"
+            self.assertEqual(stage.calibrate(
+                identity, spec, path, runtime=runtime,
+                client_factory=lambda _url, _auth: client,
+            ), 2)
+            document = json.loads(path.read_text())
+        self.assertEqual(document["status"], "UNKNOWN")
+        self.assertIn("signal 15", document["detail"])
+        self.assertEqual(document["orphans"], [])
+        runtime.destroy_machine.assert_called_once_with(identity, "machine_owned")
+        runtime.destroy_volume.assert_called_once_with(identity, "vol_owned")
+        runtime.destroy_app.assert_called_once_with(identity)
+
+    def test_proxy_termination_failure_does_not_skip_resource_cleanup(self):
+        identity = stage.build_identity("calibrate-proxy")
+        spec = stage.CorpusSpec(
+            stage.CALIBRATION_SAMPLE_COUNT, 50,
+            stage.CALIBRATION_LOW_PAYLOAD_BYTES, "test-seed",
+        )
+        runtime = mock.Mock()
+        runtime.create_app.return_value = identity.app_name
+        runtime.create_volume.return_value = "vol_owned"
+        runtime.create_machine.return_value = "machine_owned"
+        runtime.proxy.return_value = mock.Mock(
+            terminate=mock.Mock(side_effect=OSError("stop failed")),
+            kill=mock.Mock(side_effect=OSError("kill failed")),
+        )
+        runtime.disk_sample.return_value = stage.DiskSample("empty", 100, 900, 1000)
+        runtime.list_owned_resources.return_value = []
+        client = mock.Mock()
+        client.initialize.side_effect = stage.RehearsalUnknown("interrupted")
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "proxy-failure.json"
+            self.assertEqual(stage.calibrate(
+                identity, spec, path, runtime=runtime,
+                client_factory=lambda _url, _auth: client,
+            ), 2)
+            document = json.loads(path.read_text())
+        self.assertEqual(document["status"], "UNKNOWN")
+        self.assertEqual(document["detail"], "local proxy cleanup uncertain")
+        runtime.destroy_machine.assert_called_once_with(identity, "machine_owned")
+        runtime.destroy_volume.assert_called_once_with(identity, "vol_owned")
+        runtime.destroy_app.assert_called_once_with(identity)
+
+    def test_calibration_orchestration_uses_baseline_only_and_cleans_up(self):
+        identity = stage.build_identity("calibrate-fake")
+        spec = stage.CorpusSpec(
+            stage.CALIBRATION_SAMPLE_COUNT, 50,
+            stage.CALIBRATION_LOW_PAYLOAD_BYTES, "test-seed",
+        )
+        runtime = mock.Mock()
+        runtime.create_app.return_value = identity.app_name
+        runtime.create_volume.return_value = "vol_owned"
+        runtime.create_machine.return_value = "machine_owned"
+        runtime.proxy.return_value = mock.Mock(poll=mock.Mock(return_value=0))
+        gib = 1024**3
+        runtime.disk_sample.side_effect = [
+            stage.DiskSample("empty", 100 * 1024**2, 19 * gib, 20 * gib),
+            stage.DiskSample("low", 300 * 1024**2, 18 * gib, 20 * gib),
+            stage.DiskSample("high", 575 * 1024**2, 17 * gib, 20 * gib),
+        ]
+        runtime.list_owned_resources.return_value = []
+        client = mock.Mock()
+        receipts = [
+            stage.CorpusReceipt(submitted=25000, accepted=25000, batches=500, manifest_sha256="a" * 64),
+            stage.CorpusReceipt(submitted=25000, accepted=25000, batches=500, manifest_sha256="b" * 64),
+        ]
+        seen_specs = []
+        def fake_ingest(_client, cohort, **_kwargs):
+            seen_specs.append(cohort)
+            return receipts[len(seen_specs) - 1]
+        with tempfile.TemporaryDirectory() as root, \
+             mock.patch.object(stage, "ingest_corpus", side_effect=fake_ingest):
+            path = Path(root) / "calibration.json"
+            self.assertEqual(stage.calibrate(
+                identity, spec, path, runtime=runtime,
+                client_factory=lambda _url, _auth: client,
+            ), 0)
+            document = json.loads(path.read_text())
+        self.assertEqual([item.payload_bytes for item in seen_specs], [1000, 4000])
+        runtime.create_machine.assert_called_once_with(
+            identity, "vol_owned", stage.BASELINE_IMAGE, "baseline",
+        )
+        self.assertNotIn(stage.CANDIDATE_IMAGE, repr(runtime.mock_calls))
+        self.assertEqual(document["status"], "PASSED")
+        self.assertEqual(document["measurements"]["mode"], "calibrate")
+        runtime.destroy_machine.assert_called_once_with(identity, "machine_owned")
+        runtime.destroy_volume.assert_called_once_with(identity, "vol_owned")
+        runtime.destroy_app.assert_called_once_with(identity)
+
+    def test_workflow_reserves_cleanup_headroom_and_uploads_both_receipts(self):
+        workflow = (MODULE_PATH.parents[1] / ".github" / "workflows" / "koala-stage-a-rehearse.yml").read_text()
+        self.assertIn("timeout-minutes: 360", workflow)
+        self.assertIn("deadline=300m", workflow)
+        self.assertIn("deadline=120m", workflow)
+        self.assertIn("if: inputs.mode != 'plan'", workflow)
+        self.assertIn("plan_mode=calibrate", workflow)
+        self.assertIn("plan_mode=execute", workflow)
+        self.assertIn('--dry-run --plan-mode "$plan_mode"', workflow)
+        self.assertLess(workflow.index("Clean up exact run-owned resources"), workflow.index("Upload redacted evidence"))
+        self.assertIn("--cleanup-only", workflow)
+        self.assertIn("cleanup.json.sha256", workflow)
+        self.assertIn("cleanup-exit-code", workflow)
 
 if __name__ == "__main__": unittest.main()

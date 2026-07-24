@@ -10,6 +10,7 @@ on:
         type: choice
         options:
           - plan
+          - calibrate
           - execute
       run_id:
         description: Unique lowercase run ID (4-32 characters)
@@ -60,11 +61,22 @@ jobs:
         shell: bash
         env:
           RUN_ID: ${{ inputs.run_id }}
+          MODE: ${{ inputs.mode }}
         run: |
           set -euo pipefail
           mkdir -p /tmp/koala-stage-a
+          if test "$MODE" = "calibrate"; then
+            plan_mode=calibrate
+            record_count=25000
+            payload_bytes=1000
+          else
+            plan_mode=execute
+            record_count=502385
+            payload_bytes=10900
+          fi
           python3 scripts/koala_stage_a_rehearsal.py \
-            --dry-run --run-id "$RUN_ID" --json \
+            --dry-run --plan-mode "$plan_mode" --run-id "$RUN_ID" \
+            --record-count "$record_count" --payload-bytes "$payload_bytes" --json \
             > /tmp/koala-stage-a/plan.json
 
       - name: Upload plan receipt
@@ -77,10 +89,10 @@ jobs:
 
   execute:
     name: Execute disposable Fly rehearsal
-    if: inputs.mode == 'execute'
+    if: inputs.mode != 'plan'
     needs: contract
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 360
     environment: koala-stage-a-rehearsal
     steps:
       - name: Check out workflow ref
@@ -138,14 +150,41 @@ jobs:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
           RUN_ID: ${{ inputs.run_id }}
           CONFIRMATION: ${{ inputs.confirmation }}
+          MODE: ${{ inputs.mode }}
         run: |
           set +e
           mkdir -p /tmp/koala-stage-a
-          python3 scripts/koala_stage_a_rehearsal.py \
-            --execute --run-id "$RUN_ID" --confirm "$CONFIRMATION" \
-            --receipt /tmp/koala-stage-a/receipt.json
+          printf '2\n' > /tmp/koala-stage-a/exit-code
+          if test "$MODE" = "calibrate"; then
+            deadline=120m
+            mode_flag=--calibrate
+          else
+            deadline=300m
+            mode_flag=--execute
+          fi
+          timeout --signal=TERM --kill-after=10m "$deadline" \
+            python3 scripts/koala_stage_a_rehearsal.py \
+              "$mode_flag" --run-id "$RUN_ID" --confirm "$CONFIRMATION" \
+              --receipt /tmp/koala-stage-a/receipt.json
           code=$?
+          printf '%s\n' "$code" > /tmp/koala-stage-a/exit-code
           printf 'exit_code=%s\n' "$code" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Clean up exact run-owned resources
+        if: always()
+        shell: bash
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          RUN_ID: ${{ inputs.run_id }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          set +e
+          python3 scripts/koala_stage_a_rehearsal.py \
+            --cleanup-only --run-id "$RUN_ID" --confirm "$CONFIRMATION" \
+            --receipt /tmp/koala-stage-a/cleanup.json
+          cleanup_code=$?
+          printf '%s\n' "$cleanup_code" > /tmp/koala-stage-a/cleanup-exit-code
           exit 0
 
       - name: Upload redacted evidence
@@ -156,15 +195,29 @@ jobs:
           path: |
             /tmp/koala-stage-a/receipt.json
             /tmp/koala-stage-a/receipt.json.sha256
+            /tmp/koala-stage-a/cleanup.json
+            /tmp/koala-stage-a/cleanup.json.sha256
+            /tmp/koala-stage-a/exit-code
+            /tmp/koala-stage-a/cleanup-exit-code
           if-no-files-found: error
           retention-days: 30
 
       - name: Enforce rehearsal verdict
         if: always()
         shell: bash
-        env:
-          REHEARSAL_EXIT_CODE: ${{ steps.rehearsal.outputs.exit_code }}
         run: |
           set -euo pipefail
-          test -n "$REHEARSAL_EXIT_CODE"
-          test "$REHEARSAL_EXIT_CODE" = "0"
+          test -f /tmp/koala-stage-a/exit-code
+          test -f /tmp/koala-stage-a/cleanup-exit-code
+          test "$(cat /tmp/koala-stage-a/exit-code)" = "0"
+          test "$(cat /tmp/koala-stage-a/cleanup-exit-code)" = "0"
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          receipt = json.loads(Path("/tmp/koala-stage-a/receipt.json").read_text())
+          cleanup = json.loads(Path("/tmp/koala-stage-a/cleanup.json").read_text())
+          if receipt.get("status") != "PASSED":
+              raise SystemExit("rehearsal receipt did not pass")
+          if cleanup.get("status") != "PASSED" or cleanup.get("orphans"):
+              raise SystemExit("independent cleanup did not pass")
+          PY

@@ -317,6 +317,27 @@ class StageAContractTests(unittest.TestCase):
         sample = runtime.resource_sample(identity, "machine", "migration")
         self.assertEqual(sample, stage.ResourceSample("migration", 37.5, 2 * 1024 * 1024))
 
+    def test_disk_sample_retries_only_transient_408(self):
+        identity = stage.build_identity("disk-retry")
+        responses = [
+            subprocess.CompletedProcess([], 1, "", "request returned non-2xx status: 408"),
+            subprocess.CompletedProcess([], 0, "Filesystem 1024-blocks Used Available Capacity Mounted on\n/data 1000 100 900 10% /data\n", ""),
+        ]
+        runtime = stage.FlyRuntime(runner=mock.Mock(side_effect=responses))
+        with mock.patch.object(stage.time, "sleep") as sleep:
+            sample = runtime.disk_sample(identity, "machine", "settled")
+        self.assertEqual(sample, stage.DiskSample("settled", 100 * 1024, 900 * 1024, 1000 * 1024))
+        self.assertEqual(runtime.runner.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+    def test_disk_sample_fails_non_408_without_retry(self):
+        identity = stage.build_identity("disk-fail")
+        runner = mock.Mock(return_value=subprocess.CompletedProcess([], 1, "", "permission denied"))
+        runtime = stage.FlyRuntime(runner=runner)
+        with self.assertRaises(stage.RehearsalUnknown):
+            runtime.disk_sample(identity, "machine", "settled")
+        runner.assert_called_once()
+
     def test_proxy_is_loopback_only(self):
         identity = stage.build_identity("proxy-test")
         runtime = stage.FlyRuntime(popen=mock.Mock(return_value="proc"))

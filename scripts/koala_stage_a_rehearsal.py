@@ -661,7 +661,15 @@ class FlyRuntime:
         if not isinstance(private_ip, str) or not private_ip: raise RehearsalUnknown("private IP missing")
         return self.popen(["flyctl", "proxy", f"{local_port}:{MCP_PORT}", private_ip, "-a", identity.app_name, "--bind-addr", "127.0.0.1", "--quiet"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True)
     def disk_sample(self, identity: RunIdentity, machine_id: str, phase: str) -> DiskSample:
-        rows = [line.split() for line in self.run(["machine", "exec", machine_id, "-a", identity.app_name, "--timeout", "30", "df -Pk /data"]).stdout.splitlines() if line.strip()]
+        command = ["machine", "exec", machine_id, "-a", identity.app_name, "--timeout", "30", "df -Pk /data"]
+        for attempt in range(3):
+            try:
+                output = self.run(command).stdout
+                break
+            except RehearsalUnknown as exc:
+                if "408" not in str(exc) or attempt == 2: raise
+                time.sleep(attempt + 1)
+        rows = [line.split() for line in output.splitlines() if line.strip()]
         if len(rows) < 2 or len(rows[-1]) < 6: raise RehearsalUnknown("invalid disk measurement")
         total, used, available = map(int, rows[-1][1:4]); return DiskSample(phase, used * 1024, available * 1024, total * 1024)
     def resource_sample(self, identity: RunIdentity, machine_id: str, phase: str) -> ResourceSample:

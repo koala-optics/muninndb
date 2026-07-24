@@ -77,7 +77,7 @@ jobs:
           else
             plan_mode=execute
             record_count=502385
-            payload_bytes=10900
+            payload_bytes=4000
           fi
           python3 scripts/koala_stage_a_rehearsal.py \
             --dry-run --plan-mode "$plan_mode" --run-id "$RUN_ID" \

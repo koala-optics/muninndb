@@ -11,6 +11,7 @@ on:
         options:
           - plan
           - calibrate
+          - ablate
           - execute
       run_id:
         description: Unique lowercase run ID (4-32 characters)
@@ -67,6 +68,10 @@ jobs:
           mkdir -p /tmp/koala-stage-a
           if test "$MODE" = "calibrate"; then
             plan_mode=calibrate
+            record_count=25000
+            payload_bytes=1000
+          elif test "$MODE" = "ablate"; then
+            plan_mode=ablate
             record_count=25000
             payload_bytes=1000
           else
@@ -158,6 +163,9 @@ jobs:
           if test "$MODE" = "calibrate"; then
             deadline=120m
             mode_flag=--calibrate
+          elif test "$MODE" = "ablate"; then
+            deadline=180m
+            mode_flag=--ablate
           else
             deadline=300m
             mode_flag=--execute

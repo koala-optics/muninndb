@@ -611,13 +611,175 @@ class StageAContractTests(unittest.TestCase):
         ])
         runtime.destroy_app.assert_called_once_with(identity)
 
+    def test_opaque_payload_remains_backward_compatible(self):
+        expected = stage.deterministic_payload("test-seed", 42, 1000)
+        self.assertEqual(stage.payload_for("opaque", "test-seed", 42, 1000), expected)
+        opaque = stage.record_for(self.small_spec(), 42)
+        self.assertEqual(json.loads(opaque["memory"]["content"])["payload"], expected)
+
+    def test_lexical_payload_is_exact_deterministic_unique_and_synthetic(self):
+        first = stage.payload_for("lexical", "test-seed", 42, 1000)
+        repeated = stage.payload_for("lexical", "test-seed", 42, 1000)
+        other = stage.payload_for("lexical", "test-seed", 43, 1000)
+        self.assertEqual(first, repeated)
+        self.assertEqual(len(first), 1000)
+        self.assertNotEqual(first, other)
+        self.assertRegex(first, r"^[a-z0-9 -]+$")
+        self.assertIn("synthetic", first)
+        self.assertNotIn("koala", first)
+
+    def test_payload_shapes_preserve_sparse_probe_contract(self):
+        opaque = stage.CorpusSpec(25000, 50, 1000, "shape", "opaque")
+        lexical = stage.CorpusSpec(25000, 50, 1000, "shape", "lexical")
+        for index in (0, 42, 43, 44, 50, 51, 57, 97, 10042):
+            left, right = stage.record_for(opaque, index), stage.record_for(lexical, index)
+            self.assertEqual(left["probe_kind"], right["probe_kind"])
+            self.assertEqual(left["vault"], right["vault"])
+            self.assertEqual(left["memory"]["concept"], right["memory"]["concept"])
+            self.assertEqual(left["memory"]["created_at"], right["memory"]["created_at"])
+            self.assertEqual(set(left["memory"]) - {"content"}, set(right["memory"]) - {"content"})
+
+    def test_quiet_window_requires_stable_monotonic_samples(self):
+        identity = stage.build_identity("settle-test")
+        runtime = mock.Mock()
+        runtime.disk_sample.side_effect = [
+            stage.DiskSample("x", 100, 900, 1000),
+            stage.DiskSample("x", 110, 890, 1000),
+            stage.DiskSample("x", 110, 890, 1000),
+            stage.DiskSample("x", 110, 890, 1000),
+        ]
+        with mock.patch.object(stage.time, "sleep"):
+            result = stage.wait_for_storage_quiet(
+                runtime, identity, "machine", "cohort", timeout_s=10,
+                interval_s=1, stable_samples=2, tolerance_bytes=0,
+            )
+        self.assertEqual(result["settled"].used_bytes, 110)
+        self.assertEqual(len(result["samples"]), 4)
+        self.assertEqual(result["witness"], "bounded-df-quiet-window")
+
+    def test_quiet_window_timeout_and_regression_are_unknown(self):
+        identity = stage.build_identity("settle-fail")
+        runtime = mock.Mock()
+        runtime.disk_sample.side_effect = [
+            stage.DiskSample("x", 100, 900, 1000),
+            stage.DiskSample("x", 90, 910, 1000),
+        ]
+        with mock.patch.object(stage.time, "monotonic", side_effect=[0, 0, 1]), \
+             mock.patch.object(stage.time, "sleep"):
+            with self.assertRaises(stage.RehearsalUnknown):
+                stage.wait_for_storage_quiet(runtime, identity, "machine", "cohort", timeout_s=1, interval_s=1)
+
+    def test_ablation_models_are_separate_and_expose_shape_delta(self):
+        empty = 1000
+        samples = {
+            "opaque-1k": (empty, empty + 25000 * 12000),
+            "opaque-4k": (empty, empty + 25000 * 15000),
+            "lexical-1k": (empty, empty + 25000 * 5000),
+            "lexical-4k": (empty, empty + 25000 * 6500),
+        }
+        result = stage.ablation_projection(samples)
+        self.assertAlmostEqual(result["opaque"]["fixed_bytes_per_record"], 11000)
+        self.assertAlmostEqual(result["opaque"]["bytes_per_payload_byte"], 1.0)
+        self.assertAlmostEqual(result["lexical"]["fixed_bytes_per_record"], 4500)
+        self.assertAlmostEqual(result["lexical"]["bytes_per_payload_byte"], 0.5)
+        self.assertEqual(result["fixed_shape_delta_bytes_per_record"], 6500)
+
+    def test_ablation_orchestration_uses_four_fresh_baseline_stores(self):
+        identity = stage.build_identity("ablate-fake")
+        spec = stage.CorpusSpec(25000, 50, 1000, "test-seed")
+        runtime = mock.Mock()
+        runtime.create_app.return_value = identity.app_name
+        runtime.create_volume.side_effect = [f"vol_{i}" for i in range(4)]
+        runtime.create_machine.side_effect = [f"machine_{i}" for i in range(4)]
+        runtime.proxy.side_effect = [mock.Mock(poll=mock.Mock(return_value=0)) for _ in range(4)]
+        runtime.disk_sample.side_effect = [
+            sample
+            for _ in range(4)
+            for sample in (
+                stage.DiskSample("empty", 100, 900, 1000),
+                stage.DiskSample("immediate", 150, 850, 1000),
+            )
+        ]
+        runtime.list_owned_resources.return_value = []
+        receipt = stage.CorpusReceipt(submitted=25000, accepted=25000, batches=500, manifest_sha256="a" * 64)
+        settled = iter([
+            {"settled": stage.DiskSample(name, used, 1000, 2000), "samples": [], "witness": "bounded-df-quiet-window"}
+            for name, used in (("opaque-1k", 300), ("opaque-4k", 450), ("lexical-1k", 200), ("lexical-4k", 275))
+        ])
+        seen = []
+        def fake_ingest(_client, cohort, **_kwargs):
+            seen.append((cohort.payload_shape, cohort.payload_bytes))
+            return receipt
+        with tempfile.TemporaryDirectory() as root, \
+             mock.patch.object(stage, "ingest_corpus", side_effect=fake_ingest), \
+             mock.patch.object(stage, "wait_for_storage_quiet", side_effect=lambda *_a, **_k: next(settled)):
+            path = Path(root) / "ablation.json"
+            self.assertEqual(stage.ablate(identity, spec, path, runtime=runtime, client_factory=lambda *_a: mock.Mock()), 0)
+            document = json.loads(path.read_text())
+        self.assertEqual(seen, [("opaque", 1000), ("opaque", 4000), ("lexical", 1000), ("lexical", 4000)])
+        self.assertEqual(runtime.create_volume.call_count, 4)
+        self.assertEqual(runtime.create_machine.call_count, 4)
+        self.assertTrue(all(call.args[2:] == (stage.BASELINE_IMAGE, "baseline") for call in runtime.create_machine.call_args_list))
+        self.assertNotIn(stage.CANDIDATE_IMAGE, repr(runtime.mock_calls))
+        self.assertEqual(runtime.destroy_machine.call_count, 4)
+        self.assertEqual(runtime.destroy_volume.call_count, 4)
+        self.assertEqual(document["measurements"]["mode"], "ablate")
+        self.assertEqual(document["corpus"]["payload_shape"], "lexical")
+        self.assertEqual(document["corpus"]["payload_bytes"], 4000)
+        self.assertEqual(document["status"], "PASSED")
+
+    def test_ablation_partial_failure_receipt_uses_active_cohort_metadata(self):
+        identity = stage.build_identity("ablate-partial")
+        spec = stage.CorpusSpec(25000, 50, 1000, "test-seed")
+        runtime = mock.Mock()
+        runtime.create_app.return_value = identity.app_name
+        runtime.create_volume.side_effect = ["vol_0", "vol_1"]
+        runtime.create_machine.side_effect = ["machine_0", "machine_1"]
+        runtime.proxy.side_effect = [mock.Mock(), mock.Mock()]
+        runtime.disk_sample.side_effect = [
+            stage.DiskSample("empty", 100, 900, 1000),
+            stage.DiskSample("immediate", 150, 850, 1000),
+            stage.DiskSample("empty", 100, 900, 1000),
+        ]
+        runtime.list_owned_resources.return_value = []
+        complete = stage.CorpusReceipt(25000, 25000, 500, "a" * 64)
+        progress = stage.IngestProgress(100, 100, 2, 1.0, {"count": 2})
+        def fake_ingest(_client, cohort, **kwargs):
+            if cohort.payload_bytes == 1000:
+                return complete
+            kwargs["progress"](progress)
+            raise stage.RehearsalUnknown("synthetic interruption")
+        quiet = {"settled": stage.DiskSample("settled", 300, 700, 1000), "samples": [], "witness": "bounded-df-quiet-window"}
+        with tempfile.TemporaryDirectory() as root, \
+             mock.patch.object(stage, "ingest_corpus", side_effect=fake_ingest), \
+             mock.patch.object(stage, "wait_for_storage_quiet", return_value=quiet):
+            path = Path(root) / "partial.json"
+            self.assertEqual(stage.ablate(identity, spec, path, runtime=runtime, client_factory=lambda *_a: mock.Mock()), 2)
+            document = json.loads(path.read_text())
+        self.assertEqual(document["status"], "UNKNOWN")
+        self.assertEqual(document["corpus"]["payload_shape"], "opaque")
+        self.assertEqual(document["corpus"]["payload_bytes"], 4000)
+        self.assertEqual(document["corpus"]["submitted"], 100)
+
+    def test_ablation_cli_is_distinct_and_plan_only_is_non_mutating(self):
+        with mock.patch.object(stage, "FlyRuntime", side_effect=AssertionError("runtime constructed")):
+            self.assertEqual(stage.main([
+                "--dry-run", "--plan-mode", "ablate", "--run-id", "ablate-cli",
+                "--record-count", "25000", "--payload-bytes", "1000", "--json",
+            ]), 0)
+        parser = stage.build_parser()
+        self.assertTrue(parser.parse_args(["--run-id", "x123", "--ablate"]).ablate)
+
     def test_workflow_reserves_cleanup_headroom_and_uploads_both_receipts(self):
         workflow = (MODULE_PATH.parents[1] / ".github" / "workflows" / "koala-stage-a-rehearse.yml").read_text()
         self.assertIn("timeout-minutes: 360", workflow)
         self.assertIn("deadline=300m", workflow)
         self.assertIn("deadline=120m", workflow)
+        self.assertIn("deadline=180m", workflow)
         self.assertIn("if: inputs.mode != 'plan'", workflow)
+        self.assertIn("- ablate", workflow)
         self.assertIn("plan_mode=calibrate", workflow)
+        self.assertIn("plan_mode=ablate", workflow)
         self.assertIn("plan_mode=execute", workflow)
         self.assertIn('--dry-run --plan-mode "$plan_mode"', workflow)
         self.assertLess(workflow.index("Clean up exact run-owned resources"), workflow.index("Upload redacted evidence"))

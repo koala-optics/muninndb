@@ -35,6 +35,16 @@ DEFAULT_PAYLOAD_BYTES = 10_900
 MIN_PAYLOAD_BYTES, MAX_PAYLOAD_BYTES = 1_000, 32_000
 CALIBRATION_SAMPLE_COUNT = 25_000
 CALIBRATION_LOW_PAYLOAD_BYTES, CALIBRATION_HIGH_PAYLOAD_BYTES = MIN_PAYLOAD_BYTES, 4_000
+ABLATION_COHORTS = (
+    ("opaque-1k", "opaque", CALIBRATION_LOW_PAYLOAD_BYTES),
+    ("opaque-4k", "opaque", CALIBRATION_HIGH_PAYLOAD_BYTES),
+    ("lexical-1k", "lexical", CALIBRATION_LOW_PAYLOAD_BYTES),
+    ("lexical-4k", "lexical", CALIBRATION_HIGH_PAYLOAD_BYTES),
+)
+STORAGE_QUIET_TIMEOUT_S = 5 * 60
+STORAGE_QUIET_INTERVAL_S = 10.0
+STORAGE_QUIET_SAMPLES = 3
+STORAGE_QUIET_TOLERANCE_BYTES = 1024 * 1024
 PROGRESS_BATCH_INTERVAL = 100
 MIN_STORE_BYTES, MAX_STORE_BYTES = 11 * 1024**3 // 2, 13 * 1024**3 // 2
 TARGET_STORE_BYTES = 6 * 1024**3
@@ -78,6 +88,7 @@ class CorpusSpec:
     batch_size: int = DEFAULT_BATCH_SIZE
     payload_bytes: int = DEFAULT_PAYLOAD_BYTES
     seed: str = "koala-stage-a-v1"
+    payload_shape: str = "opaque"
 
 @dataclass
 class CorpusReceipt:
@@ -183,6 +194,7 @@ def validate_spec(spec: CorpusSpec, *, minimum_count: int = MIN_RECORD_COUNT) ->
     if not 1 <= spec.batch_size <= MAX_BATCH_SIZE: raise RehearsalUnknown("invalid batch size")
     if not MIN_PAYLOAD_BYTES <= spec.payload_bytes <= MAX_PAYLOAD_BYTES: raise RehearsalUnknown("invalid payload calibration")
     if not spec.seed or len(spec.seed) > 128: raise RehearsalUnknown("invalid synthetic seed")
+    if spec.payload_shape not in {"opaque", "lexical"}: raise RehearsalUnknown("invalid payload shape")
 
 def validate_calibration_spec(spec: CorpusSpec) -> None:
     if spec.count != CALIBRATION_SAMPLE_COUNT or spec.payload_bytes != CALIBRATION_LOW_PAYLOAD_BYTES:
@@ -199,6 +211,27 @@ def deterministic_payload(seed: str, index: int, length: int) -> str:
     raw = hashlib.shake_256(f"{seed}:{index}".encode()).digest(math.ceil(length * 3 / 4))
     return base64.b64encode(raw).decode()[:length]
 
+def lexical_payload(seed: str, index: int, length: int) -> str:
+    vocabulary = (
+        "synthetic amber beacon calm delta ember field gentle harbor ivory "
+        "jasmine kind lantern meadow north olive plain quiet river silver "
+        "timber umber valley willow xenon yellow zenith"
+    ).split()
+    digest = hashlib.shake_256(f"lexical:{seed}:{index}".encode()).digest(32)
+    words = ["synthetic", f"record{index}", f"hash{digest.hex()[:12]}"]
+    cursor = 0
+    while len(" ".join(words)) < length:
+        words.append(vocabulary[digest[cursor % len(digest)] % len(vocabulary)])
+        cursor += 1
+    return " ".join(words)[:length]
+
+def payload_for(shape: str, seed: str, index: int, length: int) -> str:
+    if shape == "opaque":
+        return deterministic_payload(seed, index, length)
+    if shape == "lexical":
+        return lexical_payload(seed, index, length)
+    raise RehearsalUnknown("invalid payload shape")
+
 def probe_kind(index: int) -> str | None:
     if index < 2: return "collision"
     if index == 43: return "hard-delete"
@@ -212,7 +245,7 @@ def record_for(spec: CorpusSpec, index: int) -> dict[str, Any]:
     vault = "stage-a-isolation" if kind == "isolation" else "stage-a-primary"
     concept = COLLISION_CONCEPTS[index] if kind == "collision" else f"stage-a/concept/{cohort:04d}"
     if kind == "isolation": concept = f"stage-a/isolation/{index:07d}"
-    content = json.dumps({"schema": CORPUS_SCHEMA_VERSION, "synthetic": True, "index": index, "payload": deterministic_payload(spec.seed, index, spec.payload_bytes)}, sort_keys=True, separators=(",", ":"))
+    content = json.dumps({"schema": CORPUS_SCHEMA_VERSION, "synthetic": True, "index": index, "payload": payload_for(spec.payload_shape, spec.seed, index, spec.payload_bytes)}, sort_keys=True, separators=(",", ":"))
     memory: dict[str, Any] = {
         "concept": concept, "content": content,
         "created_at": f"2025-01-{1 + seconds // 86400:02d}T{seconds // 3600 % 24:02d}:{seconds // 60 % 60:02d}:{seconds % 60:02d}Z",
@@ -369,6 +402,62 @@ def calibration_projection(
         "recommended_payload_bytes": recommendation,
     }
 
+def ablation_projection(samples: dict[str, tuple[int, int]]) -> dict[str, Any]:
+    expected = {name for name, _, _ in ABLATION_COHORTS}
+    if set(samples) != expected:
+        raise RehearsalUnknown("ablation cohort evidence missing or unexpected")
+    result: dict[str, Any] = {}
+    for shape in ("opaque", "lexical"):
+        low_empty, low_populated = samples[f"{shape}-1k"]
+        high_empty, high_populated = samples[f"{shape}-4k"]
+        low_net, high_net = low_populated - low_empty, high_populated - high_empty
+        if low_net <= 0 or high_net <= 0:
+            raise RehearsalUnknown(f"{shape} ablation store did not grow")
+        low_bpr, high_bpr = low_net / CALIBRATION_SAMPLE_COUNT, high_net / CALIBRATION_SAMPLE_COUNT
+        slope = (high_bpr - low_bpr) / (CALIBRATION_HIGH_PAYLOAD_BYTES - CALIBRATION_LOW_PAYLOAD_BYTES)
+        fixed = low_bpr - slope * CALIBRATION_LOW_PAYLOAD_BYTES
+        if slope <= 0 or fixed < 0:
+            raise RehearsalUnknown(f"{shape} ablation model is invalid")
+        result[shape] = {
+            "low_net_growth_bytes": low_net,
+            "high_net_growth_bytes": high_net,
+            "bytes_per_payload_byte": round(slope, 6),
+            "fixed_bytes_per_record": round(fixed, 3),
+        }
+    result["fixed_shape_delta_bytes_per_record"] = round(
+        result["opaque"]["fixed_bytes_per_record"] - result["lexical"]["fixed_bytes_per_record"], 3,
+    )
+    return result
+
+def wait_for_storage_quiet(
+    runtime: Any,
+    identity: RunIdentity,
+    machine_id: str,
+    cohort: str,
+    *,
+    timeout_s: float = STORAGE_QUIET_TIMEOUT_S,
+    interval_s: float = STORAGE_QUIET_INTERVAL_S,
+    stable_samples: int = STORAGE_QUIET_SAMPLES,
+    tolerance_bytes: int = STORAGE_QUIET_TOLERANCE_BYTES,
+) -> dict[str, Any]:
+    if timeout_s <= 0 or interval_s <= 0 or stable_samples < 2 or tolerance_bytes < 0:
+        raise RehearsalUnknown("invalid storage quiet-window contract")
+    started, samples, stable = time.monotonic(), [], 0
+    while time.monotonic() - started <= timeout_s:
+        sample = runtime.disk_sample(identity, machine_id, f"ablation-{cohort}-settling")
+        require_disk_safety(sample)
+        if samples and sample.used_bytes < samples[-1].used_bytes:
+            raise RehearsalUnknown("storage quiet-window disk usage regressed")
+        if samples and sample.used_bytes - samples[-1].used_bytes <= tolerance_bytes:
+            stable += 1
+        else:
+            stable = 0
+        samples.append(sample)
+        if stable >= stable_samples:
+            return {"settled": sample, "samples": samples, "witness": "bounded-df-quiet-window"}
+        time.sleep(interval_s)
+    raise RehearsalUnknown("storage quiet-window deadline expired")
+
 def combine_status(gates: dict[str, Gate], orphans: Sequence[str]) -> str:
     if orphans or any(g.status == "UNKNOWN" for g in gates.values()): return "UNKNOWN"
     if any(g.status == "FAILED" for g in gates.values()): return "FAILED"
@@ -411,6 +500,7 @@ def corpus_evidence(spec: CorpusSpec, receipt: CorpusReceipt | IngestProgress | 
         "seed": spec.seed,
         "requested_count": spec.count,
         "payload_bytes": spec.payload_bytes,
+        "payload_shape": spec.payload_shape,
         **shape_counts(spec.count),
     }
     if isinstance(receipt, CorpusReceipt):
@@ -449,6 +539,14 @@ def receipt_document(
 ) -> dict[str, Any]:
     bounded_measurements = json.loads(json.dumps(measurements))
     bounded_measurements["mode"] = mode
+    limitations = [
+        "Synthetic rehearsal is not production deployment authorization.",
+        "Production data, backups, volumes, machines, app, and credentials are prohibited.",
+    ]
+    if mode == "ablate":
+        limitations.append(
+            "The bounded df quiet-window witnesses disk settlement; it does not prove asynchronous FTS or provenance queues are empty."
+        )
     return {
         "schema_version": SCHEMA_VERSION,
         "status": status,
@@ -463,10 +561,7 @@ def receipt_document(
         "cleanup": cleanup_result,
         "orphans": list(orphans),
         "detail": detail,
-        "limitations": [
-            "Synthetic rehearsal is not production deployment authorization.",
-            "Production data, backups, volumes, machines, app, and credentials are prohibited.",
-        ],
+        "limitations": limitations,
     }
 
 class MCPClient:
@@ -831,7 +926,7 @@ def run_query_probes(client: MCPClient, receipt: CorpusReceipt) -> dict[str, lis
     return samples
 
 def plan(identity: RunIdentity, spec: CorpusSpec, *, mode: str = "execute") -> dict[str, Any]:
-    if mode == "calibrate": validate_calibration_spec(spec)
+    if mode in {"calibrate", "ablate"}: validate_calibration_spec(spec)
     else: validate_spec(spec)
     validate_image(BASELINE_IMAGE, "baseline"); validate_image(CANDIDATE_IMAGE, "candidate")
     return {"mode": f"{mode}-plan", "run_id": identity.run_id, "confirmation_required_for_execute": identity.confirmation,
@@ -944,6 +1039,91 @@ def calibrate(
             identity, spec, status=status, exit_code=exit_code, detail=detail, ledger=ledger,
             measurements=measurements, gates=gates, cleanup_result=cleanup_result,
             orphans=orphans, corpus=corpus_receipt, mode="calibrate",
+        ))
+    return exit_code
+
+def ablate(
+    identity: RunIdentity,
+    spec: CorpusSpec,
+    receipt_path: Path,
+    *,
+    runtime: FlyRuntime | None = None,
+    client_factory: Callable[[str, str], MCPClient] | None = None,
+    local_port: int = 18750,
+) -> int:
+    runtime = runtime or FlyRuntime(); client_factory = client_factory or (lambda url, auth: MCPClient(url, auth))
+    ledger, proxy = ResourceLedger(), None
+    gates: dict[str, Gate] = {}; measurements: dict[str, Any] = {"cohorts": {}, "disk_samples": []}
+    corpus_receipt: CorpusReceipt | IngestProgress | None = None
+    receipt_spec = spec
+    cleanup_result: dict[str, str] = {}; orphans: list[str] = []
+    detail, status, exit_code = "storage ablation did not complete", "UNKNOWN", 2
+    auth_value = secrets.token_urlsafe(32)
+    samples: dict[str, tuple[int, int]] = {}
+    try:
+        validate_calibration_spec(spec); validate_image(BASELINE_IMAGE, "baseline"); runtime.preflight(identity)
+        ledger.app = runtime.create_app(identity); runtime.install_auth(identity, auth_value)
+        for offset, (cohort, shape, payload_bytes) in enumerate(ABLATION_COHORTS):
+            cohort_spec = CorpusSpec(
+                CALIBRATION_SAMPLE_COUNT, spec.batch_size, payload_bytes,
+                f"{spec.seed}-{cohort}", shape,
+            )
+            receipt_spec = cohort_spec
+            ledger.volume_id = runtime.create_volume(identity, identity.volume_name)
+            ledger.machine_id = runtime.create_machine(identity, ledger.volume_id, BASELINE_IMAGE, "baseline")
+            runtime.wait_ready(identity, ledger.machine_id, READINESS_LIMIT_S)
+            empty = runtime.disk_sample(identity, ledger.machine_id, f"ablation-{cohort}-empty")
+            require_disk_safety(empty)
+            proxy = runtime.proxy(identity, ledger.machine_id, local_port + offset)
+            client = client_factory(f"http://127.0.0.1:{local_port + offset}/mcp", auth_value); client.initialize()
+
+            def checkpoint(progress: IngestProgress) -> None:
+                nonlocal corpus_receipt
+                corpus_receipt = progress
+                write_receipt(receipt_path, receipt_document(
+                    identity, spec, status="UNKNOWN", exit_code=2,
+                    detail=f"ablation {cohort} ingestion in progress", ledger=ledger,
+                    measurements=measurements, gates=gates, cleanup_result={}, orphans=[],
+                    corpus=progress, mode="ablate",
+                ))
+
+            cohort_receipt = ingest_corpus(
+                client, cohort_spec, minimum_count=CALIBRATION_SAMPLE_COUNT, progress=checkpoint,
+            )
+            corpus_receipt, receipt_spec = cohort_receipt, cohort_spec
+            immediate = runtime.disk_sample(identity, ledger.machine_id, f"ablation-{cohort}-immediate")
+            require_disk_safety(immediate)
+            quiet = wait_for_storage_quiet(runtime, identity, ledger.machine_id, cohort)
+            settled = quiet["settled"]
+            samples[cohort] = (empty.used_bytes, settled.used_bytes)
+            measurements["cohorts"][cohort] = {
+                "payload_shape": shape,
+                "payload_bytes": payload_bytes,
+                "empty": asdict(empty) | {"free_percent": empty.free_percent},
+                "immediate": asdict(immediate) | {"free_percent": immediate.free_percent},
+                "settled": asdict(settled) | {"free_percent": settled.free_percent},
+                "settlement_samples": [asdict(item) | {"free_percent": item.free_percent} for item in quiet["samples"]],
+                "settlement_witness": quiet["witness"],
+                "corpus": corpus_evidence(cohort_spec, cohort_receipt),
+            }
+            terminate_proxy(proxy); proxy = None
+            runtime.destroy_machine(identity, ledger.machine_id); ledger.machine_id = None
+            runtime.destroy_volume(identity, ledger.volume_id); ledger.volume_id = None
+        measurements["ablation"] = ablation_projection(samples)
+        gates["ablation_evidence"] = Gate("PASSED", "four independent settled baseline cohorts measured", len(samples), len(ABLATION_COHORTS))
+        status, exit_code = "PASSED", 0
+        detail = "storage ablation completed; full Stage A was not run"
+    except RehearsalError as exc: status, exit_code, detail = exc.status, 1 if exc.status == "FAILED" else 2, safe_detail(str(exc))
+    except Exception as exc: status, exit_code, detail = "UNKNOWN", 2, f"unexpected {type(exc).__name__}"
+    finally:
+        try: terminate_proxy(proxy)
+        except RehearsalError: status, exit_code, detail = "UNKNOWN", 2, "local proxy cleanup uncertain"
+        cleanup_result, orphans = cleanup(runtime, identity, ledger)
+        if orphans: status, exit_code, detail = "UNKNOWN", 2, "cleanup uncertainty or orphaned resources"
+        write_receipt(receipt_path, receipt_document(
+            identity, receipt_spec, status=status, exit_code=exit_code, detail=detail, ledger=ledger,
+            measurements=measurements, gates=gates, cleanup_result=cleanup_result,
+            orphans=orphans, corpus=corpus_receipt, mode="ablate",
         ))
     return exit_code
 
@@ -1074,9 +1254,10 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--execute", action="store_true")
     mode.add_argument("--calibrate", action="store_true")
+    mode.add_argument("--ablate", action="store_true")
     mode.add_argument("--cleanup-only", action="store_true")
     parser.add_argument("--run-id", required=True); parser.add_argument("--confirm"); parser.add_argument("--record-count", type=int)
-    parser.add_argument("--plan-mode", choices=("execute", "calibrate"), default="execute")
+    parser.add_argument("--plan-mode", choices=("execute", "calibrate", "ablate"), default="execute")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE); parser.add_argument("--payload-bytes", type=int)
     parser.add_argument("--seed", default="koala-stage-a-v1"); parser.add_argument("--receipt", type=Path, default=Path("stage-a-receipt.json")); parser.add_argument("--json", action="store_true")
     return parser
@@ -1085,20 +1266,21 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         identity = build_identity(args.run_id)
-        calibrating = args.calibrate or (args.dry_run and args.plan_mode == "calibrate")
+        calibrating = args.calibrate or args.ablate or (args.dry_run and args.plan_mode in {"calibrate", "ablate"})
         spec = CorpusSpec(
             args.record_count if args.record_count is not None else (CALIBRATION_SAMPLE_COUNT if calibrating else DEFAULT_RECORD_COUNT),
             args.batch_size,
             args.payload_bytes if args.payload_bytes is not None else (CALIBRATION_LOW_PAYLOAD_BYTES if calibrating else DEFAULT_PAYLOAD_BYTES),
             args.seed,
         )
-        if not (args.execute or args.calibrate or args.cleanup_only):
+        if not (args.execute or args.calibrate or args.ablate or args.cleanup_only):
             print(json.dumps(plan(identity, spec, mode=args.plan_mode), indent=2 if args.json else None, sort_keys=True)); return 0
         if args.confirm != identity.confirmation:
             print("REFUSED: mutating mode requires the exact run-specific confirmation", file=sys.stderr); print(f"Required confirmation: {identity.confirmation}", file=sys.stderr); return 2
         install_termination_handlers()
         if args.cleanup_only: return cleanup_only(identity, args.receipt)
         if args.calibrate: return calibrate(identity, spec, args.receipt)
+        if args.ablate: return ablate(identity, spec, args.receipt)
         return execute(identity, spec, args.receipt)
     except RehearsalError as exc: print(f"Stage A refused: {safe_detail(str(exc))}", file=sys.stderr); return 2
 

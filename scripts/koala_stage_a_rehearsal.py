@@ -14,6 +14,7 @@ import math
 import os
 import re
 import secrets
+import signal
 import subprocess
 import sys
 import tempfile
@@ -29,7 +30,12 @@ CORPUS_SCHEMA_VERSION = 1
 DEFAULT_RECORD_COUNT = MIN_RECORD_COUNT = 502_385
 DEFAULT_BATCH_SIZE = MAX_BATCH_SIZE = 50
 DEFAULT_PAYLOAD_BYTES = 10_900
-MIN_STORE_BYTES, MAX_STORE_BYTES = 5_500 * 1024**3, 6_500 * 1024**3
+MIN_PAYLOAD_BYTES, MAX_PAYLOAD_BYTES = 1_000, 32_000
+CALIBRATION_SAMPLE_COUNT = 25_000
+CALIBRATION_LOW_PAYLOAD_BYTES, CALIBRATION_HIGH_PAYLOAD_BYTES = MIN_PAYLOAD_BYTES, 4_000
+PROGRESS_BATCH_INTERVAL = 100
+MIN_STORE_BYTES, MAX_STORE_BYTES = 11 * 1024**3 // 2, 13 * 1024**3 // 2
+TARGET_STORE_BYTES = 6 * 1024**3
 VOLUME_SIZE_GB = 20
 MAX_PEAK_BYTES, MIN_FREE_PERCENT = 14 * 1024**3, 30.0
 MIGRATION_LIMIT_S, READINESS_LIMIT_S = 45 * 60, 5 * 60
@@ -79,6 +85,14 @@ class CorpusReceipt:
     manifest_sha256: str = ""
     retained_ids: dict[str, list[str]] = field(default_factory=dict)
     batch_latencies_ms: list[float] = field(default_factory=list)
+
+@dataclass(frozen=True)
+class IngestProgress:
+    submitted: int
+    accepted: int
+    batches: int
+    elapsed_s: float
+    batch_latency: dict[str, float | int | None]
 
 @dataclass(frozen=True)
 class DiskSample:
@@ -162,11 +176,16 @@ def validate_image(ref: str, role: str) -> str:
         raise RehearsalUnknown(f"{role} image differs from qualified immutable identity")
     return ref
 
-def validate_spec(spec: CorpusSpec) -> None:
-    if spec.count < MIN_RECORD_COUNT: raise RehearsalUnknown("record count below production scale")
+def validate_spec(spec: CorpusSpec, *, minimum_count: int = MIN_RECORD_COUNT) -> None:
+    if spec.count < minimum_count: raise RehearsalUnknown("record count below required scale")
     if not 1 <= spec.batch_size <= MAX_BATCH_SIZE: raise RehearsalUnknown("invalid batch size")
-    if not 1_000 <= spec.payload_bytes <= 32_000: raise RehearsalUnknown("invalid payload calibration")
+    if not MIN_PAYLOAD_BYTES <= spec.payload_bytes <= MAX_PAYLOAD_BYTES: raise RehearsalUnknown("invalid payload calibration")
     if not spec.seed or len(spec.seed) > 128: raise RehearsalUnknown("invalid synthetic seed")
+
+def validate_calibration_spec(spec: CorpusSpec) -> None:
+    if spec.count != CALIBRATION_SAMPLE_COUNT or spec.payload_bytes != CALIBRATION_LOW_PAYLOAD_BYTES:
+        raise RehearsalUnknown("calibration corpus differs from fixed pilot contract")
+    validate_spec(spec, minimum_count=CALIBRATION_SAMPLE_COUNT)
 
 def fnv1a_32(value: str) -> int:
     result = 2166136261
@@ -191,8 +210,8 @@ def record_for(spec: CorpusSpec, index: int) -> dict[str, Any]:
         "confidence": 1.0, "tags": ["koala-stage-a", "synthetic-only", f"cohort-{cohort:04d}"],
         "entities": [{"name": f"Stage A Entity {cohort % 50:02d}", "type": "synthetic"}, {"name": f"Stage A Group {cohort % 7}", "type": "group"}]}}
 
-def iter_records(spec: CorpusSpec) -> Iterator[dict[str, Any]]:
-    validate_spec(spec)
+def iter_records(spec: CorpusSpec, *, minimum_count: int = MIN_RECORD_COUNT) -> Iterator[dict[str, Any]]:
+    validate_spec(spec, minimum_count=minimum_count)
     for index in range(spec.count): yield record_for(spec, index)
 
 def iter_batches(items: Iterable[dict[str, Any]], size: int) -> Iterator[list[dict[str, Any]]]:
@@ -217,10 +236,18 @@ def decode_batch_result(result: Any, expected: int) -> list[str]:
     if len(ids) != expected: raise RehearsalFailed("batch result count mismatch")
     return ids
 
-def ingest_corpus(client: Any, spec: CorpusSpec) -> CorpusReceipt:
-    receipt, digest = CorpusReceipt(), hashlib.sha256()
+def ingest_corpus(
+    client: Any,
+    spec: CorpusSpec,
+    *,
+    minimum_count: int = MIN_RECORD_COUNT,
+    progress: Callable[[IngestProgress], None] | None = None,
+    progress_interval: int = PROGRESS_BATCH_INTERVAL,
+) -> CorpusReceipt:
+    if progress_interval < 1: raise RehearsalUnknown("invalid progress interval")
+    receipt, digest, started = CorpusReceipt(), hashlib.sha256(), time.monotonic()
     retained = {"collision": [], "ordering": [], "isolation": [], "hard_delete": []}
-    for batch in iter_batches(iter_records(spec), spec.batch_size):
+    for batch in iter_batches(iter_records(spec, minimum_count=minimum_count), spec.batch_size):
         groups: dict[str, list[dict[str, Any]]] = {}
         for record in batch:
             digest.update(canonical_record(record)); groups.setdefault(record["vault"], []).append(record)
@@ -235,6 +262,11 @@ def ingest_corpus(client: Any, spec: CorpusSpec) -> CorpusReceipt:
                     retained["ordering"].append(memory_id); retained["ordering"] = retained["ordering"][-50:]
                 if record["vault"] == "stage-a-isolation" and len(retained["isolation"]) < 10: retained["isolation"].append(memory_id)
                 if index == 43: retained["hard_delete"].append(memory_id)
+            if progress and receipt.batches % progress_interval == 0:
+                progress(IngestProgress(
+                    receipt.submitted, receipt.accepted, receipt.batches,
+                    time.monotonic() - started, latency_summary(receipt.batch_latencies_ms),
+                ))
     if receipt.accepted != spec.count: raise RehearsalFailed("accepted count mismatch")
     receipt.manifest_sha256, receipt.retained_ids = digest.hexdigest(), retained
     return receipt
@@ -265,6 +297,49 @@ def store_footprint_gate(used: int | None) -> Gate:
     if used is None: return Gate("UNKNOWN", "pre-migration footprint missing")
     passed = MIN_STORE_BYTES <= used <= MAX_STORE_BYTES
     return Gate("PASSED" if passed else "FAILED", f"pre-migration bytes={used}", used, MAX_STORE_BYTES)
+
+def require_disk_safety(sample: DiskSample) -> None:
+    if sample.used_bytes > MAX_PEAK_BYTES or sample.free_percent < MIN_FREE_PERCENT:
+        raise RehearsalFailed(
+            f"ingestion disk safety failed: used={sample.used_bytes} free_percent={sample.free_percent:.2f}"
+        )
+
+def calibration_projection(
+    empty: DiskSample,
+    low: DiskSample,
+    high: DiskSample,
+    sample_count: int = CALIBRATION_SAMPLE_COUNT,
+) -> dict[str, Any]:
+    if sample_count != CALIBRATION_SAMPLE_COUNT:
+        raise RehearsalUnknown("calibration sample count differs from fixed pilot contract")
+    low_net, high_increment = low.used_bytes - empty.used_bytes, high.used_bytes - low.used_bytes
+    if low_net <= 0 or high_increment <= 0:
+        raise RehearsalUnknown("calibration store did not grow across both samples")
+    payload_delta = CALIBRATION_HIGH_PAYLOAD_BYTES - CALIBRATION_LOW_PAYLOAD_BYTES
+    low_bytes_per_record = low_net / sample_count
+    high_bytes_per_record = high_increment / sample_count
+    bytes_per_payload_byte = (high_bytes_per_record - low_bytes_per_record) / payload_delta
+    fixed_bytes_per_record = low_bytes_per_record - bytes_per_payload_byte * CALIBRATION_LOW_PAYLOAD_BYTES
+    if bytes_per_payload_byte <= 0 or fixed_bytes_per_record < 0:
+        raise RehearsalUnknown("calibration slope or fixed overhead invalid")
+    projected_minimum = empty.used_bytes + DEFAULT_RECORD_COUNT * (
+        fixed_bytes_per_record + bytes_per_payload_byte * MIN_PAYLOAD_BYTES
+    )
+    recommended = round(
+        (TARGET_STORE_BYTES - empty.used_bytes - DEFAULT_RECORD_COUNT * fixed_bytes_per_record)
+        / (DEFAULT_RECORD_COUNT * bytes_per_payload_byte)
+    )
+    recommendation = recommended if MIN_PAYLOAD_BYTES <= recommended <= MAX_PAYLOAD_BYTES else None
+    return {
+        "empty_used_bytes": empty.used_bytes,
+        "low_sample_used_bytes": low.used_bytes,
+        "high_sample_used_bytes": high.used_bytes,
+        "sample_count_each": sample_count,
+        "bytes_per_payload_byte": round(bytes_per_payload_byte, 6),
+        "fixed_bytes_per_record": round(fixed_bytes_per_record, 3),
+        "projected_minimum_bytes": round(projected_minimum),
+        "recommended_payload_bytes": recommendation,
+    }
 
 def combine_status(gates: dict[str, Gate], orphans: Sequence[str]) -> str:
     if orphans or any(g.status == "UNKNOWN" for g in gates.values()): return "UNKNOWN"
@@ -301,6 +376,69 @@ def write_receipt(path: Path, receipt: dict[str, Any]) -> str:
     finally:
         if os.path.exists(temporary): os.unlink(temporary)
     return digest
+
+def corpus_evidence(spec: CorpusSpec, receipt: CorpusReceipt | IngestProgress | None) -> dict[str, Any]:
+    evidence: dict[str, Any] = {
+        "schema_version": CORPUS_SCHEMA_VERSION,
+        "seed": spec.seed,
+        "requested_count": spec.count,
+        "payload_bytes": spec.payload_bytes,
+    }
+    if isinstance(receipt, CorpusReceipt):
+        evidence.update({
+            "submitted": receipt.submitted,
+            "accepted": receipt.accepted,
+            "batches": receipt.batches,
+            "manifest_sha256": receipt.manifest_sha256,
+            "batch_latency": latency_summary(receipt.batch_latencies_ms),
+        })
+    elif isinstance(receipt, IngestProgress):
+        evidence.update({
+            "submitted": receipt.submitted,
+            "accepted": receipt.accepted,
+            "batches": receipt.batches,
+            "elapsed_s": round(receipt.elapsed_s, 3),
+            "batch_latency": receipt.batch_latency,
+            "complete": False,
+        })
+    return evidence
+
+def receipt_document(
+    identity: RunIdentity,
+    spec: CorpusSpec,
+    *,
+    status: str,
+    exit_code: int,
+    detail: str,
+    ledger: ResourceLedger,
+    measurements: dict[str, Any],
+    gates: dict[str, Gate],
+    cleanup_result: dict[str, str],
+    orphans: Sequence[str],
+    corpus: CorpusReceipt | IngestProgress | None,
+    mode: str = "execute",
+) -> dict[str, Any]:
+    bounded_measurements = json.loads(json.dumps(measurements))
+    bounded_measurements["mode"] = mode
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": status,
+        "exit_code": exit_code,
+        "run_id": identity.run_id,
+        "source": {"commit": SOURCE_COMMIT, "tag": SOURCE_TAG},
+        "images": {"baseline": BASELINE_IMAGE, "baseline_digest": BASELINE_DIGEST, "candidate": CANDIDATE_IMAGE},
+        "corpus": corpus_evidence(spec, corpus),
+        "resources": {key: value for key, value in asdict(ledger).items() if value},
+        "measurements": bounded_measurements,
+        "gates": {name: asdict(gate) for name, gate in gates.items()},
+        "cleanup": cleanup_result,
+        "orphans": list(orphans),
+        "detail": detail,
+        "limitations": [
+            "Synthetic rehearsal is not production deployment authorization.",
+            "Production data, backups, volumes, machines, app, and credentials are prohibited.",
+        ],
+    }
 
 class MCPClient:
     def __init__(self, url: str, auth_value: str, timeout: float = 60.0):
@@ -504,6 +642,52 @@ class FlyRuntime:
     def list_owned_resources(self, identity: RunIdentity) -> list[str]:
         proc = self.runner(["flyctl", "status", "-a", identity.app_name], text=True, capture_output=True, timeout=60)
         return [] if proc.returncode else [identity.app_name]
+    def discover_owned_resources(self, identity: RunIdentity) -> ResourceLedger:
+        assert_not_production(identity)
+        status = self.runner(["flyctl", "status", "-a", identity.app_name], text=True, capture_output=True, timeout=60)
+        if status.returncode:
+            return ResourceLedger()
+        machines = self.json(["machines", "list", "-a", identity.app_name])
+        volumes = self.json(["volumes", "list", "-a", identity.app_name])
+        if not isinstance(machines, list) or not isinstance(volumes, list):
+            raise RehearsalUnknown("cleanup discovery returned invalid resources")
+        machine_ids = []
+        for machine in machines:
+            if not isinstance(machine, dict): raise RehearsalUnknown("cleanup machine entry invalid")
+            machine_id = str(machine.get("id", ""))
+            metadata = machine.get("config", {}).get("metadata", {})
+            if machine_id in PRODUCTION_MACHINE_IDS or metadata.get("koala_stage_a_run") != identity.run_id:
+                raise RehearsalUnknown("cleanup discovered unowned machine")
+            machine_ids.append(machine_id)
+        if len(machine_ids) > 1: raise RehearsalUnknown("cleanup discovered multiple machines")
+        by_name: dict[str, str] = {}
+        allowed_names = {
+            identity.volume_name,
+            identity.backup_volume_name,
+            identity.restore_volume_name,
+            identity.rollback_volume_name,
+        }
+        for volume in volumes:
+            if not isinstance(volume, dict): raise RehearsalUnknown("cleanup volume entry invalid")
+            volume_id, name = str(volume.get("id", "")), str(volume.get("name", ""))
+            if volume_id in PRODUCTION_VOLUME_IDS or name not in allowed_names or name in by_name:
+                raise RehearsalUnknown("cleanup discovered unowned or duplicate volume")
+            by_name[name] = volume_id
+        return ResourceLedger(
+            app=identity.app_name,
+            machine_id=machine_ids[0] if machine_ids else None,
+            volume_id=by_name.get(identity.volume_name),
+            backup_volume_id=by_name.get(identity.backup_volume_name),
+            restore_volume_id=by_name.get(identity.restore_volume_name),
+            rollback_volume_id=by_name.get(identity.rollback_volume_name),
+        )
+
+def termination_handler(signum: int, _frame: Any) -> None:
+    raise RehearsalUnknown(f"rehearsal terminated by signal {signum}")
+
+def install_termination_handlers() -> None:
+    signal.signal(signal.SIGTERM, termination_handler)
+    signal.signal(signal.SIGINT, termination_handler)
 
 def terminate_proxy(proxy: subprocess.Popen[str] | None) -> None:
     if proxy is None: return
@@ -531,6 +715,36 @@ def cleanup(runtime: FlyRuntime, identity: RunIdentity, ledger: ResourceLedger) 
     try: orphans.extend(x for x in runtime.list_owned_resources(identity) if x not in orphans)
     except Exception: orphans.append(f"{identity.run_id}:orphan-scan-unknown")
     return results, orphans
+
+def cleanup_only(
+    identity: RunIdentity,
+    receipt_path: Path,
+    *,
+    runtime: FlyRuntime | None = None,
+) -> int:
+    runtime = runtime or FlyRuntime()
+    status, exit_code, detail = "UNKNOWN", 2, "cleanup did not complete"
+    cleanup_result: dict[str, str] = {}
+    orphans: list[str] = []
+    ledger = ResourceLedger()
+    try:
+        ledger = runtime.discover_owned_resources(identity)
+        cleanup_result, orphans = cleanup(runtime, identity, ledger)
+        if orphans: detail = "cleanup uncertainty or orphaned resources"
+        else: status, exit_code, detail = "PASSED", 0, "run-owned resources absent after cleanup"
+    except RehearsalError as exc:
+        detail = safe_detail(str(exc))
+        orphans = [f"{identity.run_id}:cleanup-discovery-unknown"]
+    except Exception as exc:
+        detail = f"unexpected {type(exc).__name__}"
+        orphans = [f"{identity.run_id}:cleanup-discovery-unknown"]
+    spec = CorpusSpec()
+    write_receipt(receipt_path, receipt_document(
+        identity, spec, status=status, exit_code=exit_code, detail=detail,
+        ledger=ledger, measurements={}, gates={}, cleanup_result=cleanup_result,
+        orphans=orphans, corpus=None, mode="cleanup-only",
+    ))
+    return exit_code
 
 def query_count(client: MCPClient, vault: str) -> tuple[int, float]:
     result, latency = client.call("muninn_status", {"vault": vault})
@@ -587,9 +801,11 @@ def run_query_probes(client: MCPClient, receipt: CorpusReceipt) -> dict[str, lis
     if len(result_ids(isolated)) != 1: raise RehearsalFailed("isolated vault lookup failed")
     return samples
 
-def plan(identity: RunIdentity, spec: CorpusSpec) -> dict[str, Any]:
-    validate_spec(spec); validate_image(BASELINE_IMAGE, "baseline"); validate_image(CANDIDATE_IMAGE, "candidate")
-    return {"mode": "dry-run", "run_id": identity.run_id, "confirmation_required_for_execute": identity.confirmation,
+def plan(identity: RunIdentity, spec: CorpusSpec, *, mode: str = "execute") -> dict[str, Any]:
+    if mode == "calibrate": validate_calibration_spec(spec)
+    else: validate_spec(spec)
+    validate_image(BASELINE_IMAGE, "baseline"); validate_image(CANDIDATE_IMAGE, "candidate")
+    return {"mode": f"{mode}-plan", "run_id": identity.run_id, "confirmation_required_for_execute": identity.confirmation,
             "source_commit": SOURCE_COMMIT, "source_tag": SOURCE_TAG, "baseline_image": BASELINE_IMAGE,
             "baseline_digest": BASELINE_DIGEST, "candidate_image": CANDIDATE_IMAGE,
             "record_count": spec.count, "batch_size": spec.batch_size,
@@ -598,6 +814,93 @@ def plan(identity: RunIdentity, spec: CorpusSpec) -> dict[str, Any]:
                                     "backup_volume": identity.backup_volume_name, "restore_volume": identity.restore_volume_name,
                                     "rollback_volume": identity.rollback_volume_name},
             "note": "plan-only: zero Fly mutations, credentials, network queries, or production access"}
+
+def calibrate(
+    identity: RunIdentity,
+    spec: CorpusSpec,
+    receipt_path: Path,
+    *,
+    runtime: FlyRuntime | None = None,
+    client_factory: Callable[[str, str], MCPClient] | None = None,
+    local_port: int = 18750,
+) -> int:
+    runtime = runtime or FlyRuntime(); client_factory = client_factory or (lambda url, auth: MCPClient(url, auth))
+    ledger, proxy = ResourceLedger(), None
+    gates: dict[str, Gate] = {}; measurements: dict[str, Any] = {"disk_samples": [], "latencies": {}}
+    corpus_receipt: CorpusReceipt | IngestProgress | None = None
+    cleanup_result: dict[str, str] = {}; orphans: list[str] = []
+    detail, status, exit_code = "calibration did not complete", "UNKNOWN", 2
+    auth_value = secrets.token_urlsafe(32)
+    try:
+        validate_calibration_spec(spec); validate_image(BASELINE_IMAGE, "baseline"); runtime.preflight(identity)
+        ledger.app = runtime.create_app(identity); runtime.install_auth(identity, auth_value)
+        ledger.volume_id = runtime.create_volume(identity, identity.volume_name)
+        ledger.machine_id = runtime.create_machine(identity, ledger.volume_id, BASELINE_IMAGE, "baseline")
+        runtime.wait_ready(identity, ledger.machine_id, READINESS_LIMIT_S)
+        empty = runtime.disk_sample(identity, ledger.machine_id, "calibration-empty")
+        measurements["disk_samples"].append(asdict(empty) | {"free_percent": empty.free_percent})
+        proxy = runtime.proxy(identity, ledger.machine_id, local_port)
+        client = client_factory(f"http://127.0.0.1:{local_port}/mcp", auth_value); client.initialize()
+        def checkpoint(progress: IngestProgress) -> None:
+            nonlocal corpus_receipt
+            corpus_receipt = progress
+            sample = runtime.disk_sample(identity, ledger.machine_id or "", "calibration-ingestion")
+            require_disk_safety(sample)
+            measurements["latest_disk_sample"] = asdict(sample) | {"free_percent": sample.free_percent}
+            write_receipt(receipt_path, receipt_document(
+                identity, spec, status="UNKNOWN", exit_code=2, detail="calibration ingestion in progress",
+                ledger=ledger, measurements=measurements, gates=gates, cleanup_result={}, orphans=[],
+                corpus=progress, mode="calibrate",
+            ))
+        corpus_receipt = ingest_corpus(
+            client, spec, minimum_count=CALIBRATION_SAMPLE_COUNT, progress=checkpoint,
+        )
+        low = runtime.disk_sample(identity, ledger.machine_id, "calibration-low-payload")
+        require_disk_safety(low)
+        measurements["disk_samples"].append(asdict(low) | {"free_percent": low.free_percent})
+        high_spec = CorpusSpec(
+            CALIBRATION_SAMPLE_COUNT, spec.batch_size, CALIBRATION_HIGH_PAYLOAD_BYTES,
+            f"{spec.seed}-high",
+        )
+        high_receipt = ingest_corpus(
+            client, high_spec, minimum_count=CALIBRATION_SAMPLE_COUNT, progress=checkpoint,
+        )
+        populated = runtime.disk_sample(identity, ledger.machine_id, "calibration-high-payload")
+        require_disk_safety(populated)
+        measurements["disk_samples"].append(asdict(populated) | {"free_percent": populated.free_percent})
+        projection = calibration_projection(empty, low, populated)
+        measurements["calibration"] = projection
+        measurements["high_sample"] = corpus_evidence(high_spec, high_receipt)
+        if projection["projected_minimum_bytes"] > MAX_STORE_BYTES:
+            gates["minimum_payload_projection"] = Gate(
+                "FAILED", "minimum payload projects above maximum Stage A footprint",
+                projection["projected_minimum_bytes"], MAX_STORE_BYTES,
+            )
+            detail = "minimum-payload calibration requires synthetic record-shape reduction"
+        elif projection["recommended_payload_bytes"] is None:
+            gates["payload_recommendation"] = Gate("UNKNOWN", "calibrated payload recommendation is out of bounds")
+            detail = "calibration could not produce a bounded payload recommendation"
+        else:
+            gates["payload_recommendation"] = Gate(
+                "PASSED", "bounded payload recommendation measured; full Stage A not run",
+                projection["recommended_payload_bytes"], MAX_PAYLOAD_BYTES,
+            )
+            detail = "calibration completed; full Stage A remains separately gated"
+        status = combine_status(gates, [])
+        exit_code = 0 if status == "PASSED" else (1 if status == "FAILED" else 2)
+    except RehearsalError as exc: status, exit_code, detail = exc.status, 1 if exc.status == "FAILED" else 2, safe_detail(str(exc))
+    except Exception as exc: status, exit_code, detail = "UNKNOWN", 2, f"unexpected {type(exc).__name__}"
+    finally:
+        try: terminate_proxy(proxy)
+        except RehearsalError: status, exit_code, detail = "UNKNOWN", 2, "local proxy cleanup uncertain"
+        cleanup_result, orphans = cleanup(runtime, identity, ledger)
+        if orphans: status, exit_code, detail = "UNKNOWN", 2, "cleanup uncertainty or orphaned resources"
+        write_receipt(receipt_path, receipt_document(
+            identity, spec, status=status, exit_code=exit_code, detail=detail, ledger=ledger,
+            measurements=measurements, gates=gates, cleanup_result=cleanup_result,
+            orphans=orphans, corpus=corpus_receipt, mode="calibrate",
+        ))
+    return exit_code
 
 def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runtime: FlyRuntime | None = None,
             client_factory: Callable[[str, str], MCPClient] | None = None, local_port: int = 18750) -> int:
@@ -613,8 +916,21 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
         ledger.volume_id = runtime.create_volume(identity, identity.volume_name)
         ledger.machine_id = runtime.create_machine(identity, ledger.volume_id, BASELINE_IMAGE, "baseline")
         runtime.wait_ready(identity, ledger.machine_id, READINESS_LIMIT_S); proxy = runtime.proxy(identity, ledger.machine_id, local_port)
-        client = client_factory(f"http://127.0.0.1:{local_port}/mcp", auth_value); client.initialize(); corpus_receipt = ingest_corpus(client, spec)
-        pre = runtime.disk_sample(identity, ledger.machine_id, "pre-migration"); measurements["disk_samples"].append(asdict(pre) | {"free_percent": pre.free_percent})
+        client = client_factory(f"http://127.0.0.1:{local_port}/mcp", auth_value); client.initialize()
+        def checkpoint(progress: IngestProgress) -> None:
+            nonlocal corpus_receipt
+            corpus_receipt = progress
+            sample = runtime.disk_sample(identity, ledger.machine_id or "", "baseline-ingestion")
+            require_disk_safety(sample)
+            measurements["latest_disk_sample"] = asdict(sample) | {"free_percent": sample.free_percent}
+            write_receipt(receipt_path, receipt_document(
+                identity, spec, status="UNKNOWN", exit_code=2, detail="baseline ingestion in progress",
+                ledger=ledger, measurements=measurements, gates=gates, cleanup_result={}, orphans=[],
+                corpus=progress,
+            ))
+        corpus_receipt = ingest_corpus(client, spec, progress=checkpoint)
+        pre = runtime.disk_sample(identity, ledger.machine_id, "pre-migration"); require_disk_safety(pre)
+        measurements["disk_samples"].append(asdict(pre) | {"free_percent": pre.free_percent})
         gates["store_footprint"] = store_footprint_gate(pre.used_bytes)
         baseline_counts, status_samples = query_counts(client); measurements["baseline_counts"] = baseline_counts
         gates["baseline_status"] = threshold_gate("baseline status", max(status_samples) / 1000, STATUS_LIMIT_S)
@@ -696,37 +1012,48 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
     except RehearsalError as exc: status, exit_code, detail = exc.status, 1 if exc.status == "FAILED" else 2, safe_detail(str(exc))
     except Exception as exc: status, exit_code, detail = "UNKNOWN", 2, f"unexpected {type(exc).__name__}"
     finally:
-        terminate_proxy(proxy); cleanup_result, orphans = cleanup(runtime, identity, ledger); computed = combine_status(gates, orphans)
+        try: terminate_proxy(proxy)
+        except RehearsalError: status, exit_code, detail = "UNKNOWN", 2, "local proxy cleanup uncertain"
+        cleanup_result, orphans = cleanup(runtime, identity, ledger); computed = combine_status(gates, orphans)
         if detail == "all measured Stage A phases completed": status, exit_code = computed, 0 if computed == "PASSED" else (1 if computed == "FAILED" else 2)
         if orphans: status, exit_code, detail = "UNKNOWN", 2, "cleanup uncertainty or orphaned resources"
-        receipt = {"schema_version": SCHEMA_VERSION, "status": status, "exit_code": exit_code, "run_id": identity.run_id,
-            "source": {"commit": SOURCE_COMMIT, "tag": SOURCE_TAG},
-            "images": {"baseline": BASELINE_IMAGE, "baseline_digest": BASELINE_DIGEST, "candidate": CANDIDATE_IMAGE},
-            "corpus": ({"schema_version": CORPUS_SCHEMA_VERSION, "seed": spec.seed, "requested_count": spec.count, "payload_bytes": spec.payload_bytes,
-                        "submitted": corpus_receipt.submitted, "accepted": corpus_receipt.accepted, "batches": corpus_receipt.batches,
-                        "manifest_sha256": corpus_receipt.manifest_sha256, "batch_latency": latency_summary(corpus_receipt.batch_latencies_ms)}
-                       if corpus_receipt else {"schema_version": CORPUS_SCHEMA_VERSION, "seed": spec.seed, "requested_count": spec.count, "payload_bytes": spec.payload_bytes}),
-            "resources": {k: v for k, v in asdict(ledger).items() if v}, "measurements": measurements, "gates": {name: asdict(gate) for name, gate in gates.items()},
-            "cleanup": cleanup_result, "orphans": orphans, "detail": detail,
-            "limitations": ["Synthetic rehearsal is not production deployment authorization.", "Production data, backups, volumes, machines, app, and credentials are prohibited."]}
-        write_receipt(receipt_path, receipt)
+        write_receipt(receipt_path, receipt_document(
+            identity, spec, status=status, exit_code=exit_code, detail=detail, ledger=ledger,
+            measurements=measurements, gates=gates, cleanup_result=cleanup_result,
+            orphans=orphans, corpus=corpus_receipt,
+        ))
     return exit_code
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__); mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--dry-run", action="store_true"); mode.add_argument("--execute", action="store_true")
-    parser.add_argument("--run-id", required=True); parser.add_argument("--confirm"); parser.add_argument("--record-count", type=int, default=DEFAULT_RECORD_COUNT)
-    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE); parser.add_argument("--payload-bytes", type=int, default=DEFAULT_PAYLOAD_BYTES)
+    mode.add_argument("--dry-run", action="store_true")
+    mode.add_argument("--execute", action="store_true")
+    mode.add_argument("--calibrate", action="store_true")
+    mode.add_argument("--cleanup-only", action="store_true")
+    parser.add_argument("--run-id", required=True); parser.add_argument("--confirm"); parser.add_argument("--record-count", type=int)
+    parser.add_argument("--plan-mode", choices=("execute", "calibrate"), default="execute")
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE); parser.add_argument("--payload-bytes", type=int)
     parser.add_argument("--seed", default="koala-stage-a-v1"); parser.add_argument("--receipt", type=Path, default=Path("stage-a-receipt.json")); parser.add_argument("--json", action="store_true")
     return parser
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        identity = build_identity(args.run_id); spec = CorpusSpec(args.record_count, args.batch_size, args.payload_bytes, args.seed)
-        if not args.execute: print(json.dumps(plan(identity, spec), indent=2 if args.json else None, sort_keys=True)); return 0
+        identity = build_identity(args.run_id)
+        calibrating = args.calibrate or (args.dry_run and args.plan_mode == "calibrate")
+        spec = CorpusSpec(
+            args.record_count if args.record_count is not None else (CALIBRATION_SAMPLE_COUNT if calibrating else DEFAULT_RECORD_COUNT),
+            args.batch_size,
+            args.payload_bytes if args.payload_bytes is not None else (CALIBRATION_LOW_PAYLOAD_BYTES if calibrating else DEFAULT_PAYLOAD_BYTES),
+            args.seed,
+        )
+        if not (args.execute or args.calibrate or args.cleanup_only):
+            print(json.dumps(plan(identity, spec, mode=args.plan_mode), indent=2 if args.json else None, sort_keys=True)); return 0
         if args.confirm != identity.confirmation:
-            print("REFUSED: --execute requires the exact run-specific confirmation", file=sys.stderr); print(f"Required confirmation: {identity.confirmation}", file=sys.stderr); return 2
+            print("REFUSED: mutating mode requires the exact run-specific confirmation", file=sys.stderr); print(f"Required confirmation: {identity.confirmation}", file=sys.stderr); return 2
+        install_termination_handlers()
+        if args.cleanup_only: return cleanup_only(identity, args.receipt)
+        if args.calibrate: return calibrate(identity, spec, args.receipt)
         return execute(identity, spec, args.receipt)
     except RehearsalError as exc: print(f"Stage A refused: {safe_detail(str(exc))}", file=sys.stderr); return 2
 

@@ -637,8 +637,14 @@ class FlyRuntime:
         if proc.returncode: raise RehearsalUnknown(f"flyctl {args[0]} failed: {_safe_process_error(proc)}")
         return proc
     def json(self, args: list[str], *, timeout: int = 600) -> Any:
-        try: return json.loads(self.run([*args, "--json"], timeout=timeout).stdout)
-        except json.JSONDecodeError as exc: raise RehearsalUnknown(f"flyctl {args[0]} returned invalid JSON") from exc
+        for attempt in range(3):
+            try:
+                return json.loads(self.run([*args, "--json"], timeout=timeout).stdout)
+            except json.JSONDecodeError as exc:
+                if attempt == 2:
+                    raise RehearsalUnknown(f"flyctl {args[0]} returned invalid JSON") from exc
+                time.sleep(attempt + 1)
+        raise AssertionError("unreachable")
     def preflight(self, identity: RunIdentity) -> None:
         assert_not_production(identity)
         proc = self.runner(["flyctl", "status", "-a", identity.app_name], text=True, capture_output=True, timeout=60)

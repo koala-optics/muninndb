@@ -27,7 +27,7 @@ class FakeClient:
 
 class StageAContractTests(unittest.TestCase):
     def small_spec(self, count=53):
-        return stage.CorpusSpec(count=count, batch_size=50, payload_bytes=1000, seed="test-seed")
+        return stage.CorpusSpec(count=count, batch_size=50, payload_bytes=1000, seed="test-seed", payload_shape="opaque")
 
     def test_qualified_identities_are_immutable(self):
         self.assertEqual(stage.validate_image(stage.BASELINE_IMAGE, "baseline"), stage.BASELINE_IMAGE)
@@ -97,11 +97,23 @@ class StageAContractTests(unittest.TestCase):
         with self.assertRaises(stage.RehearsalUnknown): stage.assert_not_production(duplicate)
         with self.assertRaises(stage.RehearsalUnknown): stage.assert_owned("ksa_deadbeef00_src", identity, "volume-name")
 
-    def test_defaults_are_production_scale_and_twenty_gb(self):
+    def test_defaults_are_production_scale_lexical_and_twenty_gb(self):
         self.assertEqual(stage.DEFAULT_RECORD_COUNT, 502_385)
         self.assertEqual(stage.DEFAULT_BATCH_SIZE, 50)
+        self.assertEqual(stage.DEFAULT_PAYLOAD_BYTES, 4000)
+        self.assertEqual(stage.DEFAULT_PAYLOAD_SHAPE, "lexical")
+        self.assertEqual(stage.CorpusSpec().payload_shape, "opaque")
         self.assertEqual(stage.VOLUME_SIZE_GB, 20)
+        stage.validate_execute_spec(stage.CorpusSpec(payload_shape=stage.DEFAULT_PAYLOAD_SHAPE))
         with self.assertRaises(stage.RehearsalUnknown): stage.validate_spec(self.small_spec())
+
+    def test_execute_contract_refuses_obsolete_or_unmeasured_shapes(self):
+        for spec in (
+            stage.CorpusSpec(payload_shape="opaque"),
+            stage.CorpusSpec(payload_bytes=1000),
+        ):
+            with self.assertRaisesRegex(stage.RehearsalUnknown, "qualified lexical contract"):
+                stage.validate_execute_spec(spec)
 
     def test_calibration_contract_is_fixed_and_two_point(self):
         spec = stage.CorpusSpec(
@@ -368,6 +380,26 @@ class StageAContractTests(unittest.TestCase):
         with mock.patch.object(stage, "execute", side_effect=AssertionError("must not execute")):
             self.assertEqual(stage.main(["--run-id", "refusal-test", "--execute", "--confirm", "wrong"]), 2)
 
+    def test_execute_refuses_opaque_spec_before_fly_mutation(self):
+        identity = stage.build_identity("opaque-refusal")
+        runtime = mock.Mock()
+        runtime.list_owned_resources.return_value = []
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "refusal.json"
+            self.assertEqual(stage.execute(
+                identity,
+                stage.CorpusSpec(payload_shape="opaque"),
+                path,
+                runtime=runtime,
+            ), 2)
+            receipt = json.loads(path.read_text())
+        self.assertEqual(receipt["status"], "UNKNOWN")
+        self.assertIn("qualified lexical contract", receipt["detail"])
+        runtime.preflight.assert_not_called()
+        runtime.create_app.assert_not_called()
+        runtime.create_volume.assert_not_called()
+        runtime.create_machine.assert_not_called()
+
     def test_old_image_is_only_allowed_for_baseline_and_rollback_roles(self):
         identity = stage.build_identity("role-test")
         runtime = stage.FlyRuntime(runner=lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, "Machine ID: abcdef12345678\n", ""))
@@ -489,6 +521,25 @@ class StageAContractTests(unittest.TestCase):
         self.assertEqual(receipt["status"], "PASSED")
         self.assertEqual(receipt["measurements"]["mode"], "cleanup-only")
         self.assertEqual(receipt["orphans"], [])
+
+    def test_execute_plan_is_lexical_evidence_backed_and_non_mutating(self):
+        identity = stage.build_identity("execute-plan")
+        with mock.patch.object(stage, "FlyRuntime", side_effect=AssertionError("runtime constructed")):
+            rendered = stage.plan(identity, stage.CorpusSpec(payload_shape="lexical"))
+        self.assertEqual(rendered["mode"], "execute-plan")
+        self.assertEqual(rendered["record_count"], 502_385)
+        self.assertEqual(rendered["payload_bytes"], 4000)
+        self.assertEqual(rendered["payload_shape"], "lexical")
+        self.assertEqual(rendered["expected_net_store_bytes"], 6_043_996_679)
+        self.assertEqual(rendered["store_footprint_gate_bytes"], {
+            "minimum": stage.MIN_STORE_BYTES,
+            "maximum": stage.MAX_STORE_BYTES,
+        })
+        self.assertEqual(rendered["storage_evidence"], {
+            "ablation_run_id": "30102233910",
+            "receipt_sha256": stage.ABLATION_RECEIPT_SHA256,
+        })
+        self.assertTrue(any("asynchronous FTS" in item for item in rendered["limitations"]))
 
     def test_calibration_plan_is_fixed_and_non_mutating(self):
         identity = stage.build_identity("calibrate-plan")
@@ -824,6 +875,8 @@ class StageAContractTests(unittest.TestCase):
         self.assertIn("plan_mode=calibrate", workflow)
         self.assertIn("plan_mode=ablate", workflow)
         self.assertIn("plan_mode=execute", workflow)
+        self.assertIn("payload_bytes=4000", workflow)
+        self.assertNotIn("payload_bytes=10900", workflow)
         self.assertIn('--dry-run --plan-mode "$plan_mode"', workflow)
         self.assertLess(workflow.index("Clean up exact run-owned resources"), workflow.index("Upload redacted evidence"))
         self.assertIn("--cleanup-only", workflow)

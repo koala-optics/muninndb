@@ -31,10 +31,14 @@ CORPUS_SCHEMA_VERSION = 2
 CORPUS_SHAPE_VERSION = "lean-bulk-probes-v1"
 DEFAULT_RECORD_COUNT = MIN_RECORD_COUNT = 502_385
 DEFAULT_BATCH_SIZE = MAX_BATCH_SIZE = 50
-DEFAULT_PAYLOAD_BYTES = 10_900
+DEFAULT_PAYLOAD_BYTES = 4_000
+DEFAULT_PAYLOAD_SHAPE = "lexical"
 MIN_PAYLOAD_BYTES, MAX_PAYLOAD_BYTES = 1_000, 32_000
 CALIBRATION_SAMPLE_COUNT = 25_000
 CALIBRATION_LOW_PAYLOAD_BYTES, CALIBRATION_HIGH_PAYLOAD_BYTES = MIN_PAYLOAD_BYTES, 4_000
+ABLATION_RUN_ID = "30102233910"
+ABLATION_RECEIPT_SHA256 = "852b1db77e5a1f082c05835a20e0653acc59c2fd4c3cb2f46b20cb4b8c0ad241"
+EXPECTED_NET_STORE_BYTES = 6_043_996_679
 ABLATION_COHORTS = (
     ("opaque-1k", "opaque", CALIBRATION_LOW_PAYLOAD_BYTES),
     ("opaque-4k", "opaque", CALIBRATION_HIGH_PAYLOAD_BYTES),
@@ -200,6 +204,12 @@ def validate_calibration_spec(spec: CorpusSpec) -> None:
     if spec.count != CALIBRATION_SAMPLE_COUNT or spec.payload_bytes != CALIBRATION_LOW_PAYLOAD_BYTES:
         raise RehearsalUnknown("calibration corpus differs from fixed pilot contract")
     validate_spec(spec, minimum_count=CALIBRATION_SAMPLE_COUNT)
+
+
+def validate_execute_spec(spec: CorpusSpec) -> None:
+    validate_spec(spec)
+    if spec.payload_shape != DEFAULT_PAYLOAD_SHAPE or spec.payload_bytes != DEFAULT_PAYLOAD_BYTES:
+        raise RehearsalUnknown("execute corpus differs from qualified lexical contract")
 
 def fnv1a_32(value: str) -> int:
     result = 2166136261
@@ -933,17 +943,27 @@ def run_query_probes(client: MCPClient, receipt: CorpusReceipt) -> dict[str, lis
 
 def plan(identity: RunIdentity, spec: CorpusSpec, *, mode: str = "execute") -> dict[str, Any]:
     if mode in {"calibrate", "ablate"}: validate_calibration_spec(spec)
-    else: validate_spec(spec)
+    else: validate_execute_spec(spec)
     validate_image(BASELINE_IMAGE, "baseline"); validate_image(CANDIDATE_IMAGE, "candidate")
-    return {"mode": f"{mode}-plan", "run_id": identity.run_id, "confirmation_required_for_execute": identity.confirmation,
-            "source_commit": SOURCE_COMMIT, "source_tag": SOURCE_TAG, "baseline_image": BASELINE_IMAGE,
-            "baseline_digest": BASELINE_DIGEST, "candidate_image": CANDIDATE_IMAGE,
-            "record_count": spec.count, "batch_size": spec.batch_size,
-            "payload_bytes": spec.payload_bytes, "volume_gb": VOLUME_SIZE_GB,
-            "generated_resources": {"app": identity.app_name, "source_volume": identity.volume_name,
-                                    "backup_volume": identity.backup_volume_name, "restore_volume": identity.restore_volume_name,
-                                    "rollback_volume": identity.rollback_volume_name},
-            "note": "plan-only: zero Fly mutations, credentials, network queries, or production access"}
+    result = {"mode": f"{mode}-plan", "run_id": identity.run_id, "confirmation_required_for_execute": identity.confirmation,
+              "source_commit": SOURCE_COMMIT, "source_tag": SOURCE_TAG, "baseline_image": BASELINE_IMAGE,
+              "baseline_digest": BASELINE_DIGEST, "candidate_image": CANDIDATE_IMAGE,
+              "record_count": spec.count, "batch_size": spec.batch_size,
+              "payload_bytes": spec.payload_bytes, "payload_shape": spec.payload_shape, "volume_gb": VOLUME_SIZE_GB,
+              "generated_resources": {"app": identity.app_name, "source_volume": identity.volume_name,
+                                      "backup_volume": identity.backup_volume_name, "restore_volume": identity.restore_volume_name,
+                                      "rollback_volume": identity.rollback_volume_name},
+              "note": "plan-only: zero Fly mutations, credentials, network queries, or production access"}
+    if mode == "execute":
+        result["expected_net_store_bytes"] = EXPECTED_NET_STORE_BYTES
+        result["store_footprint_gate_bytes"] = {"minimum": MIN_STORE_BYTES, "maximum": MAX_STORE_BYTES}
+        result["storage_evidence"] = {"ablation_run_id": ABLATION_RUN_ID, "receipt_sha256": ABLATION_RECEIPT_SHA256}
+        result["limitations"] = [
+            "Synthetic rehearsal is not production deployment authorization.",
+            "Production data, backups, volumes, machines, app, and credentials are prohibited.",
+            "The ablation quiet-window witnessed disk settlement; it did not prove asynchronous FTS or provenance queues were empty.",
+        ]
+    return result
 
 def calibrate(
     identity: RunIdentity,
@@ -1142,7 +1162,7 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
     detail, status, exit_code = "rehearsal did not complete", "UNKNOWN", 2
     auth_value = secrets.token_urlsafe(32)
     try:
-        validate_spec(spec); validate_image(BASELINE_IMAGE, "baseline"); validate_image(CANDIDATE_IMAGE, "candidate"); runtime.preflight(identity)
+        validate_execute_spec(spec); validate_image(BASELINE_IMAGE, "baseline"); validate_image(CANDIDATE_IMAGE, "candidate"); runtime.preflight(identity)
         ledger.app = runtime.create_app(identity); runtime.install_auth(identity, auth_value)
         ledger.volume_id = runtime.create_volume(identity, identity.volume_name)
         ledger.machine_id = runtime.create_machine(identity, ledger.volume_id, BASELINE_IMAGE, "baseline")
@@ -1278,6 +1298,7 @@ def main(argv: list[str] | None = None) -> int:
             args.batch_size,
             args.payload_bytes if args.payload_bytes is not None else (CALIBRATION_LOW_PAYLOAD_BYTES if calibrating else DEFAULT_PAYLOAD_BYTES),
             args.seed,
+            "opaque" if calibrating else DEFAULT_PAYLOAD_SHAPE,
         )
         if not (args.execute or args.calibrate or args.ablate or args.cleanup_only):
             print(json.dumps(plan(identity, spec, mode=args.plan_mode), indent=2 if args.json else None, sort_keys=True)); return 0

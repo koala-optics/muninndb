@@ -446,9 +446,7 @@ def wait_for_storage_quiet(
     while time.monotonic() - started <= timeout_s:
         sample = runtime.disk_sample(identity, machine_id, f"ablation-{cohort}-settling")
         require_disk_safety(sample)
-        if samples and sample.used_bytes < samples[-1].used_bytes:
-            raise RehearsalUnknown("storage quiet-window disk usage regressed")
-        if samples and sample.used_bytes - samples[-1].used_bytes <= tolerance_bytes:
+        if samples and abs(sample.used_bytes - samples[-1].used_bytes) <= tolerance_bytes:
             stable += 1
         else:
             stable = 0

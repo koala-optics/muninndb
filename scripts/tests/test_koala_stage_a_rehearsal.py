@@ -639,7 +639,7 @@ class StageAContractTests(unittest.TestCase):
             self.assertEqual(left["memory"]["created_at"], right["memory"]["created_at"])
             self.assertEqual(set(left["memory"]) - {"content"}, set(right["memory"]) - {"content"})
 
-    def test_quiet_window_requires_stable_monotonic_samples(self):
+    def test_quiet_window_requires_stable_samples(self):
         identity = stage.build_identity("settle-test")
         runtime = mock.Mock()
         runtime.disk_sample.side_effect = [
@@ -657,17 +657,36 @@ class StageAContractTests(unittest.TestCase):
         self.assertEqual(len(result["samples"]), 4)
         self.assertEqual(result["witness"], "bounded-df-quiet-window")
 
-    def test_quiet_window_timeout_and_regression_are_unknown(self):
-        identity = stage.build_identity("settle-fail")
+    def test_quiet_window_accepts_small_bidirectional_settlement(self):
+        identity = stage.build_identity("settle-decrease")
         runtime = mock.Mock()
         runtime.disk_sample.side_effect = [
             stage.DiskSample("x", 100, 900, 1000),
             stage.DiskSample("x", 90, 910, 1000),
+            stage.DiskSample("x", 95, 905, 1000),
         ]
-        with mock.patch.object(stage.time, "monotonic", side_effect=[0, 0, 1]), \
+        with mock.patch.object(stage.time, "sleep"):
+            result = stage.wait_for_storage_quiet(
+                runtime, identity, "machine", "cohort", timeout_s=10,
+                interval_s=1, stable_samples=2, tolerance_bytes=10,
+            )
+        self.assertEqual(result["settled"].used_bytes, 95)
+        self.assertEqual(len(result["samples"]), 3)
+
+    def test_quiet_window_timeout_is_unknown(self):
+        identity = stage.build_identity("settle-fail")
+        runtime = mock.Mock()
+        runtime.disk_sample.side_effect = [
+            stage.DiskSample("x", 100, 900, 1000),
+            stage.DiskSample("x", 110, 890, 1000),
+        ]
+        with mock.patch.object(stage.time, "monotonic", side_effect=[0, 0, 1, 2]), \
              mock.patch.object(stage.time, "sleep"):
             with self.assertRaises(stage.RehearsalUnknown):
-                stage.wait_for_storage_quiet(runtime, identity, "machine", "cohort", timeout_s=1, interval_s=1)
+                stage.wait_for_storage_quiet(
+                    runtime, identity, "machine", "cohort", timeout_s=1,
+                    interval_s=1, tolerance_bytes=0,
+                )
 
     def test_ablation_models_are_separate_and_expose_shape_delta(self):
         empty = 1000

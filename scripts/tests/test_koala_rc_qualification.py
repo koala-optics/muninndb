@@ -174,6 +174,20 @@ class QualificationSafetyTests(unittest.TestCase):
                 ["new", "old"],
             )
 
+    def test_vault_count_requires_integer_status_count(self) -> None:
+        client = mock.Mock()
+        client.call.return_value = ({"total_memories": 3}, 1.0)
+        self.assertEqual(qualification.vault_count(client, "rc-synthetic"), 3)
+        client.call.assert_called_once_with("muninn_status", {"vault": "rc-synthetic"})
+        for result in ({}, {"total_memories": "3"}, []):
+            client.call.return_value = (result, 1.0)
+            with self.assertRaises(qualification.QualificationError):
+                qualification.vault_count(client, "rc-synthetic")
+
+    def test_v5_count_gate_is_required(self) -> None:
+        self.assertIn("migration_v5_counts", qualification.REQUIRED_GATES)
+        self.assertIn("muninn_status", qualification.REQUIRED_TOOLS)
+
     def test_disposable_data_directory_is_container_writable(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             args = mock.Mock(

@@ -1011,23 +1011,49 @@ func TestContextWithSnapshot(t *testing.T) {
 	}
 }
 
-// TestWriteEngramBatch_VaultCountIncrement verifies that the vault count
-// increases by exactly the batch size after WriteEngramBatch.
-func TestWriteEngramBatch_VaultCountIncrement(t *testing.T) {
+func TestWriteEngram_FirstWriteInitializesExactVaultCount(t *testing.T) {
 	store := newTestStore(t)
-
 	ctx := context.Background()
-	ws := store.VaultPrefix("batch-count")
+	ws := store.VaultPrefix("single-count-cold")
 
-	countBefore := store.GetVaultCount(ctx, ws)
+	if _, err := store.WriteEngram(ctx, ws, &Engram{Concept: "c", Content: "x"}); err != nil {
+		t.Fatalf("WriteEngram: %v", err)
+	}
+	if got := store.GetVaultCount(ctx, ws); got != 1 {
+		t.Fatalf("vault count = %d, want 1", got)
+	}
+}
+
+func TestWriteEngramBatch_FirstWriteInitializesExactVaultCount(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	ws := store.VaultPrefix("batch-count-cold")
 
 	const batchSize = 3
 	items := make([]EngramBatchItem, batchSize)
 	for i := range items {
-		items[i] = EngramBatchItem{
-			WSPrefix: ws,
-			Engram:   &Engram{Concept: "c", Content: "x"},
+		items[i] = EngramBatchItem{WSPrefix: ws, Engram: &Engram{Concept: "c", Content: "x"}}
+	}
+	_, errs := store.WriteEngramBatch(ctx, items)
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("WriteEngramBatch item[%d]: %v", i, err)
 		}
+	}
+	if got := store.GetVaultCount(ctx, ws); got != batchSize {
+		t.Fatalf("vault count = %d, want %d", got, batchSize)
+	}
+}
+
+func TestWriteEngramBatch_FirstWriteInitializesEachVaultCount(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	first := store.VaultPrefix("batch-count-first")
+	second := store.VaultPrefix("batch-count-second")
+	items := []EngramBatchItem{
+		{WSPrefix: first, Engram: &Engram{Concept: "a", Content: "x"}},
+		{WSPrefix: first, Engram: &Engram{Concept: "b", Content: "x"}},
+		{WSPrefix: second, Engram: &Engram{Concept: "c", Content: "x"}},
 	}
 
 	_, errs := store.WriteEngramBatch(ctx, items)
@@ -1036,10 +1062,11 @@ func TestWriteEngramBatch_VaultCountIncrement(t *testing.T) {
 			t.Fatalf("WriteEngramBatch item[%d]: %v", i, err)
 		}
 	}
-
-	countAfter := store.GetVaultCount(ctx, ws)
-	if countAfter-countBefore != batchSize {
-		t.Errorf("vault count increment: got %d, want %d", countAfter-countBefore, batchSize)
+	if got := store.GetVaultCount(ctx, first); got != 2 {
+		t.Fatalf("first vault count = %d, want 2", got)
+	}
+	if got := store.GetVaultCount(ctx, second); got != 1 {
+		t.Fatalf("second vault count = %d, want 1", got)
 	}
 }
 

@@ -136,13 +136,12 @@ func (ps *PebbleStore) getOrInitCounter(ctx context.Context, wsPrefix [8]byte) *
 			loaded.count.Store(n)
 			return
 		}
-		// Fall back to per-vault scan (one-time cost on first startup)
+		// Fall back to a per-vault scan (one-time cost on first startup).
+		// Do not persist the seed here: a write may be preparing its atomic
+		// commit, and persisting the pre-commit value would survive an abrupt
+		// close as a stale count while the engram itself survives.
 		n, _ := ps.countEngramsForVault(ctx, wsPrefix)
 		loaded.count.Store(n)
-		// Persist so next startup avoids the scan
-		buf := make([]byte, 8)
-		binary.BigEndian.PutUint64(buf, uint64(n))
-		_ = ps.db.Set(countKey, buf, pebble.NoSync)
 	})
 	return loaded
 }
@@ -270,6 +269,10 @@ func (ps *PebbleStore) WriteEngram(ctx context.Context, wsPrefix [8]byte, eng *E
 		eng.LastAccess = eng.CreatedAt
 	}
 
+	// Initialize before commit so a cold counter scan cannot include this write
+	// and then count it again in the post-commit increment.
+	vc := ps.getOrInitCounter(ctx, wsPrefix)
+
 	erfEng := toERFEngram(eng)
 	erfBytes, err := erf.EncodeV2(erfEng)
 	if err != nil {
@@ -357,8 +360,6 @@ func (ps *PebbleStore) WriteEngram(ctx context.Context, wsPrefix [8]byte, eng *E
 	// NOTE: Intentionally NOT caching on write to avoid flooding L1 cache.
 
 	// Vault counter: in-memory atomic; coalescer persists every 100ms.
-	// Load-or-init before the Add so we hold a reference to the live counter.
-	vc := ps.getOrInitCounter(ctx, wsPrefix)
 	newCount := vc.count.Add(1)
 	// Only submit if vc is still the current counter for this vault.
 	// ClearVault may have evicted the counter between Add and Submit; in that
@@ -421,6 +422,16 @@ func (ps *PebbleStore) WriteEngramBatch(ctx context.Context, items []EngramBatch
 
 	batch := ps.db.NewBatch()
 	defer batch.Close()
+
+	// Capture each live vault counter before commit. A post-commit cold scan
+	// would include this batch and then double-count its successful items.
+	counters := make(map[[8]byte]*vaultCounter)
+	for i := range items {
+		ws := items[i].WSPrefix
+		if _, ok := counters[ws]; !ok {
+			counters[ws] = ps.getOrInitCounter(ctx, ws)
+		}
+	}
 
 	for i := range items {
 		eng := items[i].Engram
@@ -535,7 +546,7 @@ func (ps *PebbleStore) WriteEngramBatch(ctx context.Context, items []EngramBatch
 		eng := items[i].Engram
 		ws := items[i].WSPrefix
 
-		vc := ps.getOrInitCounter(ctx, ws)
+		vc := counters[ws]
 		newCount := vc.count.Add(1)
 		if ps.counterFlush != nil {
 			if current, ok := ps.vaultCounters.Load(ws); ok && current.(*vaultCounter) == vc {

@@ -294,6 +294,60 @@ class StageAContractTests(unittest.TestCase):
         self.assertEqual(stage.disk_gate(samples).status, "FAILED")
         self.assertEqual(stage.combine_status({"a": stage.Gate("PASSED", "ok")}, ["orphan"]), "UNKNOWN")
 
+    def test_direct_store_growth_requires_positive_bounded_same_volume_growth(self):
+        empty = stage.DiskSample("empty", 100, 900, 1000)
+        self.assertEqual(
+            stage.direct_store_growth_gate(
+                empty,
+                stage.DiskSample("settled", 200, 800, 1000),
+            ).status,
+            "PASSED",
+        )
+        for settled_used in (100, 99, 100 + stage.MAX_STORE_BYTES + 1):
+            self.assertEqual(
+                stage.direct_store_growth_gate(
+                    empty,
+                    stage.DiskSample("settled", settled_used, 800, 1000),
+                ).status,
+                "FAILED",
+            )
+
+    def test_count_contract_separates_logical_candidate_from_exact_legacy_baseline(self):
+        spec = stage.CorpusSpec(payload_shape="lexical")
+        logical = stage.logical_vault_counts(spec)
+        legacy = stage.legacy_baseline_counts(spec)
+        self.assertEqual(logical, {"stage-a-primary": 502_375, "stage-a-isolation": 10})
+        self.assertEqual(legacy, {"stage-a-primary": 502_425, "stage-a-isolation": 11})
+        stage.require_legacy_baseline_counts(legacy, spec)
+        for wrong in (
+            logical,
+            {"stage-a-primary": 502_424, "stage-a-isolation": 11},
+            {"stage-a-primary": 502_425, "stage-a-isolation": 12},
+        ):
+            with self.assertRaises(stage.RehearsalFailed):
+                stage.require_legacy_baseline_counts(wrong, spec)
+
+    def test_execute_receipt_discloses_async_queue_observability_limit(self):
+        document = stage.receipt_document(
+            stage.build_identity("execute-limit"),
+            stage.CorpusSpec(payload_shape="lexical"),
+            status="UNKNOWN",
+            exit_code=2,
+            detail="test",
+            ledger=stage.ResourceLedger(),
+            measurements={},
+            gates={},
+            cleanup_result={},
+            orphans=[],
+            corpus=None,
+            mode="execute",
+        )
+        self.assertEqual(document["limitations"], [
+            "Synthetic rehearsal is not production deployment authorization.",
+            "Production data, backups, volumes, machines, app, and credentials are prohibited.",
+            "The bounded df quiet-window witnesses disk settlement; it does not prove asynchronous FTS or provenance queues are empty.",
+        ])
+
     def test_volume_command_is_encrypted_twenty_gb_and_unscheduled(self):
         identity = stage.build_identity("volume-test")
         calls = []
@@ -530,15 +584,28 @@ class StageAContractTests(unittest.TestCase):
         self.assertEqual(rendered["record_count"], 502_385)
         self.assertEqual(rendered["payload_bytes"], 4000)
         self.assertEqual(rendered["payload_shape"], "lexical")
-        self.assertEqual(rendered["expected_net_store_bytes"], 6_043_996_679)
-        self.assertEqual(rendered["store_footprint_gate_bytes"], {
-            "minimum": stage.MIN_STORE_BYTES,
-            "maximum": stage.MAX_STORE_BYTES,
+        self.assertEqual(rendered["storage_qualification"], {
+            "method": "direct-same-volume-empty-to-settled-net-growth",
+            "maximum_net_growth_bytes": stage.MAX_STORE_BYTES,
+            "maximum_peak_bytes": stage.MAX_PEAK_BYTES,
+            "minimum_free_percent": stage.MIN_FREE_PERCENT,
         })
-        self.assertEqual(rendered["storage_evidence"], {
-            "ablation_run_id": "30102233910",
-            "receipt_sha256": stage.ABLATION_RECEIPT_SHA256,
+        self.assertEqual(rendered["falsification_evidence"], {
+            "run_id": "30108034677",
+            "receipt_sha256": stage.FALSIFICATION_RECEIPT_SHA256,
+            "finding": "fixed-record-count payload cohorts cannot identify fixed per-record overhead",
         })
+        self.assertEqual(
+            rendered["count_qualification"]["logical_counts"],
+            {"stage-a-primary": 502_375, "stage-a-isolation": 10},
+        )
+        self.assertEqual(
+            rendered["count_qualification"]["baseline_exact_legacy_fingerprint"],
+            {"stage-a-primary": 502_425, "stage-a-isolation": 11},
+        )
+        self.assertTrue(rendered["count_qualification"]["candidate_requires_exact_logical_counts"])
+        self.assertNotIn("expected_net_store_bytes", rendered)
+        self.assertNotIn("store_footprint_gate_bytes", rendered)
         self.assertTrue(any("asynchronous FTS" in item for item in rendered["limitations"]))
 
     def test_calibration_plan_is_fixed_and_non_mutating(self):
@@ -730,6 +797,7 @@ class StageAContractTests(unittest.TestCase):
             )
         self.assertEqual(result["settled"].used_bytes, 110)
         self.assertEqual(len(result["samples"]), 4)
+        self.assertTrue(all(call.args[2] == "cohort-settling" for call in runtime.disk_sample.call_args_list))
         self.assertEqual(result["witness"], "bounded-df-quiet-window")
 
     def test_quiet_window_accepts_small_bidirectional_settlement(self):

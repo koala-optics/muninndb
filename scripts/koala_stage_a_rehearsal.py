@@ -36,9 +36,8 @@ DEFAULT_PAYLOAD_SHAPE = "lexical"
 MIN_PAYLOAD_BYTES, MAX_PAYLOAD_BYTES = 1_000, 32_000
 CALIBRATION_SAMPLE_COUNT = 25_000
 CALIBRATION_LOW_PAYLOAD_BYTES, CALIBRATION_HIGH_PAYLOAD_BYTES = MIN_PAYLOAD_BYTES, 4_000
-ABLATION_RUN_ID = "30102233910"
-ABLATION_RECEIPT_SHA256 = "852b1db77e5a1f082c05835a20e0653acc59c2fd4c3cb2f46b20cb4b8c0ad241"
-EXPECTED_NET_STORE_BYTES = 6_043_996_679
+FALSIFICATION_RUN_ID = "30108034677"
+FALSIFICATION_RECEIPT_SHA256 = "b89c4daf7d4b6b55d92f1754d65606b9406cfdd60156bc450ab00d5048de6d68"
 ABLATION_COHORTS = (
     ("opaque-1k", "opaque", CALIBRATION_LOW_PAYLOAD_BYTES),
     ("opaque-4k", "opaque", CALIBRATION_HIGH_PAYLOAD_BYTES),
@@ -50,7 +49,7 @@ STORAGE_QUIET_INTERVAL_S = 10.0
 STORAGE_QUIET_SAMPLES = 3
 STORAGE_QUIET_TOLERANCE_BYTES = 1024 * 1024
 PROGRESS_BATCH_INTERVAL = 100
-MIN_STORE_BYTES, MAX_STORE_BYTES = 11 * 1024**3 // 2, 13 * 1024**3 // 2
+MAX_STORE_BYTES = 13 * 1024**3 // 2
 TARGET_STORE_BYTES = 6 * 1024**3
 VOLUME_SIZE_GB = 20
 MAX_PEAK_BYTES, MIN_FREE_PERCENT = 14 * 1024**3, 30.0
@@ -357,10 +356,30 @@ def disk_gate(samples: Sequence[DiskSample]) -> Gate:
     passed = peak <= MAX_PEAK_BYTES and free >= MIN_FREE_PERCENT
     return Gate("PASSED" if passed else "FAILED", f"peak={peak} minimum_free_percent={free:.2f}", peak, MAX_PEAK_BYTES)
 
-def store_footprint_gate(used: int | None) -> Gate:
-    if used is None: return Gate("UNKNOWN", "pre-migration footprint missing")
-    passed = MIN_STORE_BYTES <= used <= MAX_STORE_BYTES
-    return Gate("PASSED" if passed else "FAILED", f"pre-migration bytes={used}", used, MAX_STORE_BYTES)
+def direct_store_growth_gate(empty: DiskSample, settled: DiskSample) -> Gate:
+    net_growth = settled.used_bytes - empty.used_bytes
+    passed = 0 < net_growth <= MAX_STORE_BYTES
+    detail = f"direct same-volume settled net growth bytes={net_growth}"
+    return Gate("PASSED" if passed else "FAILED", detail, net_growth, MAX_STORE_BYTES)
+
+
+def logical_vault_counts(spec: CorpusSpec) -> dict[str, int]:
+    isolation = sum(probe_kind(index) == "isolation" for index in range(spec.count))
+    return {"stage-a-primary": spec.count - isolation, "stage-a-isolation": isolation}
+
+
+def legacy_baseline_counts(spec: CorpusSpec) -> dict[str, int]:
+    logical = logical_vault_counts(spec)
+    return {
+        "stage-a-primary": logical["stage-a-primary"] + spec.batch_size,
+        "stage-a-isolation": logical["stage-a-isolation"] + 1,
+    }
+
+
+def require_legacy_baseline_counts(actual: dict[str, int], spec: CorpusSpec) -> None:
+    expected = legacy_baseline_counts(spec)
+    if actual != expected:
+        raise RehearsalFailed(f"baseline vault counts differ from exact legacy fingerprint: expected={expected} actual={actual}")
 
 def require_disk_safety(sample: DiskSample) -> None:
     if sample.used_bytes > MAX_PEAK_BYTES or sample.free_percent < MIN_FREE_PERCENT:
@@ -443,7 +462,7 @@ def wait_for_storage_quiet(
     runtime: Any,
     identity: RunIdentity,
     machine_id: str,
-    cohort: str,
+    phase: str,
     *,
     timeout_s: float = STORAGE_QUIET_TIMEOUT_S,
     interval_s: float = STORAGE_QUIET_INTERVAL_S,
@@ -454,7 +473,7 @@ def wait_for_storage_quiet(
         raise RehearsalUnknown("invalid storage quiet-window contract")
     started, samples, stable = time.monotonic(), [], 0
     while time.monotonic() - started <= timeout_s:
-        sample = runtime.disk_sample(identity, machine_id, f"ablation-{cohort}-settling")
+        sample = runtime.disk_sample(identity, machine_id, f"{phase}-settling")
         require_disk_safety(sample)
         if samples and abs(sample.used_bytes - samples[-1].used_bytes) <= tolerance_bytes:
             stable += 1
@@ -551,7 +570,7 @@ def receipt_document(
         "Synthetic rehearsal is not production deployment authorization.",
         "Production data, backups, volumes, machines, app, and credentials are prohibited.",
     ]
-    if mode == "ablate":
+    if mode in {"ablate", "execute"}:
         limitations.append(
             "The bounded df quiet-window witnesses disk settlement; it does not prove asynchronous FTS or provenance queues are empty."
         )
@@ -955,13 +974,26 @@ def plan(identity: RunIdentity, spec: CorpusSpec, *, mode: str = "execute") -> d
                                       "rollback_volume": identity.rollback_volume_name},
               "note": "plan-only: zero Fly mutations, credentials, network queries, or production access"}
     if mode == "execute":
-        result["expected_net_store_bytes"] = EXPECTED_NET_STORE_BYTES
-        result["store_footprint_gate_bytes"] = {"minimum": MIN_STORE_BYTES, "maximum": MAX_STORE_BYTES}
-        result["storage_evidence"] = {"ablation_run_id": ABLATION_RUN_ID, "receipt_sha256": ABLATION_RECEIPT_SHA256}
+        result["storage_qualification"] = {
+            "method": "direct-same-volume-empty-to-settled-net-growth",
+            "maximum_net_growth_bytes": MAX_STORE_BYTES,
+            "maximum_peak_bytes": MAX_PEAK_BYTES,
+            "minimum_free_percent": MIN_FREE_PERCENT,
+        }
+        result["falsification_evidence"] = {
+            "run_id": FALSIFICATION_RUN_ID,
+            "receipt_sha256": FALSIFICATION_RECEIPT_SHA256,
+            "finding": "fixed-record-count payload cohorts cannot identify fixed per-record overhead",
+        }
+        result["count_qualification"] = {
+            "logical_counts": logical_vault_counts(spec),
+            "baseline_exact_legacy_fingerprint": legacy_baseline_counts(spec),
+            "candidate_requires_exact_logical_counts": True,
+        }
         result["limitations"] = [
             "Synthetic rehearsal is not production deployment authorization.",
             "Production data, backups, volumes, machines, app, and credentials are prohibited.",
-            "The ablation quiet-window witnessed disk settlement; it did not prove asynchronous FTS or provenance queues were empty.",
+            "The bounded df quiet-window witnesses disk settlement; it does not prove asynchronous FTS or provenance queues are empty.",
         ]
     return result
 
@@ -1119,7 +1151,7 @@ def ablate(
             corpus_receipt, receipt_spec = cohort_receipt, cohort_spec
             immediate = runtime.disk_sample(identity, ledger.machine_id, f"ablation-{cohort}-immediate")
             require_disk_safety(immediate)
-            quiet = wait_for_storage_quiet(runtime, identity, ledger.machine_id, cohort)
+            quiet = wait_for_storage_quiet(runtime, identity, ledger.machine_id, f"ablation-{cohort}")
             settled = quiet["settled"]
             samples[cohort] = (empty.used_bytes, settled.used_bytes)
             measurements["cohorts"][cohort] = {
@@ -1166,7 +1198,11 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
         ledger.app = runtime.create_app(identity); runtime.install_auth(identity, auth_value)
         ledger.volume_id = runtime.create_volume(identity, identity.volume_name)
         ledger.machine_id = runtime.create_machine(identity, ledger.volume_id, BASELINE_IMAGE, "baseline")
-        runtime.wait_ready(identity, ledger.machine_id, READINESS_LIMIT_S); proxy = runtime.proxy(identity, ledger.machine_id, local_port)
+        runtime.wait_ready(identity, ledger.machine_id, READINESS_LIMIT_S)
+        empty = runtime.disk_sample(identity, ledger.machine_id, "baseline-empty")
+        require_disk_safety(empty)
+        measurements["disk_samples"].append(asdict(empty) | {"free_percent": empty.free_percent})
+        proxy = runtime.proxy(identity, ledger.machine_id, local_port)
         client = client_factory(f"http://127.0.0.1:{local_port}/mcp", auth_value); client.initialize()
         def checkpoint(progress: IngestProgress) -> None:
             nonlocal corpus_receipt
@@ -1180,12 +1216,27 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
                 corpus=progress,
             ))
         corpus_receipt = ingest_corpus(client, spec, progress=checkpoint)
-        pre = runtime.disk_sample(identity, ledger.machine_id, "pre-migration"); require_disk_safety(pre)
-        measurements["disk_samples"].append(asdict(pre) | {"free_percent": pre.free_percent})
-        gates["store_footprint"] = store_footprint_gate(pre.used_bytes)
+        immediate = runtime.disk_sample(identity, ledger.machine_id, "baseline-immediate")
+        require_disk_safety(immediate)
+        measurements["disk_samples"].append(asdict(immediate) | {"free_percent": immediate.free_percent})
+        quiet = wait_for_storage_quiet(runtime, identity, ledger.machine_id, "baseline-storage")
+        settled = quiet["settled"]
+        measurements["disk_samples"].extend(
+            asdict(sample) | {"free_percent": sample.free_percent}
+            for sample in quiet["samples"]
+        )
+        measurements["storage_settlement_witness"] = quiet["witness"]
+        measurements["direct_net_store_growth_bytes"] = settled.used_bytes - empty.used_bytes
+        gates["store_footprint"] = direct_store_growth_gate(empty, settled)
         baseline_counts, status_samples = query_counts(client); measurements["baseline_counts"] = baseline_counts
         gates["baseline_status"] = threshold_gate("baseline status", max(status_samples) / 1000, STATUS_LIMIT_S)
-        if sum(baseline_counts.values()) != spec.count: raise RehearsalFailed("baseline vault counts differ from accepted corpus")
+        require_legacy_baseline_counts(baseline_counts, spec)
+        gates["baseline_legacy_counts"] = Gate(
+            "PASSED",
+            f"immutable baseline matched exact legacy fingerprint={baseline_counts}",
+            sum(baseline_counts.values()),
+            spec.count + spec.batch_size + 1,
+        )
         terminate_proxy(proxy); proxy = None; runtime.stop_machine(identity, ledger.machine_id); runtime.destroy_machine(identity, ledger.machine_id); ledger.machine_id = None
         ledger.snapshot_id = runtime.snapshot(identity, ledger.volume_id)
         migration_started = time.monotonic(); ledger.machine_id = runtime.create_machine(identity, ledger.volume_id, CANDIDATE_IMAGE, "candidate")
@@ -1201,15 +1252,22 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
         gates["candidate_readiness"] = threshold_gate("candidate readiness after migration", readiness_s, READINESS_LIMIT_S)
         gates["candidate_status"] = threshold_gate("candidate status", readiness_status_ms / 1000, STATUS_LIMIT_S)
         migrated_counts, _ = query_counts(candidate)
-        gates["count_invariance"] = Gate("PASSED" if migrated_counts == baseline_counts else "FAILED",
-            f"baseline={baseline_counts} migrated={migrated_counts}", sum(migrated_counts.values()), spec.count)
+        logical_counts = logical_vault_counts(spec)
+        measurements["candidate_counts"] = migrated_counts
+        gates["candidate_logical_counts"] = Gate(
+            "PASSED" if migrated_counts == logical_counts else "FAILED",
+            f"logical={logical_counts} candidate={migrated_counts}",
+            sum(migrated_counts.values()),
+            spec.count,
+        )
         samples = run_query_probes(candidate, corpus_receipt); run_lifecycle_probes(candidate, corpus_receipt)
         gates["semantic_probes"] = Gate("PASSED", "exact-concept, entity ordering, vault isolation, collision hydration, lifecycle filtering, and fuzzy reads passed")
         measurements["latencies"] = {name: latency_summary(values) for name, values in samples.items()}
         p95 = max(summary["p95_ms"] or 0 for summary in measurements["latencies"].values() if summary["count"])
         gates["query_latency"] = threshold_gate("bounded query p95", p95, QUERY_P95_LIMIT_MS)
         post = runtime.disk_sample(identity, ledger.machine_id, "post-migration"); measurements["disk_samples"].append(asdict(post) | {"free_percent": post.free_percent})
-        all_disk_samples = [pre, *migration_disks, post]; gates["disk_headroom"] = disk_gate(all_disk_samples)
+        all_disk_samples = [empty, immediate, *quiet["samples"], *migration_disks, post]
+        gates["disk_headroom"] = disk_gate(all_disk_samples)
         gates["resource_sampling"] = Gate("PASSED" if migration_resources else "UNKNOWN", "migration CPU and RSS samples captured", len(migration_resources))
         terminate_proxy(proxy); proxy = None; runtime.stop_machine(identity, ledger.machine_id); runtime.destroy_machine(identity, ledger.machine_id); ledger.machine_id = None
         ledger.machine_id = runtime.create_machine(identity, ledger.volume_id, CANDIDATE_IMAGE, "clean-restart"); runtime.wait_ready(identity, ledger.machine_id, READINESS_LIMIT_S)
@@ -1230,7 +1288,7 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
         except RehearsalFailed: pass
         else: raise RehearsalFailed("hard-deleted record remained readable")
         hard_delete_counts, _ = query_counts(hard_delete_client); terminate_proxy(proxy); proxy = None
-        expected_after_delete = dict(baseline_counts); expected_after_delete["stage-a-primary"] -= 1
+        expected_after_delete = dict(logical_counts); expected_after_delete["stage-a-primary"] -= 1
         if hard_delete_counts != expected_after_delete: raise RehearsalFailed("hard-delete count delta was not exactly one")
         gates["hard_delete_cleanup"] = Gate("PASSED", "offline hard delete removed primary and reverse-index reachability")
         runtime.stop_machine(identity, ledger.machine_id); runtime.destroy_machine(identity, ledger.machine_id); ledger.machine_id = None
@@ -1256,7 +1314,11 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
         ledger.machine_id = runtime.create_machine(identity, ledger.rollback_volume_id, BASELINE_IMAGE, "rollback"); runtime.wait_ready(identity, ledger.machine_id, READINESS_LIMIT_S)
         proxy = runtime.proxy(identity, ledger.machine_id, local_port); rollback_client = client_factory(f"http://127.0.0.1:{local_port}/mcp", auth_value); rollback_client.initialize()
         rollback_counts, _ = query_counts(rollback_client); rollback_samples = run_query_probes(rollback_client, corpus_receipt); terminate_proxy(proxy); proxy = None
-        if rollback_counts != baseline_counts: raise RehearsalFailed("pre-migration rollback counts differ from baseline")
+        require_legacy_baseline_counts(rollback_counts, spec)
+        measurements["rollback_counts"] = {
+            "behavior": "exact-known-legacy-fingerprint",
+            "counts": rollback_counts,
+        }
         measurements["rollback_latencies"] = {name: latency_summary(values) for name, values in rollback_samples.items()}
         measurements["rollback_check_s"] = time.monotonic() - rollback_started; gates["pre_migration_rollback"] = threshold_gate("pre-migration rollback", measurements["rollback_check_s"], ROLLBACK_LIMIT_S)
         detail = "all measured Stage A phases completed"

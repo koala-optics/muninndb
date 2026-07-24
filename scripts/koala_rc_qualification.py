@@ -32,11 +32,13 @@ PRODUCTION_ENV_KEYS = {
 PRODUCTION_MARKERS = ("muninn.koalalifestyle.com", "koalalifestyle.com", "production", "prod-")
 REQUIRED_TOOLS = {
     "muninn_remember", "muninn_read", "muninn_forget", "muninn_restore",
-    "muninn_state", "muninn_find_by_entity", "muninn_find_by_concept",
+    "muninn_state", "muninn_status", "muninn_find_by_entity",
+    "muninn_find_by_concept",
 }
 REQUIRED_GATES = (
-    "baseline_fixture", "migration_v4", "migration_idempotence", "exact_concept",
-    "newest_first_entity", "lifecycle_filtering", "clean_restart", "crash_restart",
+    "baseline_fixture", "migration_v4", "migration_v5_counts",
+    "migration_idempotence", "exact_concept", "newest_first_entity",
+    "lifecycle_filtering", "clean_restart", "crash_restart",
     "hard_delete_cleanup", "backup_restore",
 )
 
@@ -327,6 +329,17 @@ def verify_lookup_state(client: MCPClient, *, concept: str, entity: str, expecte
     return {"concept_ms": round(concept_ms, 3), "entity_ms": round(entity_ms, 3)}
 
 
+def vault_count(client: MCPClient, vault: str) -> int:
+    result, _ = client.call("muninn_status", {"vault": vault})
+    if not isinstance(result, dict):
+        raise QualificationError(f"status envelope is invalid: {result}")
+    for key in ("total_memories", "total_engrams", "memory_count", "engram_count"):
+        value = result.get(key)
+        if isinstance(value, int):
+            return value
+    raise QualificationError(f"status count is missing: {result}")
+
+
 def ensure_image(ref: str, repositories: set[str]) -> dict[str, str]:
     validate_image_ref(ref, repositories)
     run_command(["docker", "pull", ref], timeout=1200)
@@ -443,9 +456,17 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         ids_oldest, write_ms = remember_fixture(baseline_client, manifest)
         for memory_id in ids_oldest:
             baseline_client.call("muninn_read", {"vault": "rc-synthetic", "id": memory_id})
+        baseline_count = vault_count(baseline_client, "rc-synthetic")
+        expected_legacy_count = len(ids_oldest) + 1
+        if baseline_count != expected_legacy_count:
+            raise QualificationError(
+                "baseline count differs from exact legacy first-write fingerprint: "
+                f"{baseline_count} != {expected_legacy_count}"
+            )
         active.stop()
         active = None
         gate(receipt, "baseline_fixture", ids_oldest_first=ids_oldest,
+            legacy_count=baseline_count,
             write_samples_ms=[round(value, 3) for value in write_ms])
 
         expected = list(reversed(ids_oldest))
@@ -456,12 +477,19 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         if missing:
             raise QualificationError(f"candidate is missing tools: {', '.join(missing)}")
         timings = verify_lookup_state(client, concept=concept, entity=entity, expected_ids=expected)
+        candidate_count = vault_count(client, "rc-synthetic")
         migration_logs = active.stop()
         active = None
         if "migrations applied" not in migration_logs:
-            raise QualificationError("candidate startup did not report applying migration v4")
+            raise QualificationError("candidate startup did not report applying migrations")
+        if candidate_count != len(ids_oldest):
+            raise QualificationError(
+                f"migration v5 count repair failed: {candidate_count} != {len(ids_oldest)}"
+            )
         gate(receipt, "migration_v4", backfilled_ids=expected,
             startup_log_sha256=hashlib.sha256(migration_logs.encode()).hexdigest())
+        gate(receipt, "migration_v5_counts", legacy_count=baseline_count,
+            repaired_count=candidate_count, logical_count=len(ids_oldest))
         gate(receipt, "exact_concept", latency_ms=timings["concept_ms"])
         gate(receipt, "newest_first_entity", latency_ms=timings["entity_ms"])
 
@@ -469,11 +497,16 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
             network=network, env_file=env_file, logs_dir=logs_dir)
         client = start_client(active, token, args)
         verify_lookup_state(client, concept=concept, entity=entity, expected_ids=expected)
+        restarted_count = vault_count(client, "rc-synthetic")
+        if restarted_count != len(ids_oldest):
+            raise QualificationError(
+                f"restarted candidate count drifted: {restarted_count} != {len(ids_oldest)}"
+            )
         idempotent_logs = active.stop()
         active = None
         if "migrations applied" in idempotent_logs:
             raise QualificationError("migration unexpectedly re-applied on second candidate start")
-        gate(receipt, "migration_idempotence")
+        gate(receipt, "migration_idempotence", restarted_count=restarted_count)
         gate(receipt, "clean_restart")
 
         active = new_container(name="koala-rc-lifecycle", image=candidate, data_dir=data_dir,

@@ -660,6 +660,9 @@ class StageAContractTests(unittest.TestCase):
             self.assertEqual(left["memory"]["created_at"], right["memory"]["created_at"])
             self.assertEqual(set(left["memory"]) - {"content"}, set(right["memory"]) - {"content"})
 
+    def test_storage_quiet_deadline_allows_async_index_settlement(self):
+        self.assertEqual(stage.STORAGE_QUIET_TIMEOUT_S, 20 * 60)
+
     def test_quiet_window_requires_stable_samples(self):
         identity = stage.build_identity("settle-test")
         runtime = mock.Mock()

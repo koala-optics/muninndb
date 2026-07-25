@@ -596,6 +596,9 @@ def receipt_document(
         limitations.append(
             "Fly machine-create rejects a digest-pinned config.image, so the candidate launches from the run-owned mirror tag; identity rests on the digest assertion taken before launch, not on the launch reference itself."
         )
+        limitations.append(
+            "The pre-ingestion provisioning probe is mountless, so it proves candidate image and guest provisioning only; volume attachment, readiness, and every measured gate remain first exercised by the real machines."
+        )
     return {
         "schema_version": SCHEMA_VERSION,
         "status": status,
@@ -863,6 +866,23 @@ class FlyRuntime:
         if len(matches) != 1 or matches[0] in PRODUCTION_MACHINE_IDS:
             raise RehearsalUnknown(f"{role} helper ID missing")
         return matches[0]
+    def provisioning_probe(self, identity: RunIdentity, image: str) -> str:
+        """Launch a mountless no-op machine to prove candidate provisioning before ingestion.
+
+        Six consecutive rehearsals spent roughly 1.5 hours ingesting 502,385 records and
+        then failed within seconds on a Fly provisioning call against the candidate image
+        (run 30165273639: "invalid image identifier"; run 30173477457: "invalid CPU or
+        memory measurement"). This probe launches the same image with the same guest spec
+        the real machines use, so that class of fault costs minutes instead of a full
+        ingest. It adds no gate and relaxes none; it only moves failure earlier.
+
+        Deliberately mountless: attaching the source volume would let the candidate
+        initialise a store on it and corrupt the empty-to-settled footprint measurement.
+        Volume attachment is therefore NOT covered here and is still first exercised by
+        the real candidate machine.
+        """
+        validate_image(image, "candidate", expected_candidate=self.candidate_ref)
+        return self._offline_helper(identity, image, "preflight-probe", [], "true")
     def create_backup(self, identity: RunIdentity, volume_id: str, backup_volume_id: str,
                       image: str) -> tuple[str, str]:
         validate_image(image, "candidate", expected_candidate=self.candidate_ref)
@@ -1119,6 +1139,15 @@ def plan(identity: RunIdentity, spec: CorpusSpec, *, mode: str = "execute") -> d
             "ordering": "immediately after app creation, before any corpus ingestion",
             "scope": "run-owned app repository only; no shared or production repository is written",
         }
+        result["provisioning_probe"] = {
+            "purpose": "surface candidate image and guest provisioning faults before the corpus ingest, not after it",
+            "ordering": "immediately after the mirror digest assertion, before any volume or measured machine exists",
+            "shape": "mountless no-op machine using the same guest spec as every real machine, launched then destroyed",
+            "mounts": "none, so the measured source volume cannot be written before its empty disk sample",
+            "failure_policy": "UNKNOWN",
+            "coverage_limit": "image resolution, guest sizing, machine create and boot only; volume attachment is not covered",
+            "gate_effect": "none; no gate is added, removed, or relaxed",
+        }
         result["falsification_evidence"] = {
             "run_id": FALSIFICATION_RUN_ID,
             "receipt_sha256": FALSIFICATION_RECEIPT_SHA256,
@@ -1336,6 +1365,9 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
     try:
         validate_execute_spec(spec); validate_image(BASELINE_IMAGE, "baseline"); validate_image(CANDIDATE_IMAGE, "candidate"); runtime.preflight(identity)
         ledger.app = runtime.create_app(identity); candidate_ref = runtime.mirror_candidate(identity); runtime.install_auth(identity, auth_value)
+        ledger.machine_id = runtime.provisioning_probe(identity, candidate_ref)
+        runtime.wait_stopped(identity, ledger.machine_id, READINESS_LIMIT_S)
+        runtime.destroy_machine(identity, ledger.machine_id); ledger.machine_id = None
         ledger.volume_id = runtime.create_volume(identity, identity.volume_name)
         ledger.machine_id = runtime.create_machine(identity, ledger.volume_id, BASELINE_IMAGE, "baseline")
         runtime.wait_ready(identity, ledger.machine_id, READINESS_LIMIT_S)

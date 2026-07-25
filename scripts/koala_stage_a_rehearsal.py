@@ -56,6 +56,7 @@ MAX_PEAK_BYTES, MIN_FREE_PERCENT = 14 * 1024**3, 30.0
 MIGRATION_LIMIT_S, READINESS_LIMIT_S = 45 * 60, 5 * 60
 QUERY_P95_LIMIT_MS, STATUS_LIMIT_S = 250.0, 30.0
 RESTORE_LIMIT_S, ROLLBACK_LIMIT_S = 45 * 60, 30 * 60
+SNAPSHOT_LIMIT_S, SNAPSHOT_POLL_INTERVAL_S = 10 * 60, 5.0
 FLY_REGION, FLY_ORG, MCP_PORT = "ewr", "personal", 8750
 BASELINE_IMAGE = "registry.fly.io/koala-muninndb:deployment-01KSWRX9GKW5M94MQQCBZSJZHS"
 BASELINE_DIGEST = "sha256:c06842e1452f2aab4c1f01207adf9406bfe757b4984da516568006f1f5c8ad86"
@@ -734,10 +735,66 @@ class FlyRuntime:
                     pass
             time.sleep(interval_s)
         raise RehearsalUnknown("migration readiness deadline expired")
-    def snapshot(self, identity: RunIdentity, volume_id: str) -> str:
-        result = self.json(["volumes", "snapshots", "create", volume_id, "-a", identity.app_name]); snapshot_id = str(result.get("id", "")) if isinstance(result, dict) else ""
-        if not snapshot_id: raise RehearsalUnknown("snapshot ID missing")
-        return snapshot_id
+    def _snapshots(self, identity: RunIdentity, volume_id: str) -> list[dict[str, str]]:
+        result = self.json(["volumes", "snapshots", "list", volume_id, "-a", identity.app_name])
+        if not isinstance(result, list):
+            raise RehearsalUnknown("snapshot list returned invalid shape")
+        snapshots = []
+        for item in result:
+            if not isinstance(item, dict):
+                raise RehearsalUnknown("snapshot list entry invalid")
+            snapshot_id = item.get("id")
+            status = item.get("status")
+            created_at = item.get("created_at")
+            if not isinstance(snapshot_id, str) or not isinstance(status, str) or not isinstance(created_at, str) or not created_at:
+                raise RehearsalUnknown("snapshot list entry missing identity or status")
+            if status not in {"waiting", "running", "created"}:
+                raise RehearsalUnknown(f"snapshot entered non-success status: {safe_detail(status)}")
+            if status == "created" and not snapshot_id:
+                raise RehearsalUnknown("created snapshot ID missing")
+            snapshots.append({"id": snapshot_id, "status": status, "created_at": created_at})
+        return snapshots
+    def snapshot(self, identity: RunIdentity, volume_id: str, *,
+                 timeout_s: float = SNAPSHOT_LIMIT_S,
+                 interval_s: float = SNAPSHOT_POLL_INTERVAL_S) -> str:
+        if timeout_s <= 0 or interval_s <= 0:
+            raise RehearsalUnknown("invalid snapshot wait contract")
+        before = self._snapshots(identity, volume_id)
+        pending = [item for item in before if item["status"] in {"waiting", "running"}]
+        if len(pending) > 1:
+            raise RehearsalUnknown("multiple snapshots already in flight")
+        target_created_at = pending[0]["created_at"] if pending else None
+        known = {(item["id"], item["created_at"]) for item in before}
+        if not pending:
+            try:
+                self.run(["volumes", "snapshots", "create", volume_id, "-a", identity.app_name])
+            except RehearsalUnknown as exc:
+                if "failed_precondition: snapshot is already scheduled" not in str(exc):
+                    raise
+                collision = self._snapshots(identity, volume_id)
+                pending = [item for item in collision if item["status"] in {"waiting", "running"}]
+                if len(pending) != 1:
+                    raise RehearsalUnknown("scheduled snapshot could not be identified") from exc
+                target_created_at = pending[0]["created_at"]
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            snapshots = self._snapshots(identity, volume_id)
+            if target_created_at is None:
+                candidates = [
+                    item for item in snapshots
+                    if (item["id"], item["created_at"]) not in known
+                ]
+                if len(candidates) > 1:
+                    raise RehearsalUnknown("new snapshot identity is ambiguous")
+                if candidates:
+                    target_created_at = candidates[0]["created_at"]
+            matches = [item for item in snapshots if item["created_at"] == target_created_at]
+            if target_created_at is not None and len(matches) != 1:
+                raise RehearsalUnknown("scheduled snapshot disappeared or changed identity")
+            if matches and matches[0]["status"] == "created":
+                return matches[0]["id"]
+            time.sleep(interval_s)
+        raise RehearsalUnknown("snapshot creation deadline expired")
     def _offline_helper(self, identity: RunIdentity, image: str, role: str,
                         mounts: list[dict[str, str]], command: str) -> str:
         helper_name = f"koala-stage-a-{identity.run_id}-{role}"
@@ -985,6 +1042,13 @@ def plan(identity: RunIdentity, spec: CorpusSpec, *, mode: str = "execute") -> d
             "maximum_net_growth_bytes": MAX_STORE_BYTES,
             "maximum_peak_bytes": MAX_PEAK_BYTES,
             "minimum_free_percent": MIN_FREE_PERCENT,
+        }
+        result["snapshot_qualification"] = {
+            "method": "list-observed-asynchronous-convergence",
+            "success_status": "created",
+            "timeout_s": SNAPSHOT_LIMIT_S,
+            "poll_interval_s": SNAPSHOT_POLL_INTERVAL_S,
+            "already_scheduled_policy": "adopt-exactly-one-observed-in-flight-snapshot",
         }
         result["falsification_evidence"] = {
             "run_id": FALSIFICATION_RUN_ID,

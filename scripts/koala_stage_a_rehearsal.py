@@ -69,6 +69,7 @@ PRODUCTION_MACHINE_IDS = frozenset({"6e8262d6c6d298"})
 PRODUCTION_VOLUME_IDS = frozenset({"vol_vgn3o017zm3gkgz4"})
 COLLISION_CONCEPTS = ("stage-a/collision/1162789", "stage-a/collision/1379192")
 DIGEST_REF = re.compile(r"[a-z0-9./-]+@sha256:[0-9a-f]{64}")
+MIRROR_REF = re.compile(rf"{re.escape(FLY_REGISTRY)}/koala-stage-a-[a-z0-9-]{{4,32}}:{re.escape(CANDIDATE_MIRROR_TAG)}")
 RUN_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{3,31}")
 FLY_VOLUME_NAME_RE = re.compile(r"[a-z0-9_]{1,30}")
 SENSITIVE_TEXT = re.compile(r"https?://|(?i:authorization|bearer|password|secret|token|x-amz-|fly_api)")
@@ -190,8 +191,18 @@ def assert_owned(value: str, identity: RunIdentity, kind: str) -> None:
         raise RehearsalUnknown(f"refusing unowned {kind}")
 
 def validate_image(ref: str, role: str, *, expected_candidate: str = CANDIDATE_IMAGE) -> str:
+    """Refuse any image reference that is not the exact expected identity for its role.
+
+    Exact string equality against the expected reference is the binding check. The shape
+    backstop accepts two candidate forms: a digest-pinned reference (the qualified source
+    identity) and a run-owned Fly mirror tag. Fly's machine-create API rejects a
+    digest-pinned config.image with "invalid image identifier", so the launch reference is
+    necessarily a tag; digest equality is asserted separately in mirror_candidate against
+    the immutable qualified digest, which is what actually binds image identity.
+    """
     expected = BASELINE_IMAGE if role == "baseline" else expected_candidate
-    if ref != expected or (role != "baseline" and not DIGEST_REF.fullmatch(ref)):
+    accepted_shape = role == "baseline" or bool(DIGEST_REF.fullmatch(ref) or MIRROR_REF.fullmatch(ref))
+    if ref != expected or not accepted_shape:
         raise RehearsalUnknown(f"{role} image differs from qualified immutable identity")
     return ref
 
@@ -582,6 +593,9 @@ def receipt_document(
         limitations.append(
             "The candidate mirror is written to the run-owned Fly app repository; registry-repository retention is not covered by the machine and volume orphan scan."
         )
+        limitations.append(
+            "Fly machine-create rejects a digest-pinned config.image, so the candidate launches from the run-owned mirror tag; identity rests on the digest assertion taken before launch, not on the launch reference itself."
+        )
     return {
         "schema_version": SCHEMA_VERSION,
         "status": status,
@@ -673,15 +687,23 @@ class FlyRuntime:
         refused unless its digest still equals the qualified immutable identity, so
         mirroring cannot substitute a different image. Registry-repository retention after
         app destruction is Fly's behavior and is not asserted here.
+
+        The returned launch reference is the mirror TAG, not a digest reference: Fly's
+        machine-create rejects a digest-pinned config.image with "invalid image identifier"
+        even after resolving the manifest (observed in run 30165273639). Identity is still
+        bound by the digest assertion immediately above, which reads the tag's own manifest
+        digest and refuses any value other than the qualified one. The residual exposure is
+        a repoint of this tag between assertion and launch, in a repository this run created
+        and which no other writer targets; it is disclosed as a receipt limitation.
         """
         assert_not_production(identity)
         target = f"{FLY_REGISTRY}/{identity.app_name}"
-        self.crane(["copy", CANDIDATE_IMAGE, f"{target}:{CANDIDATE_MIRROR_TAG}"])
-        mirrored_digest = self.crane(["digest", f"{target}:{CANDIDATE_MIRROR_TAG}"]).stdout.strip()
+        mirrored_ref = f"{target}:{CANDIDATE_MIRROR_TAG}"
+        self.crane(["copy", CANDIDATE_IMAGE, mirrored_ref])
+        mirrored_digest = self.crane(["digest", mirrored_ref]).stdout.strip()
         if mirrored_digest != CANDIDATE_DIGEST:
             raise RehearsalUnknown("mirrored candidate digest differs from qualified immutable identity")
-        mirrored_ref = f"{target}@{CANDIDATE_DIGEST}"
-        if not DIGEST_REF.fullmatch(mirrored_ref): raise RehearsalUnknown("mirrored candidate reference is not digest-pinned")
+        if not MIRROR_REF.fullmatch(mirrored_ref): raise RehearsalUnknown("mirrored candidate reference is not a run-owned mirror tag")
         self.candidate_ref = mirrored_ref
         return self.candidate_ref
     def install_auth(self, identity: RunIdentity, auth_value: str) -> None:
@@ -1088,9 +1110,12 @@ def plan(identity: RunIdentity, spec: CorpusSpec, *, mode: str = "execute") -> d
             "reason": "Fly holds no credential for the private source registry",
             "source": CANDIDATE_IMAGE,
             "target": f"{FLY_REGISTRY}/{identity.app_name}:{CANDIDATE_MIRROR_TAG}",
-            "executed_reference": f"{FLY_REGISTRY}/{identity.app_name}@{CANDIDATE_DIGEST}",
+            "executed_reference": f"{FLY_REGISTRY}/{identity.app_name}:{CANDIDATE_MIRROR_TAG}",
             "required_digest": CANDIDATE_DIGEST,
             "digest_mismatch_policy": "UNKNOWN",
+            "identity_binding": "crane digest of the mirror tag must equal the qualified digest before any machine launch",
+            "launch_reference_form": "tag",
+            "launch_reference_reason": "Fly machine-create rejects a digest-pinned config.image with 'invalid image identifier' (observed run 30165273639)",
             "ordering": "immediately after app creation, before any corpus ingestion",
             "scope": "run-owned app repository only; no shared or production repository is written",
         }

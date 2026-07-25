@@ -416,7 +416,7 @@ class StageAContractTests(unittest.TestCase):
     def test_execute_plan_discloses_snapshot_convergence_contract(self):
         rendered = stage.plan(stage.build_identity("snapshot-plan"), stage.CorpusSpec(payload_shape="lexical"))
         self.assertEqual(rendered["snapshot_qualification"], {
-            "method": "list-observed-asynchronous-convergence",
+            "method": "completed-id-set-difference",
             "success_status": "created",
             "timeout_s": stage.SNAPSHOT_LIMIT_S,
             "poll_interval_s": stage.SNAPSHOT_POLL_INTERVAL_S,
@@ -429,8 +429,8 @@ class StageAContractTests(unittest.TestCase):
             subprocess.CompletedProcess([], 0, "[]", ""),
             subprocess.CompletedProcess([], 0, "Scheduled\n", ""),
             subprocess.CompletedProcess([], 0, json.dumps([{"id": "", "status": "waiting", "created_at": "2026-07-25T01:00:00Z"}]), ""),
-            subprocess.CompletedProcess([], 0, json.dumps([{"id": "", "status": "running", "created_at": "2026-07-25T01:00:00Z"}]), ""),
-            subprocess.CompletedProcess([], 0, json.dumps([{"id": "vs_new", "status": "created", "created_at": "2026-07-25T01:00:00Z"}]), ""),
+            subprocess.CompletedProcess([], 0, json.dumps([{"id": "", "status": "running", "created_at": "2026-07-25T01:01:00Z"}]), ""),
+            subprocess.CompletedProcess([], 0, json.dumps([{"id": "vs_new", "status": "created", "created_at": "2026-07-25T01:02:00Z"}]), ""),
         ]
         runtime = stage.FlyRuntime(runner=mock.Mock(side_effect=responses))
         with mock.patch.object(stage.time, "sleep") as sleep:
@@ -465,6 +465,17 @@ class StageAContractTests(unittest.TestCase):
         self.assertEqual(runtime.snapshot(identity, "vol_test"), "vs_collision")
         self.assertEqual(sum("create" in call.args[0] for call in runner.call_args_list), 1)
 
+    def test_snapshot_accepts_completion_observed_after_create_collision(self):
+        identity = stage.build_identity("snapshot-collision-completed")
+        created = {"id": "vs_collision", "status": "created", "created_at": "2026-07-25T01:01:00Z"}
+        runner = mock.Mock(side_effect=[
+            subprocess.CompletedProcess([], 0, "[]", ""),
+            subprocess.CompletedProcess([], 1, "", "failed_precondition: snapshot is already scheduled"),
+            subprocess.CompletedProcess([], 0, json.dumps([created]), ""),
+        ])
+        self.assertEqual(stage.FlyRuntime(runner=runner).snapshot(identity, "vol_test"), "vs_collision")
+        self.assertEqual(runner.call_count, 3)
+
     def test_snapshot_does_not_retry_unrelated_create_failure(self):
         identity = stage.build_identity("snapshot-failure")
         runner = mock.Mock(side_effect=[
@@ -497,14 +508,31 @@ class StageAContractTests(unittest.TestCase):
         ])
         self.assertEqual(stage.FlyRuntime(runner=runner).snapshot(identity, "vol_test"), "vs_new")
 
-    def test_snapshot_rejects_disappeared_pending_operation(self):
+    def test_snapshot_tolerates_pending_disappearance_before_completion(self):
         identity = stage.build_identity("snapshot-disappeared")
         pending = {"id": "", "status": "waiting", "created_at": "2026-07-25T01:00:00Z"}
+        created = {"id": "vs_completed", "status": "created", "created_at": "2026-07-25T01:02:00Z"}
         runner = mock.Mock(side_effect=[
             subprocess.CompletedProcess([], 0, json.dumps([pending]), ""),
             subprocess.CompletedProcess([], 0, "[]", ""),
+            subprocess.CompletedProcess([], 0, json.dumps([created]), ""),
         ])
-        with self.assertRaisesRegex(stage.RehearsalUnknown, "disappeared"):
+        with mock.patch.object(stage.time, "sleep") as sleep:
+            self.assertEqual(stage.FlyRuntime(runner=runner).snapshot(identity, "vol_test"), "vs_completed")
+        sleep.assert_called_once_with(stage.SNAPSHOT_POLL_INTERVAL_S)
+
+    def test_snapshot_rejects_multiple_new_completed_ids(self):
+        identity = stage.build_identity("snapshot-two-completed")
+        pending = {"id": "", "status": "waiting", "created_at": "2026-07-25T01:00:00Z"}
+        completed = [
+            {"id": "vs_one", "status": "created", "created_at": "2026-07-25T01:01:00Z"},
+            {"id": "vs_two", "status": "created", "created_at": "2026-07-25T01:01:01Z"},
+        ]
+        runner = mock.Mock(side_effect=[
+            subprocess.CompletedProcess([], 0, json.dumps([pending]), ""),
+            subprocess.CompletedProcess([], 0, json.dumps(completed), ""),
+        ])
+        with self.assertRaisesRegex(stage.RehearsalUnknown, "identity is ambiguous"):
             stage.FlyRuntime(runner=runner).snapshot(identity, "vol_test")
 
     def test_snapshot_rejects_malformed_or_terminal_list_entries(self):

@@ -763,8 +763,9 @@ class FlyRuntime:
         pending = [item for item in before if item["status"] in {"waiting", "running"}]
         if len(pending) > 1:
             raise RehearsalUnknown("multiple snapshots already in flight")
-        target_created_at = pending[0]["created_at"] if pending else None
-        known = {(item["id"], item["created_at"]) for item in before}
+        baseline_created_ids = {
+            item["id"] for item in before if item["status"] == "created"
+        }
         if not pending:
             try:
                 self.run(["volumes", "snapshots", "create", volume_id, "-a", identity.app_name])
@@ -772,27 +773,27 @@ class FlyRuntime:
                 if "failed_precondition: snapshot is already scheduled" not in str(exc):
                     raise
                 collision = self._snapshots(identity, volume_id)
+                completed = {
+                    item["id"] for item in collision if item["status"] == "created"
+                } - baseline_created_ids
+                if len(completed) > 1:
+                    raise RehearsalUnknown("new snapshot identity is ambiguous") from exc
+                if completed:
+                    return next(iter(completed))
                 pending = [item for item in collision if item["status"] in {"waiting", "running"}]
                 if len(pending) != 1:
                     raise RehearsalUnknown("scheduled snapshot could not be identified") from exc
-                target_created_at = pending[0]["created_at"]
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             snapshots = self._snapshots(identity, volume_id)
-            if target_created_at is None:
-                candidates = [
-                    item for item in snapshots
-                    if (item["id"], item["created_at"]) not in known
-                ]
-                if len(candidates) > 1:
-                    raise RehearsalUnknown("new snapshot identity is ambiguous")
-                if candidates:
-                    target_created_at = candidates[0]["created_at"]
-            matches = [item for item in snapshots if item["created_at"] == target_created_at]
-            if target_created_at is not None and len(matches) != 1:
-                raise RehearsalUnknown("scheduled snapshot disappeared or changed identity")
-            if matches and matches[0]["status"] == "created":
-                return matches[0]["id"]
+            current_created_ids = {
+                item["id"] for item in snapshots if item["status"] == "created"
+            }
+            new_created_ids = current_created_ids - baseline_created_ids
+            if len(new_created_ids) > 1:
+                raise RehearsalUnknown("new snapshot identity is ambiguous")
+            if new_created_ids:
+                return next(iter(new_created_ids))
             time.sleep(interval_s)
         raise RehearsalUnknown("snapshot creation deadline expired")
     def _offline_helper(self, identity: RunIdentity, image: str, role: str,
@@ -1044,7 +1045,7 @@ def plan(identity: RunIdentity, spec: CorpusSpec, *, mode: str = "execute") -> d
             "minimum_free_percent": MIN_FREE_PERCENT,
         }
         result["snapshot_qualification"] = {
-            "method": "list-observed-asynchronous-convergence",
+            "method": "completed-id-set-difference",
             "success_status": "created",
             "timeout_s": SNAPSHOT_LIMIT_S,
             "poll_interval_s": SNAPSHOT_POLL_INTERVAL_S,

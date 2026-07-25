@@ -348,6 +348,7 @@ class StageAContractTests(unittest.TestCase):
             "The bounded df quiet-window witnesses disk settlement; it does not prove asynchronous FTS or provenance queues are empty.",
             "The candidate mirror is written to the run-owned Fly app repository; registry-repository retention is not covered by the machine and volume orphan scan.",
             "Fly machine-create rejects a digest-pinned config.image, so the candidate launches from the run-owned mirror tag; identity rests on the digest assertion taken before launch, not on the launch reference itself.",
+            "The pre-ingestion provisioning probe is mountless, so it proves candidate image and guest provisioning only; volume attachment, readiness, and every measured gate remain first exercised by the real machines.",
         ])
 
     def test_volume_command_is_encrypted_twenty_gb_and_unscheduled(self):
@@ -681,6 +682,35 @@ class StageAContractTests(unittest.TestCase):
         self.assertTrue(stage.MIRROR_REF.fullmatch(mirrored))
         self.assertIsNone(stage.DIGEST_REF.fullmatch(mirrored))
         self.assertTrue(stage.MIRROR_REF.fullmatch(runtime.candidate_ref))
+
+    def test_provisioning_probe_launches_candidate_mountless_with_the_real_guest_spec(self):
+        """The probe only forecloses a ~1.5 hour ingest if it provisions what the real
+        machines provision, so guest-spec parity is the property that makes it
+        representative. Mountlessness is what stops it initialising a store on the
+        measured volume before that volume's empty disk sample is taken."""
+        identity = stage.build_identity("probe-test")
+        runner, calls = self.mirror_runner(stage.CANDIDATE_DIGEST)
+        runtime = stage.FlyRuntime(runner=runner)
+        mirrored = runtime.mirror_candidate(identity)
+        self.assertEqual(runtime.provisioning_probe(identity, mirrored), "abcdef12345678")
+        probe_cmd = calls[-1]
+        self.assertEqual(probe_cmd[:4], ["flyctl", "machine", "run", mirrored])
+        probe_config = json.loads(probe_cmd[probe_cmd.index("--machine-config") + 1])
+        self.assertEqual(probe_config["mounts"], [])
+        runtime.create_machine(identity, "vol_test", mirrored, "candidate")
+        real_config = json.loads(calls[-1][calls[-1].index("--machine-config") + 1])
+        self.assertEqual(probe_config["guest"], real_config["guest"])
+        self.assertEqual(probe_config["image"], real_config["image"])
+        self.assertNotEqual(real_config["mounts"], [])
+
+    def test_provisioning_probe_refuses_a_substituted_image(self):
+        identity = stage.build_identity("probe-substitute")
+        runner, _ = self.mirror_runner(stage.CANDIDATE_DIGEST)
+        runtime = stage.FlyRuntime(runner=runner)
+        runtime.mirror_candidate(identity)
+        for substituted in (stage.CANDIDATE_IMAGE, stage.BASELINE_IMAGE,
+                            f"{stage.FLY_REGISTRY}/{stage.PRODUCTION_APP}:{stage.CANDIDATE_MIRROR_TAG}"):
+            with self.assertRaises(stage.RehearsalUnknown): runtime.provisioning_probe(identity, substituted)
 
     def test_candidate_mirror_refuses_digest_drift(self):
         identity = stage.build_identity("drift-test")

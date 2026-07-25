@@ -346,6 +346,7 @@ class StageAContractTests(unittest.TestCase):
             "Synthetic rehearsal is not production deployment authorization.",
             "Production data, backups, volumes, machines, app, and credentials are prohibited.",
             "The bounded df quiet-window witnesses disk settlement; it does not prove asynchronous FTS or provenance queues are empty.",
+            "The candidate mirror is written to the run-owned Fly app repository; registry-repository retention is not covered by the machine and volume orphan scan.",
         ])
 
     def test_volume_command_is_encrypted_twenty_gb_and_unscheduled(self):
@@ -637,6 +638,80 @@ class StageAContractTests(unittest.TestCase):
         runtime = stage.FlyRuntime(runner=lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, "Machine ID: abcdef12345678\n", ""))
         with self.assertRaises(stage.RehearsalUnknown): runtime.create_machine(identity, "vol_test", stage.BASELINE_IMAGE, "candidate")
         runtime.create_machine(identity, "vol_test", stage.BASELINE_IMAGE, "rollback")
+
+    def mirror_runner(self, reported_digest, *, copy_code=0):
+        calls = []
+        def runner(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[:2] == ["crane", "copy"]: return subprocess.CompletedProcess(cmd, copy_code, "", "copy diagnostic")
+            if cmd[:2] == ["crane", "digest"]: return subprocess.CompletedProcess(cmd, 0, f"{reported_digest}\n", "")
+            return subprocess.CompletedProcess(cmd, 0, "Machine ID: abcdef12345678\n", "")
+        return runner, calls
+
+    def test_candidate_mirror_preserves_qualified_digest_and_binds_run_owned_repository(self):
+        identity = stage.build_identity("mirror-test")
+        runner, calls = self.mirror_runner(stage.CANDIDATE_DIGEST)
+        runtime = stage.FlyRuntime(runner=runner)
+        self.assertEqual(stage.CANDIDATE_DIGEST, stage.CANDIDATE_IMAGE.split("@", 1)[1])
+        mirrored = runtime.mirror_candidate(identity)
+        self.assertEqual(mirrored, f"{stage.FLY_REGISTRY}/{identity.app_name}@{stage.CANDIDATE_DIGEST}")
+        self.assertEqual(runtime.candidate_ref, mirrored)
+        self.assertEqual(calls[0], ["crane", "copy", stage.CANDIDATE_IMAGE,
+                                    f"{stage.FLY_REGISTRY}/{identity.app_name}:{stage.CANDIDATE_MIRROR_TAG}"])
+        runtime.create_machine(identity, "vol_test", mirrored, "candidate")
+        for substituted in (stage.CANDIDATE_IMAGE, f"{stage.FLY_REGISTRY}/{stage.PRODUCTION_APP}@{stage.CANDIDATE_DIGEST}"):
+            with self.assertRaises(stage.RehearsalUnknown): runtime.create_machine(identity, "vol_test", substituted, "candidate")
+
+    def test_candidate_mirror_refuses_digest_drift(self):
+        identity = stage.build_identity("drift-test")
+        runner, _ = self.mirror_runner("sha256:" + "0" * 64)
+        runtime = stage.FlyRuntime(runner=runner)
+        with self.assertRaises(stage.RehearsalUnknown): runtime.mirror_candidate(identity)
+        self.assertEqual(runtime.candidate_ref, stage.CANDIDATE_IMAGE)
+
+    def test_candidate_mirror_refuses_copy_failure_without_reading_digest(self):
+        identity = stage.build_identity("copy-fail-test")
+        runner, calls = self.mirror_runner(stage.CANDIDATE_DIGEST, copy_code=1)
+        runtime = stage.FlyRuntime(runner=runner)
+        with self.assertRaises(stage.RehearsalUnknown): runtime.mirror_candidate(identity)
+        self.assertEqual([cmd[:2] for cmd in calls], [["crane", "copy"]])
+        self.assertEqual(runtime.candidate_ref, stage.CANDIDATE_IMAGE)
+
+    def test_candidate_mirror_refuses_production_repository(self):
+        production = stage.RunIdentity("x", stage.PRODUCTION_APP, "ksa_1234567890_src", "ksa_1234567890_bak",
+                                       "ksa_1234567890_rst", "ksa_1234567890_rbk", "x")
+        runner, calls = self.mirror_runner(stage.CANDIDATE_DIGEST)
+        with self.assertRaises(stage.RehearsalUnknown): stage.FlyRuntime(runner=runner).mirror_candidate(production)
+        self.assertEqual(calls, [])
+
+    def test_execute_mirrors_candidate_before_provisioning_or_ingestion(self):
+        identity = stage.build_identity("mirror-order")
+        runtime = mock.Mock()
+        runtime.list_owned_resources.return_value = []
+        runtime.create_app.return_value = identity.app_name
+        runtime.mirror_candidate.side_effect = stage.RehearsalUnknown("candidate mirror unavailable")
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "mirror-order.json"
+            self.assertEqual(stage.execute(identity, stage.CorpusSpec(payload_shape="lexical"), path, runtime=runtime), 2)
+            receipt = json.loads(path.read_text())
+        self.assertEqual(receipt["status"], "UNKNOWN")
+        self.assertEqual(receipt["images"]["candidate_ref_executed"], stage.CANDIDATE_IMAGE)
+        self.assertTrue(any("registry-repository retention" in item for item in receipt["limitations"]))
+        runtime.create_volume.assert_not_called()
+        runtime.create_machine.assert_not_called()
+        runtime.proxy.assert_not_called()
+
+    def test_plan_discloses_candidate_mirror_only_for_execute(self):
+        identity = stage.build_identity("mirror-plan")
+        rendered = stage.plan(identity, stage.CorpusSpec(payload_shape="lexical"))
+        access = rendered["candidate_image_access"]
+        self.assertEqual(access["source"], stage.CANDIDATE_IMAGE)
+        self.assertEqual(access["required_digest"], stage.CANDIDATE_DIGEST)
+        self.assertEqual(access["target"], f"{stage.FLY_REGISTRY}/{identity.app_name}:{stage.CANDIDATE_MIRROR_TAG}")
+        self.assertEqual(access["executed_reference"], f"{stage.FLY_REGISTRY}/{identity.app_name}@{stage.CANDIDATE_DIGEST}")
+        self.assertEqual(access["digest_mismatch_policy"], "UNKNOWN")
+        calibration = stage.CorpusSpec(stage.CALIBRATION_SAMPLE_COUNT, 50, stage.CALIBRATION_LOW_PAYLOAD_BYTES, "test-seed")
+        self.assertNotIn("candidate_image_access", stage.plan(identity, calibration, mode="calibrate"))
 
     def test_offline_helper_requires_stopped_zero_exit(self):
         identity = stage.build_identity("wait-test"); calls = []

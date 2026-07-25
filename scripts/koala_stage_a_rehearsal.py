@@ -61,6 +61,8 @@ FLY_REGION, FLY_ORG, MCP_PORT = "ewr", "personal", 8750
 BASELINE_IMAGE = "registry.fly.io/koala-muninndb:deployment-01KSWRX9GKW5M94MQQCBZSJZHS"
 BASELINE_DIGEST = "sha256:c06842e1452f2aab4c1f01207adf9406bfe757b4984da516568006f1f5c8ad86"
 CANDIDATE_IMAGE = "ghcr.io/koala-optics/muninndb@sha256:5cc1546b854e6b173181ceed139ade783751c1e58bea504bc57cb0a7fa4019df"
+CANDIDATE_DIGEST = CANDIDATE_IMAGE.split("@", 1)[1]
+FLY_REGISTRY, CANDIDATE_MIRROR_TAG = "registry.fly.io", "stage-a-candidate"
 SOURCE_COMMIT, SOURCE_TAG = "acef6bedbbd839f9616415e6a7559ad149dc8bc8", "koala-v0.9.0-rc.2"
 PRODUCTION_APP = "koala-muninndb"
 PRODUCTION_MACHINE_IDS = frozenset({"6e8262d6c6d298"})
@@ -187,8 +189,8 @@ def assert_owned(value: str, identity: RunIdentity, kind: str) -> None:
     if kind in names and value not in names[kind]:
         raise RehearsalUnknown(f"refusing unowned {kind}")
 
-def validate_image(ref: str, role: str) -> str:
-    expected = BASELINE_IMAGE if role == "baseline" else CANDIDATE_IMAGE
+def validate_image(ref: str, role: str, *, expected_candidate: str = CANDIDATE_IMAGE) -> str:
+    expected = BASELINE_IMAGE if role == "baseline" else expected_candidate
     if ref != expected or (role != "baseline" and not DIGEST_REF.fullmatch(ref)):
         raise RehearsalUnknown(f"{role} image differs from qualified immutable identity")
     return ref
@@ -564,6 +566,7 @@ def receipt_document(
     orphans: Sequence[str],
     corpus: CorpusReceipt | IngestProgress | None,
     mode: str = "execute",
+    candidate_ref: str = CANDIDATE_IMAGE,
 ) -> dict[str, Any]:
     bounded_measurements = json.loads(json.dumps(measurements))
     bounded_measurements["mode"] = mode
@@ -575,13 +578,18 @@ def receipt_document(
         limitations.append(
             "The bounded df quiet-window witnesses disk settlement; it does not prove asynchronous FTS or provenance queues are empty."
         )
+    if mode == "execute":
+        limitations.append(
+            "The candidate mirror is written to the run-owned Fly app repository; registry-repository retention is not covered by the machine and volume orphan scan."
+        )
     return {
         "schema_version": SCHEMA_VERSION,
         "status": status,
         "exit_code": exit_code,
         "run_id": identity.run_id,
         "source": {"commit": SOURCE_COMMIT, "tag": SOURCE_TAG},
-        "images": {"baseline": BASELINE_IMAGE, "baseline_digest": BASELINE_DIGEST, "candidate": CANDIDATE_IMAGE},
+        "images": {"baseline": BASELINE_IMAGE, "baseline_digest": BASELINE_DIGEST, "candidate": CANDIDATE_IMAGE,
+                   "candidate_digest": CANDIDATE_DIGEST, "candidate_ref_executed": candidate_ref},
         "corpus": corpus_evidence(spec, corpus),
         "resources": {key: value for key, value in asdict(ledger).items() if value},
         "measurements": bounded_measurements,
@@ -633,9 +641,14 @@ class FlyRuntime:
     """Injected seam around every Fly operation; construction performs no calls."""
     def __init__(self, runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run, popen: Callable[..., subprocess.Popen[str]] = subprocess.Popen):
         self.runner, self.popen = runner, popen
+        self.candidate_ref = CANDIDATE_IMAGE
     def run(self, args: list[str], *, stdin: str | None = None, timeout: int = 600) -> subprocess.CompletedProcess[str]:
         proc = self.runner(["flyctl", *args], input=stdin, text=True, capture_output=True, timeout=timeout)
         if proc.returncode: raise RehearsalUnknown(f"flyctl {args[0]} failed: {_safe_process_error(proc)}")
+        return proc
+    def crane(self, args: list[str], *, timeout: int = 1800) -> subprocess.CompletedProcess[str]:
+        proc = self.runner(["crane", *args], text=True, capture_output=True, timeout=timeout)
+        if proc.returncode: raise RehearsalUnknown(f"crane {args[0]} failed: {_safe_process_error(proc)}")
         return proc
     def json(self, args: list[str], *, timeout: int = 600) -> Any:
         for attempt in range(3):
@@ -652,6 +665,25 @@ class FlyRuntime:
         if proc.returncode == 0: raise RehearsalUnknown("run-owned app already exists")
     def create_app(self, identity: RunIdentity) -> str:
         self.run(["apps", "create", identity.app_name, "--org", FLY_ORG]); return identity.app_name
+    def mirror_candidate(self, identity: RunIdentity) -> str:
+        """Copy the qualified candidate manifest into the run-owned Fly registry repository.
+
+        Fly holds no credential for the private source registry, so the digest-pinned
+        manifest is copied verbatim into the disposable app's own repository. The copy is
+        refused unless its digest still equals the qualified immutable identity, so
+        mirroring cannot substitute a different image. Registry-repository retention after
+        app destruction is Fly's behavior and is not asserted here.
+        """
+        assert_not_production(identity)
+        target = f"{FLY_REGISTRY}/{identity.app_name}"
+        self.crane(["copy", CANDIDATE_IMAGE, f"{target}:{CANDIDATE_MIRROR_TAG}"])
+        mirrored_digest = self.crane(["digest", f"{target}:{CANDIDATE_MIRROR_TAG}"]).stdout.strip()
+        if mirrored_digest != CANDIDATE_DIGEST:
+            raise RehearsalUnknown("mirrored candidate digest differs from qualified immutable identity")
+        mirrored_ref = f"{target}@{CANDIDATE_DIGEST}"
+        if not DIGEST_REF.fullmatch(mirrored_ref): raise RehearsalUnknown("mirrored candidate reference is not digest-pinned")
+        self.candidate_ref = mirrored_ref
+        return self.candidate_ref
     def install_auth(self, identity: RunIdentity, auth_value: str) -> None:
         env_name = "MUNINN" + "_MCP_TOKEN"
         self.run(["secrets", "import", "-a", identity.app_name, "--stage"], stdin=f"{env_name}={auth_value}\nMUNINN_LOCAL_EMBED=0\n")
@@ -664,7 +696,7 @@ class FlyRuntime:
         return volume_id
     def create_machine(self, identity: RunIdentity, volume_id: str, image: str, role: str) -> str:
         if volume_id in PRODUCTION_VOLUME_IDS: raise RehearsalUnknown("refusing production volume")
-        validate_image(image, "baseline" if role in {"baseline", "rollback"} else "candidate")
+        validate_image(image, "baseline" if role in {"baseline", "rollback"} else "candidate", expected_candidate=self.candidate_ref)
         name = f"koala-stage-a-{identity.run_id}-{role}"
         config = json.dumps({"image": image, "init": {"cmd": ["--daemon", "--data", "/data", "--listen-host", "0.0.0.0", "--mcp-addr", f"0.0.0.0:{MCP_PORT}"]}, "restart": {"policy": "no"}, "guest": {"cpu_kind": "performance", "cpus": 16, "memory_mb": 32768}, "mounts": [{"volume": volume_id, "path": "/data"}], "metadata": {"koala_stage_a_run": identity.run_id, "role": role}, "services": []}, sort_keys=True)
         proc = self.run(["machine", "run", image, "-a", identity.app_name, "--region", FLY_REGION, "--name", name, "--machine-config", config, "--restart", "no", "--skip-dns-registration", "--detach"])
@@ -811,7 +843,7 @@ class FlyRuntime:
         return matches[0]
     def create_backup(self, identity: RunIdentity, volume_id: str, backup_volume_id: str,
                       image: str) -> tuple[str, str]:
-        validate_image(image, "candidate")
+        validate_image(image, "candidate", expected_candidate=self.candidate_ref)
         if volume_id in PRODUCTION_VOLUME_IDS or backup_volume_id in PRODUCTION_VOLUME_IDS:
             raise RehearsalUnknown("refusing production backup volume")
         archive = "/backup/stage-a-backup.tgz"
@@ -824,7 +856,7 @@ class FlyRuntime:
         return self._offline_helper(identity, image, "backup", mounts, command), archive
     def hard_delete(self, identity: RunIdentity, volume_id: str, image: str,
                     vault: str, memory_id: str) -> str:
-        validate_image(image, "candidate")
+        validate_image(image, "candidate", expected_candidate=self.candidate_ref)
         if volume_id in PRODUCTION_VOLUME_IDS or not re.fullmatch(r"[A-Za-z0-9_-]+", vault) or not re.fullmatch(r"[A-Za-z0-9_-]+", memory_id):
             raise RehearsalUnknown("invalid hard-delete target")
         command = (f"set -eu; muninndb-server exec forget --data-dir /data "
@@ -832,7 +864,7 @@ class FlyRuntime:
         return self._offline_helper(identity, image, "hard-delete", [{"volume": volume_id, "path": "/data"}], command)
     def create_restore(self, identity: RunIdentity, backup_volume_id: str, restore_volume_id: str,
                        image: str, archive_path: str) -> str:
-        validate_image(image, "candidate")
+        validate_image(image, "candidate", expected_candidate=self.candidate_ref)
         if backup_volume_id in PRODUCTION_VOLUME_IDS or restore_volume_id in PRODUCTION_VOLUME_IDS:
             raise RehearsalUnknown("refusing production restore volume")
         command = (f"set -eu; A={archive_path}; test -f \"$A\"; test -f \"$A.sha256\"; "
@@ -1051,6 +1083,17 @@ def plan(identity: RunIdentity, spec: CorpusSpec, *, mode: str = "execute") -> d
             "poll_interval_s": SNAPSHOT_POLL_INTERVAL_S,
             "already_scheduled_policy": "adopt-exactly-one-observed-in-flight-snapshot",
         }
+        result["candidate_image_access"] = {
+            "method": "digest-pinned-copy-into-run-owned-fly-registry-repository",
+            "reason": "Fly holds no credential for the private source registry",
+            "source": CANDIDATE_IMAGE,
+            "target": f"{FLY_REGISTRY}/{identity.app_name}:{CANDIDATE_MIRROR_TAG}",
+            "executed_reference": f"{FLY_REGISTRY}/{identity.app_name}@{CANDIDATE_DIGEST}",
+            "required_digest": CANDIDATE_DIGEST,
+            "digest_mismatch_policy": "UNKNOWN",
+            "ordering": "immediately after app creation, before any corpus ingestion",
+            "scope": "run-owned app repository only; no shared or production repository is written",
+        }
         result["falsification_evidence"] = {
             "run_id": FALSIFICATION_RUN_ID,
             "receipt_sha256": FALSIFICATION_RECEIPT_SHA256,
@@ -1262,11 +1305,12 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
     ledger, proxy = ResourceLedger(), None
     gates: dict[str, Gate] = {}; measurements: dict[str, Any] = {"disk_samples": [], "latencies": {}}
     corpus_receipt: CorpusReceipt | None = None; cleanup_result: dict[str, str] = {}; orphans: list[str] = []
+    candidate_ref = CANDIDATE_IMAGE
     detail, status, exit_code = "rehearsal did not complete", "UNKNOWN", 2
     auth_value = secrets.token_urlsafe(32)
     try:
         validate_execute_spec(spec); validate_image(BASELINE_IMAGE, "baseline"); validate_image(CANDIDATE_IMAGE, "candidate"); runtime.preflight(identity)
-        ledger.app = runtime.create_app(identity); runtime.install_auth(identity, auth_value)
+        ledger.app = runtime.create_app(identity); candidate_ref = runtime.mirror_candidate(identity); runtime.install_auth(identity, auth_value)
         ledger.volume_id = runtime.create_volume(identity, identity.volume_name)
         ledger.machine_id = runtime.create_machine(identity, ledger.volume_id, BASELINE_IMAGE, "baseline")
         runtime.wait_ready(identity, ledger.machine_id, READINESS_LIMIT_S)
@@ -1284,7 +1328,7 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
             write_receipt(receipt_path, receipt_document(
                 identity, spec, status="UNKNOWN", exit_code=2, detail="baseline ingestion in progress",
                 ledger=ledger, measurements=measurements, gates=gates, cleanup_result={}, orphans=[],
-                corpus=progress,
+                corpus=progress, candidate_ref=candidate_ref,
             ))
         corpus_receipt = ingest_corpus(client, spec, progress=checkpoint)
         immediate = runtime.disk_sample(identity, ledger.machine_id, "baseline-immediate")
@@ -1310,7 +1354,7 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
         )
         terminate_proxy(proxy); proxy = None; runtime.stop_machine(identity, ledger.machine_id); runtime.destroy_machine(identity, ledger.machine_id); ledger.machine_id = None
         ledger.snapshot_id = runtime.snapshot(identity, ledger.volume_id)
-        migration_started = time.monotonic(); ledger.machine_id = runtime.create_machine(identity, ledger.volume_id, CANDIDATE_IMAGE, "candidate")
+        migration_started = time.monotonic(); ledger.machine_id = runtime.create_machine(identity, ledger.volume_id, candidate_ref, "candidate")
         candidate_ready, migration_disks, migration_resources = runtime.migration_samples(identity, ledger.machine_id, MIGRATION_LIMIT_S)
         migration_s = time.monotonic() - migration_started
         measurements["disk_samples"].extend(asdict(sample) | {"free_percent": sample.free_percent} for sample in migration_disks)
@@ -1341,16 +1385,16 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
         gates["disk_headroom"] = disk_gate(all_disk_samples)
         gates["resource_sampling"] = Gate("PASSED" if migration_resources else "UNKNOWN", "migration CPU and RSS samples captured", len(migration_resources))
         terminate_proxy(proxy); proxy = None; runtime.stop_machine(identity, ledger.machine_id); runtime.destroy_machine(identity, ledger.machine_id); ledger.machine_id = None
-        ledger.machine_id = runtime.create_machine(identity, ledger.volume_id, CANDIDATE_IMAGE, "clean-restart"); runtime.wait_ready(identity, ledger.machine_id, READINESS_LIMIT_S)
+        ledger.machine_id = runtime.create_machine(identity, ledger.volume_id, candidate_ref, "clean-restart"); runtime.wait_ready(identity, ledger.machine_id, READINESS_LIMIT_S)
         runtime.stop_machine(identity, ledger.machine_id, force=True); runtime.destroy_machine(identity, ledger.machine_id); ledger.machine_id = None
-        ledger.machine_id = runtime.create_machine(identity, ledger.volume_id, CANDIDATE_IMAGE, "crash-restart"); runtime.wait_ready(identity, ledger.machine_id, READINESS_LIMIT_S)
+        ledger.machine_id = runtime.create_machine(identity, ledger.volume_id, candidate_ref, "crash-restart"); runtime.wait_ready(identity, ledger.machine_id, READINESS_LIMIT_S)
         gates["restart_durability"] = Gate("PASSED", "clean and forced-crash restarts reached readiness")
         runtime.stop_machine(identity, ledger.machine_id); runtime.destroy_machine(identity, ledger.machine_id); ledger.machine_id = None
         hard_delete_id = corpus_receipt.retained_ids["hard_delete"][0]
-        hard_delete_helper = runtime.hard_delete(identity, ledger.volume_id, CANDIDATE_IMAGE, "stage-a-primary", hard_delete_id)
+        hard_delete_helper = runtime.hard_delete(identity, ledger.volume_id, candidate_ref, "stage-a-primary", hard_delete_id)
         ledger.machine_id = hard_delete_helper; runtime.wait_stopped(identity, hard_delete_helper, READINESS_LIMIT_S)
         runtime.destroy_machine(identity, hard_delete_helper); ledger.machine_id = None
-        ledger.machine_id = runtime.create_machine(identity, ledger.volume_id, CANDIDATE_IMAGE, "hard-delete-check"); runtime.wait_ready(identity, ledger.machine_id, READINESS_LIMIT_S)
+        ledger.machine_id = runtime.create_machine(identity, ledger.volume_id, candidate_ref, "hard-delete-check"); runtime.wait_ready(identity, ledger.machine_id, READINESS_LIMIT_S)
         proxy = runtime.proxy(identity, ledger.machine_id, local_port); hard_delete_client = client_factory(f"http://127.0.0.1:{local_port}/mcp", auth_value); hard_delete_client.initialize()
         deleted_concept, _ = hard_delete_client.call("muninn_find_by_concept", {"vault": "stage-a-primary", "concept": "stage-a/concept/0043", "limit": 50})
         deleted_entity, _ = hard_delete_client.call("muninn_find_by_entity", {"vault": "stage-a-primary", "entity_name": "Stage A Entity 43", "limit": 50})
@@ -1364,16 +1408,16 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
         gates["hard_delete_cleanup"] = Gate("PASSED", "offline hard delete removed primary and reverse-index reachability")
         runtime.stop_machine(identity, ledger.machine_id); runtime.destroy_machine(identity, ledger.machine_id); ledger.machine_id = None
         backup_started = time.monotonic(); ledger.backup_volume_id = runtime.create_volume(identity, identity.backup_volume_name)
-        backup_helper, backup_path = runtime.create_backup(identity, ledger.volume_id, ledger.backup_volume_id, CANDIDATE_IMAGE)
+        backup_helper, backup_path = runtime.create_backup(identity, ledger.volume_id, ledger.backup_volume_id, candidate_ref)
         ledger.machine_id = backup_helper; runtime.wait_stopped(identity, backup_helper, RESTORE_LIMIT_S)
         measurements["backup_duration_s"] = time.monotonic() - backup_started
         runtime.destroy_machine(identity, backup_helper); ledger.machine_id = None
         restore_started = time.monotonic()
         ledger.restore_volume_id = runtime.create_volume(identity, identity.restore_volume_name)
-        restore_helper = runtime.create_restore(identity, ledger.backup_volume_id, ledger.restore_volume_id, CANDIDATE_IMAGE, backup_path)
+        restore_helper = runtime.create_restore(identity, ledger.backup_volume_id, ledger.restore_volume_id, candidate_ref, backup_path)
         ledger.machine_id = restore_helper; runtime.wait_stopped(identity, restore_helper, RESTORE_LIMIT_S)
         runtime.destroy_machine(identity, restore_helper); ledger.machine_id = None
-        ledger.machine_id = runtime.create_machine(identity, ledger.restore_volume_id, CANDIDATE_IMAGE, "restore"); runtime.wait_ready(identity, ledger.machine_id, READINESS_LIMIT_S)
+        ledger.machine_id = runtime.create_machine(identity, ledger.restore_volume_id, candidate_ref, "restore"); runtime.wait_ready(identity, ledger.machine_id, READINESS_LIMIT_S)
         measurements["backup"] = runtime.backup_measurement(identity, ledger.machine_id)
         proxy = runtime.proxy(identity, ledger.machine_id, local_port); restore_client = client_factory(f"http://127.0.0.1:{local_port}/mcp", auth_value); restore_client.initialize()
         restored_counts, _ = query_counts(restore_client); restored_samples = run_query_probes(restore_client, corpus_receipt); terminate_proxy(proxy); proxy = None
@@ -1404,7 +1448,7 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
         write_receipt(receipt_path, receipt_document(
             identity, spec, status=status, exit_code=exit_code, detail=detail, ledger=ledger,
             measurements=measurements, gates=gates, cleanup_result=cleanup_result,
-            orphans=orphans, corpus=corpus_receipt,
+            orphans=orphans, corpus=corpus_receipt, candidate_ref=candidate_ref,
         ))
     return exit_code
 

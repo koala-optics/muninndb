@@ -99,6 +99,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     environment: koala-stage-a-rehearsal
+    permissions:
+      contents: read
+      packages: read
     steps:
       - name: Check out workflow ref
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -119,6 +122,34 @@ jobs:
           printf '%s  %s\n' "$FLYCTL_SHA256" "/tmp/${archive}" | sha256sum --check --strict
           tar -xzf "/tmp/${archive}" -C /usr/local/bin flyctl
           flyctl version
+
+      - name: Install pinned crane
+        if: inputs.mode == 'execute'
+        shell: bash
+        env:
+          CRANE_VERSION: v0.21.7
+          CRANE_SHA256: 1a57bc98207fa1c0d04bf760699099e26f8383499bfd55b99c1b919a928a7230
+        run: |
+          set -euo pipefail
+          archive="go-containerregistry_Linux_x86_64.tar.gz"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/${archive}" \
+            --output "/tmp/${archive}"
+          printf '%s  %s\n' "$CRANE_SHA256" "/tmp/${archive}" | sha256sum --check --strict
+          tar -xzf "/tmp/${archive}" -C /usr/local/bin crane
+          crane version
+
+      - name: Authenticate candidate source and Fly registries
+        if: inputs.mode == 'execute'
+        shell: bash
+        env:
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GHCR_TOKEN" | crane auth login ghcr.io --username "$GHCR_USERNAME" --password-stdin
+          printf '%s' "$FLY_API_TOKEN" | crane auth login registry.fly.io --username x --password-stdin
 
       - name: Validate authorized repository and source ref
         shell: bash

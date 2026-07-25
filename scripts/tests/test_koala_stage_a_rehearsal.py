@@ -347,6 +347,7 @@ class StageAContractTests(unittest.TestCase):
             "Production data, backups, volumes, machines, app, and credentials are prohibited.",
             "The bounded df quiet-window witnesses disk settlement; it does not prove asynchronous FTS or provenance queues are empty.",
             "The candidate mirror is written to the run-owned Fly app repository; registry-repository retention is not covered by the machine and volume orphan scan.",
+            "Fly machine-create rejects a digest-pinned config.image, so the candidate launches from the run-owned mirror tag; identity rests on the digest assertion taken before launch, not on the launch reference itself.",
         ])
 
     def test_volume_command_is_encrypted_twenty_gb_and_unscheduled(self):
@@ -654,13 +655,32 @@ class StageAContractTests(unittest.TestCase):
         runtime = stage.FlyRuntime(runner=runner)
         self.assertEqual(stage.CANDIDATE_DIGEST, stage.CANDIDATE_IMAGE.split("@", 1)[1])
         mirrored = runtime.mirror_candidate(identity)
-        self.assertEqual(mirrored, f"{stage.FLY_REGISTRY}/{identity.app_name}@{stage.CANDIDATE_DIGEST}")
+        self.assertEqual(mirrored, f"{stage.FLY_REGISTRY}/{identity.app_name}:{stage.CANDIDATE_MIRROR_TAG}")
         self.assertEqual(runtime.candidate_ref, mirrored)
-        self.assertEqual(calls[0], ["crane", "copy", stage.CANDIDATE_IMAGE,
-                                    f"{stage.FLY_REGISTRY}/{identity.app_name}:{stage.CANDIDATE_MIRROR_TAG}"])
+        self.assertEqual(calls[0], ["crane", "copy", stage.CANDIDATE_IMAGE, mirrored])
+        self.assertEqual(calls[1], ["crane", "digest", mirrored])
         runtime.create_machine(identity, "vol_test", mirrored, "candidate")
-        for substituted in (stage.CANDIDATE_IMAGE, f"{stage.FLY_REGISTRY}/{stage.PRODUCTION_APP}@{stage.CANDIDATE_DIGEST}"):
+        substitutions = (
+            stage.CANDIDATE_IMAGE,
+            f"{stage.FLY_REGISTRY}/{identity.app_name}@{stage.CANDIDATE_DIGEST}",
+            f"{stage.FLY_REGISTRY}/{stage.PRODUCTION_APP}@{stage.CANDIDATE_DIGEST}",
+            f"{stage.FLY_REGISTRY}/{stage.PRODUCTION_APP}:{stage.CANDIDATE_MIRROR_TAG}",
+            f"{stage.FLY_REGISTRY}/koala-stage-a-other-run:{stage.CANDIDATE_MIRROR_TAG}",
+        )
+        for substituted in substitutions:
             with self.assertRaises(stage.RehearsalUnknown): runtime.create_machine(identity, "vol_test", substituted, "candidate")
+
+    def test_launch_reference_is_a_tag_because_fly_rejects_digest_pinned_config_image(self):
+        """Run 30165273639 observed: Fly resolves a digest-pinned config.image, then refuses
+        to boot it with "invalid image identifier". The launch reference must therefore be a
+        tag, and the qualified digest must not be accepted as a launch reference."""
+        identity = stage.build_identity("tag-launch")
+        runner, _ = self.mirror_runner(stage.CANDIDATE_DIGEST)
+        runtime = stage.FlyRuntime(runner=runner)
+        mirrored = runtime.mirror_candidate(identity)
+        self.assertTrue(stage.MIRROR_REF.fullmatch(mirrored))
+        self.assertIsNone(stage.DIGEST_REF.fullmatch(mirrored))
+        self.assertTrue(stage.MIRROR_REF.fullmatch(runtime.candidate_ref))
 
     def test_candidate_mirror_refuses_digest_drift(self):
         identity = stage.build_identity("drift-test")
@@ -708,8 +728,11 @@ class StageAContractTests(unittest.TestCase):
         self.assertEqual(access["source"], stage.CANDIDATE_IMAGE)
         self.assertEqual(access["required_digest"], stage.CANDIDATE_DIGEST)
         self.assertEqual(access["target"], f"{stage.FLY_REGISTRY}/{identity.app_name}:{stage.CANDIDATE_MIRROR_TAG}")
-        self.assertEqual(access["executed_reference"], f"{stage.FLY_REGISTRY}/{identity.app_name}@{stage.CANDIDATE_DIGEST}")
+        self.assertEqual(access["executed_reference"], f"{stage.FLY_REGISTRY}/{identity.app_name}:{stage.CANDIDATE_MIRROR_TAG}")
         self.assertEqual(access["digest_mismatch_policy"], "UNKNOWN")
+        self.assertEqual(access["launch_reference_form"], "tag")
+        self.assertIn("invalid image identifier", access["launch_reference_reason"])
+        self.assertIn("must equal the qualified digest", access["identity_binding"])
         calibration = stage.CorpusSpec(stage.CALIBRATION_SAMPLE_COUNT, 50, stage.CALIBRATION_LOW_PAYLOAD_BYTES, "test-seed")
         self.assertNotIn("candidate_image_access", stage.plan(identity, calibration, mode="calibrate"))
 

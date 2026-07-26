@@ -1057,18 +1057,43 @@ class StageAContractTests(unittest.TestCase):
         unknown = stage.FlyRuntime(runner=lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, "state = stopped\n" if "status" in cmd else "", ""))
         with self.assertRaises(stage.RehearsalUnknown): unknown.wait_stopped(identity, "abc123", 30)
 
-    def test_restore_helper_uses_backup_archive_and_separate_empty_volume(self):
+    def test_restore_helper_rebuilds_from_the_archive_alone_on_one_volume(self):
+        """The restore volume is a fork of the volume the archive sits on, so it arrives
+        already holding a copy of the original store. If that copy survived, every query
+        downstream would prove only that a Fly volume fork works. The wipe has to happen
+        after the checksum is verified and before the extraction, and the archive itself
+        may only be removed after the receipt recording its size and checksum is written."""
         identity = stage.build_identity("restore-test"); calls = []
         def runner(cmd, **kwargs):
             calls.append(cmd); return subprocess.CompletedProcess(cmd, 0, "Machine ID: abcdef12345678\n", "")
         runtime = stage.FlyRuntime(runner=runner)
-        runtime.create_restore(identity, "vol_backup", "vol_restore", stage.CANDIDATE_IMAGE, "/backup/stage-a-backup.tgz")
+        runtime.create_restore(identity, "vol_restore", stage.CANDIDATE_IMAGE, "/data/stage-a-backup.tgz")
         command = calls[0]; config = json.loads(command[command.index("--machine-config") + 1])
-        self.assertEqual(config["mounts"], [{"path": "/backup", "volume": "vol_backup"}, {"path": "/restore", "volume": "vol_restore"}])
+        self.assertEqual(config["mounts"], [{"path": "/data", "volume": "vol_restore"}])
         restore_command = config["init"]["exec"][2]
-        self.assertIn("/backup/stage-a-backup.tgz", restore_command)
-        self.assertIn("sha256sum", restore_command); self.assertIn("tar -xzf", restore_command)
+        self.assertIn("/data/stage-a-backup.tgz", restore_command)
         self.assertEqual(config["services"], [])
+        order = [restore_command.index(fragment) for fragment in
+                 ("sha256sum", "-exec rm -rf {} +", "tar -xzf", ".stage-a-restore-receipt", "rm -f")]
+        self.assertEqual(order, sorted(order),
+                         "verify, wipe, extract, receipt, remove archive must stay in that order")
+        self.assertIn("! -name 'stage-a-backup.tgz*'", restore_command)
+
+    def test_restore_helper_hands_muninndb_a_data_directory_without_the_tarball(self):
+        """The two mount version extracted into a pristine volume. The fork does not give
+        that for free: without the final removal MuninnDB would be asked to open a store
+        with a 1.8 GB tarball sitting in it. set -eu means the removal is reached only on
+        success, so a failure still leaves the archive behind for diagnosis."""
+        identity = stage.build_identity("restore-clean"); calls = []
+        def runner(cmd, **kwargs):
+            calls.append(cmd); return subprocess.CompletedProcess(cmd, 0, "Machine ID: abcdef12345678\n", "")
+        stage.FlyRuntime(runner=runner).create_restore(identity, "vol_restore", stage.CANDIDATE_IMAGE, "/data/stage-a-backup.tgz")
+        command = json.loads(calls[0][calls[0].index("--machine-config") + 1])["init"]["exec"][2]
+        self.assertTrue(command.startswith("set -eu;"))
+        self.assertIn("rm -f \"$A\" \"$A.sha256\" \"$A.bytes\"", command)
+        self.assertLess(command.index(".stage-a-restore-receipt"), command.index("rm -f \"$A\""))
+        self.assertTrue(command.rstrip().endswith("-print -quit)\""),
+                        "the command must end by proving no archive remains")
 
     def test_hard_delete_helper_is_offline_and_scoped(self):
         identity = stage.build_identity("delete-test"); calls = []
@@ -1082,14 +1107,72 @@ class StageAContractTests(unittest.TestCase):
             stage.FlyRuntime(runner=runner).hard_delete(identity, "vol_source", stage.CANDIDATE_IMAGE, "stage-a-primary;bad", "id")
 
     def test_backup_helper_persists_archive_receipts_on_source_volume(self):
+        """One mount, so the archive is written beside the store rather than to a second
+        volume. MuninnDB's own backup subcommand still runs against the live store and the
+        size and checksum sidecars the restore side verifies are still produced."""
         identity = stage.build_identity("backup-test"); calls = []
         def runner(cmd, **kwargs):
             calls.append(cmd); return subprocess.CompletedProcess(cmd, 0, "Machine ID: abcdef12345678\n", "")
-        _, path = stage.FlyRuntime(runner=runner).create_backup(identity, "vol_source", "vol_backup", stage.CANDIDATE_IMAGE)
+        _, path = stage.FlyRuntime(runner=runner).create_backup(identity, "vol_source", stage.CANDIDATE_IMAGE)
         config = json.loads(calls[0][calls[0].index("--machine-config") + 1]); command = config["init"]["exec"][2]
-        self.assertEqual(path, "/backup/stage-a-backup.tgz")
-        self.assertEqual(config["mounts"], [{"path": "/data", "volume": "vol_source"}, {"path": "/backup", "volume": "vol_backup"}])
+        self.assertEqual(path, "/data/stage-a-backup.tgz")
+        self.assertEqual(config["mounts"], [{"path": "/data", "volume": "vol_source"}])
         self.assertIn("muninndb-server backup", command); self.assertIn("$A.sha256", command); self.assertIn("$A.bytes", command)
+
+    def test_no_machine_config_may_request_a_second_volume(self):
+        """Run 30202877942 passed every substantive gate, then died at the backup helper on
+        Fly's "invalid config.mounts, only 1 volume supported". create_backup mounted the
+        source and backup volumes together and create_restore mounted the backup and
+        restore volumes together, so both had been unlaunchable since the day they were
+        written; nothing before that run had ever reached them. The guard belongs at every
+        config construction site so the next such mistake fails here instead of two hours
+        into a rehearsal."""
+        identity = stage.build_identity("mount-guard")
+        def runner(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, 0, "Machine ID: abcdef12345678\n", "")
+        runtime = stage.FlyRuntime(runner=runner)
+        two = [{"volume": "vol_a", "path": "/data"}, {"volume": "vol_b", "path": "/backup"}]
+        with self.assertRaisesRegex(stage.RehearsalUnknown, "Fly machines take one"):
+            runtime._offline_helper(identity, stage.CANDIDATE_IMAGE, "backup", two, "true")
+        with self.assertRaisesRegex(stage.RehearsalUnknown, "requests 2 volumes"):
+            stage.require_single_mount(two, "restore-copy")
+        stage.require_single_mount(two[:1], "backup")
+        stage.require_single_mount([], "preflight-probe")
+        configs = []
+        def recording(cmd, **kwargs):
+            if "--machine-config" in cmd:
+                configs.append(json.loads(cmd[cmd.index("--machine-config") + 1]))
+            return subprocess.CompletedProcess(cmd, 0, "Machine ID: abcdef12345678\n", "")
+        live = stage.FlyRuntime(runner=recording)
+        live.create_backup(identity, "vol_source", stage.CANDIDATE_IMAGE)
+        live.create_restore(identity, "vol_restore", stage.CANDIDATE_IMAGE, "/data/stage-a-backup.tgz")
+        live.create_machine(identity, "vol_source", stage.BASELINE_IMAGE, "baseline")
+        self.assertEqual(len(configs), 3)
+        self.assertTrue(all(len(config["mounts"]) == 1 for config in configs),
+                        f"every launched config must mount one volume: {[c['mounts'] for c in configs]}")
+
+    def test_volume_fork_threads_a_snapshot_id_into_the_new_volume(self):
+        """The archive reaches the restore volume by fork, not by a second mount, so the
+        snapshot id has to survive into flyctl's argument list. The rollback path has always
+        relied on this and it was never covered."""
+        identity = stage.build_identity("fork-test"); calls = []
+        def runner(cmd, **kwargs):
+            calls.append(cmd)
+            if "snapshots" in cmd and "list" in cmd:
+                body = "[]" if len(calls) < 3 else json.dumps(
+                    [{"id": "vs_new", "status": "created", "created_at": "2026-07-26T00:00:00Z"}])
+                return subprocess.CompletedProcess(cmd, 0, body, "")
+            if "volumes" in cmd and "create" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, json.dumps({"id": "vol_forked"}), "")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        runtime = stage.FlyRuntime(runner=runner)
+        with mock.patch.object(stage.time, "sleep"):
+            snapshot_id = runtime.snapshot(identity, "vol_source", timeout_s=30, interval_s=1)
+        self.assertEqual(snapshot_id, "vs_new")
+        self.assertEqual(runtime.create_volume(identity, identity.restore_volume_name, snapshot_id=snapshot_id), "vol_forked")
+        created = [c for c in calls if "volumes" in c and "create" in c and "snapshots" not in c][0]
+        self.assertEqual(created[created.index("--snapshot-id") + 1], "vs_new")
+        self.assertIn("--scheduled-snapshots=false", created)
 
     def test_receipt_is_allowlisted_redacted_and_mode_0600(self):
         with tempfile.TemporaryDirectory() as root:

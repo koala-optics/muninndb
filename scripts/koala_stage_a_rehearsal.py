@@ -56,6 +56,9 @@ MAX_PEAK_BYTES, MIN_FREE_PERCENT = 14 * 1024**3, 30.0
 MIGRATION_LIMIT_S, READINESS_LIMIT_S = 45 * 60, 5 * 60
 EXEC_CANARY_TOKEN = "42"
 PROCESS_INVENTORY_CHARS = 600
+# The backup archive lives beside the store because a Fly machine mounts one volume, so
+# the helper that writes it cannot also mount a separate backup volume.
+BACKUP_ARCHIVE_DIR = "/data"
 # Sums CPU percent and RSS KiB over MuninnDB processes. Reads /proc/uptime as the first
 # input file so no command substitution is needed for uptime. Deliberately contains no
 # quote character of either kind and no backslash: single quotes delimit it for /bin/sh,
@@ -522,6 +525,21 @@ def combine_status(gates: dict[str, Gate], orphans: Sequence[str]) -> str:
     if any(g.status == "FAILED" for g in gates.values()): return "FAILED"
     return "PASSED"
 
+def require_single_mount(mounts: list[dict[str, str]], role: str) -> None:
+    """Refuse a machine config Fly cannot launch.
+
+    A Fly machine takes at most one volume. Run 30202877942 reached the backup helper
+    after passing every substantive gate and died on "invalid config.mounts, only 1
+    volume supported", because create_backup mounted the source and backup volumes
+    together and create_restore mounted the backup and restore volumes together. Both
+    were structurally impossible from the day they were written; nothing before that run
+    had ever reached them. Asserting here fails at config construction, in the unit
+    tests, rather than after a two-hour rehearsal.
+    """
+    if len(mounts) > 1:
+        raise RehearsalUnknown(f"{role} config requests {len(mounts)} volumes; Fly machines take one")
+
+
 def shell_command(script: str) -> str:
     """Wrap a shell script so that `flyctl machine exec` actually runs it in a shell.
 
@@ -773,7 +791,9 @@ class FlyRuntime:
         if volume_id in PRODUCTION_VOLUME_IDS: raise RehearsalUnknown("refusing production volume")
         validate_image(image, "baseline" if role in {"baseline", "rollback"} else "candidate", expected_candidate=self.candidate_ref)
         name = f"koala-stage-a-{identity.run_id}-{role}"
-        config = json.dumps({"image": image, "init": {"cmd": ["--daemon", "--data", "/data", "--listen-host", "0.0.0.0", "--mcp-addr", f"0.0.0.0:{MCP_PORT}"]}, "restart": {"policy": "no"}, "guest": {"cpu_kind": "performance", "cpus": 16, "memory_mb": 32768}, "mounts": [{"volume": volume_id, "path": "/data"}], "metadata": {"koala_stage_a_run": identity.run_id, "role": role}, "services": []}, sort_keys=True)
+        mounts = [{"volume": volume_id, "path": "/data"}]
+        require_single_mount(mounts, role)
+        config = json.dumps({"image": image, "init": {"cmd": ["--daemon", "--data", "/data", "--listen-host", "0.0.0.0", "--mcp-addr", f"0.0.0.0:{MCP_PORT}"]}, "restart": {"policy": "no"}, "guest": {"cpu_kind": "performance", "cpus": 16, "memory_mb": 32768}, "mounts": mounts, "metadata": {"koala_stage_a_run": identity.run_id, "role": role}, "services": []}, sort_keys=True)
         proc = self.run(["machine", "run", image, "-a", identity.app_name, "--region", FLY_REGION, "--name", name, "--machine-config", config, "--restart", "no", "--skip-dns-registration", "--detach"])
         matches = re.findall(r"(?m)^\s*Machine ID:\s*([0-9a-f]+)\s*$", proc.stdout)
         if len(matches) != 1 or matches[0] in PRODUCTION_MACHINE_IDS: raise RehearsalUnknown("invalid or preserved machine ID")
@@ -972,6 +992,7 @@ class FlyRuntime:
         raise RehearsalUnknown("snapshot creation deadline expired")
     def _offline_helper(self, identity: RunIdentity, image: str, role: str,
                         mounts: list[dict[str, str]], command: str) -> str:
+        require_single_mount(mounts, role)
         helper_name = f"koala-stage-a-{identity.run_id}-{role}"
         config = json.dumps({"image": image, "init": {"exec": ["/bin/sh", "-c", command]},
             "restart": {"policy": "no"}, "guest": {"cpu_kind": "performance", "cpus": 16, "memory_mb": 32768},
@@ -1021,18 +1042,26 @@ class FlyRuntime:
             raise RehearsalUnknown("machine exec shell canary failed; expected "
                                    f"{EXEC_CANARY_TOKEN!r}, output was {captured.strip()[:200]!r}")
         return captured.strip()
-    def create_backup(self, identity: RunIdentity, volume_id: str, backup_volume_id: str,
-                      image: str) -> tuple[str, str]:
+    def create_backup(self, identity: RunIdentity, volume_id: str, image: str) -> tuple[str, str]:
+        """Take a real MuninnDB backup, writing the archive onto the source volume.
+
+        A Fly machine mounts one volume, so the archive cannot be written to a second
+        volume here. It is written beside the store instead and reaches the restore volume
+        by volume fork, which is how the rollback path already moves a volume's contents
+        (create_volume --snapshot-id). What the gate measures is unchanged: MuninnDB's own
+        backup subcommand runs against the live store, and the archive's sha256 and byte
+        count are recorded for the restore side to verify.
+        """
         validate_image(image, "candidate", expected_candidate=self.candidate_ref)
-        if volume_id in PRODUCTION_VOLUME_IDS or backup_volume_id in PRODUCTION_VOLUME_IDS:
+        if volume_id in PRODUCTION_VOLUME_IDS:
             raise RehearsalUnknown("refusing production backup volume")
-        archive = "/backup/stage-a-backup.tgz"
-        command = ("set -eu; test -z \"$(find /backup -mindepth 1 -maxdepth 1 -print -quit)\"; "
-            "muninndb-server backup --data-dir /data --output /backup/stage-a-backup; "
-            "tar -C /backup/stage-a-backup -czf \"$A\" .; sha256sum \"$A\" | cut -d' ' -f1 > \"$A.sha256\"; "
-            "stat -c %s \"$A\" > \"$A.bytes\"; rm -rf /backup/stage-a-backup")
+        archive = f"{BACKUP_ARCHIVE_DIR}/stage-a-backup.tgz"
+        command = ("set -eu; rm -rf /data/stage-a-backup; "
+            "muninndb-server backup --data-dir /data --output /data/stage-a-backup; "
+            "tar -C /data/stage-a-backup -czf \"$A\" .; sha256sum \"$A\" | cut -d' ' -f1 > \"$A.sha256\"; "
+            "stat -c %s \"$A\" > \"$A.bytes\"; rm -rf /data/stage-a-backup")
         command = f"A={archive}; {command}"
-        mounts = [{"volume": volume_id, "path": "/data"}, {"volume": backup_volume_id, "path": "/backup"}]
+        mounts = [{"volume": volume_id, "path": "/data"}]
         return self._offline_helper(identity, image, "backup", mounts, command), archive
     def hard_delete(self, identity: RunIdentity, volume_id: str, image: str,
                     vault: str, memory_id: str) -> str:
@@ -1042,18 +1071,40 @@ class FlyRuntime:
         command = (f"set -eu; muninndb-server exec forget --data-dir /data "
             f"--vault {vault} --id {memory_id}")
         return self._offline_helper(identity, image, "hard-delete", [{"volume": volume_id, "path": "/data"}], command)
-    def create_restore(self, identity: RunIdentity, backup_volume_id: str, restore_volume_id: str,
+    def create_restore(self, identity: RunIdentity, restore_volume_id: str,
                        image: str, archive_path: str) -> str:
+        """Reconstitute the store from the archive alone, on a fork of the backup volume.
+
+        The restore volume is a fork of the volume the backup was written to, so it arrives
+        carrying BOTH the archive and a copy of the original store. Leaving that copy in
+        place would mean the queries downstream proved only that a volume fork works. The
+        store is therefore deleted before extraction, and everything downstream then reads
+        a store that only the archive could have produced, which is a stricter test of the
+        backup than the two-mount copy it replaces.
+
+        The archive and its two sidecars are removed only at the very end, after the
+        receipt that records their size and checksum has been written. Under `set -eu`
+        that point is reached only if every step succeeded, so a failure at any stage
+        leaves the archive in place for diagnosis, while a success hands the restore
+        machine a data directory holding nothing but what the archive produced. That
+        matters because the two-mount version extracted into a pristine volume, and
+        MuninnDB would otherwise be asked to open a store littered with a 1.8 GB tarball
+        it has never seen. The empty-target precondition the two-mount version asserted is
+        replaced by an explicit wipe, since the fork guarantees the target is NOT empty.
+        """
         validate_image(image, "candidate", expected_candidate=self.candidate_ref)
-        if backup_volume_id in PRODUCTION_VOLUME_IDS or restore_volume_id in PRODUCTION_VOLUME_IDS:
+        if restore_volume_id in PRODUCTION_VOLUME_IDS:
             raise RehearsalUnknown("refusing production restore volume")
         command = (f"set -eu; A={archive_path}; test -f \"$A\"; test -f \"$A.sha256\"; "
             "test -f \"$A.bytes\"; test \"$(sha256sum \"$A\" | cut -d' ' -f1)\" = \"$(cat \"$A.sha256\")\"; "
-            "test -z \"$(find /restore -mindepth 1 -maxdepth 1 -print -quit)\"; "
-            "tar -xzf \"$A\" -C /restore; "
-            "printf 'bytes=' > /restore/.stage-a-restore-receipt; cat \"$A.bytes\" >> /restore/.stage-a-restore-receipt; "
-            "printf 'sha256=' >> /restore/.stage-a-restore-receipt; cat \"$A.sha256\" >> /restore/.stage-a-restore-receipt")
-        mounts = [{"volume": backup_volume_id, "path": "/backup"}, {"volume": restore_volume_id, "path": "/restore"}]
+            "find /data -mindepth 1 -maxdepth 1 ! -name 'stage-a-backup.tgz*' -exec rm -rf {} +; "
+            "test -z \"$(find /data -mindepth 1 -maxdepth 1 ! -name 'stage-a-backup.tgz*' -print -quit)\"; "
+            "tar -xzf \"$A\" -C /data; "
+            "printf 'bytes=' > /data/.stage-a-restore-receipt; cat \"$A.bytes\" >> /data/.stage-a-restore-receipt; "
+            "printf 'sha256=' >> /data/.stage-a-restore-receipt; cat \"$A.sha256\" >> /data/.stage-a-restore-receipt; "
+            "rm -f \"$A\" \"$A.sha256\" \"$A.bytes\"; "
+            "test -z \"$(find /data -maxdepth 1 -name 'stage-a-backup.tgz*' -print -quit)\"")
+        mounts = [{"volume": restore_volume_id, "path": "/data"}]
         return self._offline_helper(identity, image, "restore-copy", mounts, command)
     def backup_measurement(self, identity: RunIdentity, machine_id: str) -> dict[str, Any]:
         proc = self.run(["machine", "exec", machine_id, "-a", identity.app_name, "--timeout", "60",
@@ -1612,14 +1663,19 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
         if hard_delete_counts != expected_after_delete: raise RehearsalFailed("hard-delete count delta was not exactly one")
         gates["hard_delete_cleanup"] = Gate("PASSED", "offline hard delete removed primary and reverse-index reachability")
         runtime.stop_machine(identity, ledger.machine_id); runtime.destroy_machine(identity, ledger.machine_id); ledger.machine_id = None
-        backup_started = time.monotonic(); ledger.backup_volume_id = runtime.create_volume(identity, identity.backup_volume_name)
-        backup_helper, backup_path = runtime.create_backup(identity, ledger.volume_id, ledger.backup_volume_id, candidate_ref)
+        backup_started = time.monotonic()
+        backup_helper, backup_path = runtime.create_backup(identity, ledger.volume_id, candidate_ref)
         ledger.machine_id = backup_helper; runtime.wait_stopped(identity, backup_helper, RESTORE_LIMIT_S)
         measurements["backup_duration_s"] = time.monotonic() - backup_started
         runtime.destroy_machine(identity, backup_helper); ledger.machine_id = None
         restore_started = time.monotonic()
-        ledger.restore_volume_id = runtime.create_volume(identity, identity.restore_volume_name)
-        restore_helper = runtime.create_restore(identity, ledger.backup_volume_id, ledger.restore_volume_id, candidate_ref, backup_path)
+        # The archive is on the source volume, and a Fly machine mounts one volume, so it
+        # reaches the restore volume by fork rather than by a second mount. The restore
+        # helper then deletes the forked store and rebuilds it from the archive alone.
+        backup_snapshot_id = runtime.snapshot(identity, ledger.volume_id)
+        measurements["backup_snapshot_id"] = backup_snapshot_id
+        ledger.restore_volume_id = runtime.create_volume(identity, identity.restore_volume_name, snapshot_id=backup_snapshot_id)
+        restore_helper = runtime.create_restore(identity, ledger.restore_volume_id, candidate_ref, backup_path)
         ledger.machine_id = restore_helper; runtime.wait_stopped(identity, restore_helper, RESTORE_LIMIT_S)
         runtime.destroy_machine(identity, restore_helper); ledger.machine_id = None
         ledger.machine_id = runtime.create_machine(identity, ledger.restore_volume_id, candidate_ref, "restore"); runtime.wait_ready(identity, ledger.machine_id, READINESS_LIMIT_S)

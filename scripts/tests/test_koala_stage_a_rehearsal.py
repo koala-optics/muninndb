@@ -1342,8 +1342,23 @@ class StageAContractTests(unittest.TestCase):
     def test_cleanup_uncertainty_forces_orphan(self):
         identity = stage.build_identity("cleanup-test"); runtime = mock.Mock()
         runtime.destroy_machine.side_effect = RuntimeError("fail"); runtime.list_owned_resources.return_value = []
-        _, orphans = stage.cleanup(runtime, identity, stage.ResourceLedger(machine_id="owned-machine"))
+        with mock.patch.object(stage, "DESTROY_RETRY_DELAY_S", 0):
+            results, orphans = stage.cleanup(runtime, identity, stage.ResourceLedger(machine_id="owned-machine"))
         self.assertEqual(orphans, ["owned-machine"])
+        self.assertEqual(runtime.destroy_machine.call_count, stage.DESTROY_ATTEMPTS)
+        self.assertIn("fail", results["machine_id_error"])
+
+    def test_a_transient_destroy_failure_is_retried_instead_of_leaking(self):
+        identity = stage.build_identity("cleanup-retry"); runtime = mock.Mock()
+        runtime.destroy_volume.side_effect = [RuntimeError("volume still attached"), None]
+        runtime.list_owned_resources.return_value = []
+        with mock.patch.object(stage, "DESTROY_RETRY_DELAY_S", 0):
+            results, orphans = stage.cleanup(
+                runtime, identity, stage.ResourceLedger(restore_volume_id="vol_restore"))
+        self.assertEqual(orphans, [])
+        self.assertEqual(results["restore_volume_id"], "destroyed")
+        self.assertNotIn("restore_volume_id_error", results)
+        self.assertEqual(runtime.destroy_volume.call_count, 2)
 
     def test_cleanup_discovery_is_exact_and_absent_is_idempotent(self):
         identity = stage.build_identity("discover-test")
@@ -1509,6 +1524,37 @@ class StageAContractTests(unittest.TestCase):
         self.assertEqual(document["detail"], "local proxy cleanup uncertain")
         runtime.destroy_machine.assert_called_once_with(identity, "machine_owned")
         runtime.destroy_volume.assert_called_once_with(identity, "vol_owned")
+        runtime.destroy_app.assert_called_once_with(identity)
+
+    def test_an_orphan_no_longer_erases_the_reason_the_run_ended(self):
+        identity = stage.build_identity("calibrate-orphan")
+        spec = stage.CorpusSpec(
+            stage.CALIBRATION_SAMPLE_COUNT, 50,
+            stage.CALIBRATION_LOW_PAYLOAD_BYTES, "test-seed",
+        )
+        runtime = mock.Mock()
+        runtime.create_app.return_value = identity.app_name
+        runtime.create_volume.return_value = "vol_owned"
+        runtime.create_machine.return_value = "machine_owned"
+        runtime.disk_sample.return_value = stage.DiskSample("empty", 100, 900, 1000)
+        runtime.list_owned_resources.return_value = []
+        runtime.destroy_volume.side_effect = RuntimeError("volume still attached")
+        client = mock.Mock()
+        client.initialize.side_effect = stage.RehearsalUnknown("candidate never answered")
+        with tempfile.TemporaryDirectory() as root, \
+                mock.patch.object(stage, "DESTROY_RETRY_DELAY_S", 0):
+            path = Path(root) / "orphan-detail.json"
+            self.assertEqual(stage.calibrate(
+                identity, spec, path, runtime=runtime,
+                client_factory=lambda _url, _auth: client,
+            ), 2)
+            document = json.loads(path.read_text())
+        self.assertEqual(document["status"], "UNKNOWN")
+        self.assertEqual(document["orphans"], ["vol_owned"])
+        self.assertIn("candidate never answered", document["detail"])
+        self.assertIn("cleanup", document["detail"])
+        self.assertIn("volume still attached", document["cleanup"]["volume_id_error"])
+        self.assertEqual(runtime.destroy_volume.call_count, stage.DESTROY_ATTEMPTS)
         runtime.destroy_app.assert_called_once_with(identity)
 
     def test_calibration_orchestration_uses_baseline_only_and_cleans_up(self):

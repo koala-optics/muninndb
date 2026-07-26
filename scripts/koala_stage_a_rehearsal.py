@@ -90,6 +90,7 @@ FUZZY_PASSES = 3
 RESTORE_LIMIT_S, ROLLBACK_LIMIT_S = 45 * 60, 30 * 60
 SNAPSHOT_LIMIT_S, SNAPSHOT_POLL_INTERVAL_S = 10 * 60, 5.0
 HELPER_POLL_INTERVAL_S, HELPER_STATUS_RETRIES = 5.0, 5
+DESTROY_ATTEMPTS, DESTROY_RETRY_DELAY_S = 3, 5.0
 FLY_REGION, FLY_ORG, MCP_PORT = "ewr", "personal", 8750
 BASELINE_IMAGE = "registry.fly.io/koala-muninndb:deployment-01KSWRX9GKW5M94MQQCBZSJZHS"
 BASELINE_DIGEST = "sha256:c06842e1452f2aab4c1f01207adf9406bfe757b4984da516568006f1f5c8ad86"
@@ -1294,15 +1295,53 @@ def terminate_proxy(proxy: subprocess.Popen[str] | None) -> None:
         except (OSError, subprocess.SubprocessError) as exc:
             raise RehearsalUnknown("local proxy could not be terminated") from exc
 
+def with_cleanup_concern(detail: str, orphans: list[str]) -> str:
+    """Add the cleanup concern to a detail without discarding the reason the run ended.
+
+    Cleanup runs in a finally block, so it observes every outcome including a phase that
+    raised. Overwriting the detail there let the last thing that happened describe the run
+    instead of the thing that ended it: run 30217281791 reached the restore phase, failed
+    inside it, and reported only "cleanup uncertainty or orphaned resources", so the error
+    was absent from the receipt and from the workflow log, and could not be recovered at
+    all. The orphan list is already its own receipt field, so the detail names the concern
+    and leaves the enumeration there.
+
+    An orphan still forces UNKNOWN at every caller. A resource that may have survived the
+    run is not a passing rehearsal, and nothing here softens that.
+    """
+    return safe_detail(f"{detail} || cleanup: {len(orphans)} resource(s) may remain", RECEIPT_DETAIL_CHARS)
+
 def cleanup(runtime: FlyRuntime, identity: RunIdentity, ledger: ResourceLedger) -> tuple[dict[str, str], list[str]]:
+    """Destroy the run's own resources, retrying a failed destroy and recording why it failed.
+
+    Machines are destroyed before the volumes they mount, so a volume destroy can arrive
+    while the platform still considers the volume attached. Run 30217281791 lost its
+    verdict to exactly that: the restore volume's destroy failed once and was reported as
+    an orphan, with no reason recorded and no second attempt. A bounded retry answers the
+    transient case, and any resource that still refuses to go is a possible leak that must
+    keep failing the run rather than being assumed away.
+
+    The failure text is kept beside the status because "destroy_failed" alone cannot
+    distinguish a detach race from a credential or quota fault, and the two need different
+    responses. It goes through the same redaction predicate as every other diagnostic.
+    """
     results, orphans = {}, []
     for label in ("machine_id", "restore_volume_id", "backup_volume_id", "rollback_volume_id", "volume_id"):
         resource = getattr(ledger, label)
         if not resource: results[label] = "not_created"; continue
-        try:
-            runtime.destroy_machine(identity, resource) if label == "machine_id" else runtime.destroy_volume(identity, resource)
-            results[label] = "destroyed"; setattr(ledger, label, None)
-        except Exception: results[label] = "destroy_failed"; orphans.append(resource)
+        failure: Exception | None = None
+        for attempt in range(DESTROY_ATTEMPTS):
+            try:
+                runtime.destroy_machine(identity, resource) if label == "machine_id" else runtime.destroy_volume(identity, resource)
+                failure = None; break
+            except Exception as exc:
+                failure = exc
+                if attempt + 1 < DESTROY_ATTEMPTS: time.sleep(DESTROY_RETRY_DELAY_S)
+        if failure is None: results[label] = "destroyed"; setattr(ledger, label, None)
+        else:
+            results[label] = "destroy_failed"
+            results[f"{label}_error"] = safe_detail(f"{type(failure).__name__}: {failure}")
+            orphans.append(resource)
     if ledger.app:
         try: runtime.destroy_app(identity); results["app"] = "destroyed"; ledger.app = None
         except Exception: results["app"] = "destroy_failed"; orphans.append(identity.app_name)
@@ -1579,7 +1618,7 @@ def calibrate(
         try: terminate_proxy(proxy)
         except RehearsalError: status, exit_code, detail = "UNKNOWN", 2, "local proxy cleanup uncertain"
         cleanup_result, orphans = cleanup(runtime, identity, ledger)
-        if orphans: status, exit_code, detail = "UNKNOWN", 2, "cleanup uncertainty or orphaned resources"
+        if orphans: status, exit_code, detail = "UNKNOWN", 2, with_cleanup_concern(detail, orphans)
         write_receipt(receipt_path, receipt_document(
             identity, spec, status=status, exit_code=exit_code, detail=detail, ledger=ledger,
             measurements=measurements, gates=gates, cleanup_result=cleanup_result,
@@ -1664,7 +1703,7 @@ def ablate(
         try: terminate_proxy(proxy)
         except RehearsalError: status, exit_code, detail = "UNKNOWN", 2, "local proxy cleanup uncertain"
         cleanup_result, orphans = cleanup(runtime, identity, ledger)
-        if orphans: status, exit_code, detail = "UNKNOWN", 2, "cleanup uncertainty or orphaned resources"
+        if orphans: status, exit_code, detail = "UNKNOWN", 2, with_cleanup_concern(detail, orphans)
         write_receipt(receipt_path, receipt_document(
             identity, receipt_spec, status=status, exit_code=exit_code, detail=detail, ledger=ledger,
             measurements=measurements, gates=gates, cleanup_result=cleanup_result,
@@ -1834,7 +1873,7 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
         except RehearsalError: status, exit_code, detail = "UNKNOWN", 2, "local proxy cleanup uncertain"
         cleanup_result, orphans = cleanup(runtime, identity, ledger); computed = combine_status(gates, orphans)
         if detail == "all measured Stage A phases completed": status, exit_code = computed, 0 if computed == "PASSED" else (1 if computed == "FAILED" else 2)
-        if orphans: status, exit_code, detail = "UNKNOWN", 2, "cleanup uncertainty or orphaned resources"
+        if orphans: status, exit_code, detail = "UNKNOWN", 2, with_cleanup_concern(detail, orphans)
         write_receipt(receipt_path, receipt_document(
             identity, spec, status=status, exit_code=exit_code, detail=detail, ledger=ledger,
             measurements=measurements, gates=gates, cleanup_result=cleanup_result,

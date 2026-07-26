@@ -56,6 +56,8 @@ MAX_PEAK_BYTES, MIN_FREE_PERCENT = 14 * 1024**3, 30.0
 MIGRATION_LIMIT_S, READINESS_LIMIT_S = 45 * 60, 5 * 60
 EXEC_CANARY_TOKEN = "42"
 PROCESS_INVENTORY_CHARS = 600
+STALL_DIAGNOSTIC_LINES = 20
+SAFE_DETAIL_CHARS, RECEIPT_DETAIL_CHARS = 400, 1600
 # The backup archive lives beside the store because a Fly machine mounts one volume, so
 # the helper that writes it cannot also mount a separate backup volume.
 BACKUP_ARCHIVE_DIR = "/data"
@@ -571,8 +573,15 @@ def shell_command(script: str) -> str:
         raise RehearsalUnknown("shell command must not contain a backslash; it does not survive transport")
     return f'/bin/sh -c "{script}"'
 
-def safe_detail(value: str) -> str:
-    compact = " ".join(value.split())[-400:]
+def safe_detail(value: str, limit: int = SAFE_DETAIL_CHARS) -> str:
+    """Compact a diagnostic to a bounded tail, blanking it entirely if anything matches.
+
+    The limit is a verbosity bound, not a safety one. Redaction is decided by
+    SENSITIVE_TEXT over whatever survives truncation, so a longer limit widens what is
+    checked as well as what is emitted and can never let through something a shorter one
+    would have caught. Only the budget varies by caller; the predicate never does.
+    """
+    compact = " ".join(value.split())[-limit:]
     return "[REDACTED: sensitive diagnostic omitted]" if SENSITIVE_TEXT.search(compact) else compact
 
 def atomic_write_json(path: Path, value: dict[str, Any]) -> None:
@@ -590,7 +599,10 @@ def write_receipt(path: Path, receipt: dict[str, Any]) -> str:
     if unknown: raise RehearsalUnknown(f"receipt has unapproved keys: {sorted(unknown)}")
     sanitized = json.loads(json.dumps(receipt))
     for key, value in list(sanitized.items()):
-        if isinstance(value, str): sanitized[key] = safe_detail(value)
+        # "detail" carries the cause of an UNKNOWN, which now includes the stalled-helper
+        # reading, and a 400 character tail truncated that back to the last probe. It gets a
+        # wider budget than the other fields, which are short by construction.
+        if isinstance(value, str): sanitized[key] = safe_detail(value, RECEIPT_DETAIL_CHARS if key == "detail" else SAFE_DETAIL_CHARS)
     atomic_write_json(path, sanitized); digest = hashlib.sha256(path.read_bytes()).hexdigest()
     hash_path = path.with_suffix(path.suffix + ".sha256")
     fd, temporary = tempfile.mkstemp(prefix=f".{hash_path.name}.", dir=hash_path.parent)
@@ -810,10 +822,63 @@ class FlyRuntime:
             if self.machine_status(identity, machine_id).get("state") == "started": return time.monotonic() - started
             time.sleep(5)
         raise RehearsalUnknown("readiness deadline expired")
+    def stalled_helper_diagnostics(self, identity: RunIdentity, machine_id: str) -> str:
+        """Describe a helper that is still running past its deadline, before it is destroyed.
+
+        Run 30206002340 spent 45 minutes waiting for the backup helper to stop, then
+        destroyed it during cleanup, so the only surviving evidence was the deadline
+        message itself. Nothing said whether the backup command had hung, was merely slow,
+        or had finished while the machine failed to exit. The helper is still running at
+        this point, so its logs, its process table and its data directory are all still
+        readable, and each answers a different one of those three questions:
+
+        - the command's own stdout and stderr say how far it got
+        - a live muninndb-server or tar process means it hung inside that step
+        - a checkpoint directory or a partial archive shows what had been produced
+
+        Every probe is best effort and bounded. A diagnostic that raised, or that hung,
+        would replace the real failure with its own, so each one swallows its exception
+        and reports the reason inline instead.
+        """
+        parts: list[str] = []
+        def probe(label: str, argv: list[str]) -> None:
+            try:
+                text = self.run(argv, timeout=60).stdout.strip()
+            except Exception as exc:  # a diagnostic must never replace the failure it describes
+                parts.append(f"{label}=<unavailable: {safe_detail(str(exc))}>"); return
+            lines = [safe_detail(line) for line in text.splitlines()[-STALL_DIAGNOSTIC_LINES:] if line.strip()]
+            parts.append(f"{label}={' / '.join(lines)}" if lines else f"{label}=<empty>")
+        # Redaction is applied per line rather than to the whole capture. safe_detail blanks
+        # its entire input when any part matches, and both of these probes reliably contain a
+        # match that is not itself a secret: the store holds a file named auth_secret, and
+        # server log lines carry a URL. Redacting the blob would therefore return
+        # "[REDACTED]" in precisely the case this exists to explain. Per line, a matching
+        # line still redacts whole and is never emitted; only its neighbours survive. The
+        # predicate is unchanged, so nothing SENSITIVE_TEXT would have caught gets through.
+        probe("logs", ["logs", "-a", identity.app_name, "--machine", machine_id, "--no-tail"])
+        # The two artifact paths are named rather than listed, both to keep the reading
+        # targeted and to avoid emitting the store's own filenames. A checkpoint directory
+        # that exists and is growing means the backup step is slow rather than wedged; a
+        # partial archive means tar is; neither present means it never got that far.
+        probe("artifacts", ["machine", "exec", machine_id, "-a", identity.app_name, "--timeout", "30",
+                            shell_command("du -sk /data/stage-a-backup 2>/dev/null; "
+                                          "ls -o /data/stage-a-backup.tgz 2>/dev/null; "
+                                          "df -Pk /data | tail -1")])
+        try:
+            parts.append(f"processes={self.process_names(identity, machine_id)}")
+        except Exception as exc:
+            parts.append(f"processes=<unavailable: {safe_detail(str(exc))}>")
+        return " | ".join(parts)
+
     def wait_stopped(self, identity: RunIdentity, machine_id: str, timeout_s: float) -> float:
         started = time.monotonic()
-        self.run(["machine", "wait", machine_id, "-a", identity.app_name, "--state", "stopped",
-                  "--wait-timeout", f"{math.ceil(timeout_s)}s"], timeout=math.ceil(timeout_s) + 30)
+        try:
+            self.run(["machine", "wait", machine_id, "-a", identity.app_name, "--state", "stopped",
+                      "--wait-timeout", f"{math.ceil(timeout_s)}s"], timeout=math.ceil(timeout_s) + 30)
+        except RehearsalUnknown as exc:
+            raise RehearsalUnknown(
+                f"{exc} || helper still running at deadline: "
+                f"{self.stalled_helper_diagnostics(identity, machine_id)}") from exc
         status = self.run(["machine", "status", machine_id, "-a", identity.app_name], timeout=60).stdout
         exit_codes = re.findall(r"exit_code\s*[=:]\s*([0-9]+)", status)
         if not exit_codes: raise RehearsalUnknown("offline helper exit code missing")
@@ -1219,7 +1284,7 @@ def cleanup_only(
         if orphans: detail = "cleanup uncertainty or orphaned resources"
         else: status, exit_code, detail = "PASSED", 0, "run-owned resources absent after cleanup"
     except RehearsalError as exc:
-        detail = safe_detail(str(exc))
+        detail = safe_detail(str(exc), RECEIPT_DETAIL_CHARS)
         orphans = [f"{identity.run_id}:cleanup-discovery-unknown"]
     except Exception as exc:
         detail = f"unexpected {type(exc).__name__}"
@@ -1444,7 +1509,7 @@ def calibrate(
             detail = "calibration completed; full Stage A remains separately gated"
         status = combine_status(gates, [])
         exit_code = 0 if status == "PASSED" else (1 if status == "FAILED" else 2)
-    except RehearsalError as exc: status, exit_code, detail = exc.status, 1 if exc.status == "FAILED" else 2, safe_detail(str(exc))
+    except RehearsalError as exc: status, exit_code, detail = exc.status, 1 if exc.status == "FAILED" else 2, safe_detail(str(exc), RECEIPT_DETAIL_CHARS)
     except Exception as exc: status, exit_code, detail = "UNKNOWN", 2, f"unexpected {type(exc).__name__}"
     finally:
         try: terminate_proxy(proxy)
@@ -1529,7 +1594,7 @@ def ablate(
         gates["ablation_evidence"] = Gate("PASSED", "four independent settled baseline cohorts measured", len(samples), len(ABLATION_COHORTS))
         status, exit_code = "PASSED", 0
         detail = "storage ablation completed; full Stage A was not run"
-    except RehearsalError as exc: status, exit_code, detail = exc.status, 1 if exc.status == "FAILED" else 2, safe_detail(str(exc))
+    except RehearsalError as exc: status, exit_code, detail = exc.status, 1 if exc.status == "FAILED" else 2, safe_detail(str(exc), RECEIPT_DETAIL_CHARS)
     except Exception as exc: status, exit_code, detail = "UNKNOWN", 2, f"unexpected {type(exc).__name__}"
     finally:
         try: terminate_proxy(proxy)
@@ -1698,7 +1763,7 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
         measurements["rollback_latencies"] = {name: latency_summary(values) for name, values in rollback_samples.items()}
         measurements["rollback_check_s"] = time.monotonic() - rollback_started; gates["pre_migration_rollback"] = threshold_gate("pre-migration rollback", measurements["rollback_check_s"], ROLLBACK_LIMIT_S)
         detail = "all measured Stage A phases completed"
-    except RehearsalError as exc: status, exit_code, detail = exc.status, 1 if exc.status == "FAILED" else 2, safe_detail(str(exc))
+    except RehearsalError as exc: status, exit_code, detail = exc.status, 1 if exc.status == "FAILED" else 2, safe_detail(str(exc), RECEIPT_DETAIL_CHARS)
     except Exception as exc: status, exit_code, detail = "UNKNOWN", 2, f"unexpected {type(exc).__name__}"
     finally:
         try: terminate_proxy(proxy)

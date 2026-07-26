@@ -1174,6 +1174,93 @@ class StageAContractTests(unittest.TestCase):
         self.assertEqual(created[created.index("--snapshot-id") + 1], "vs_new")
         self.assertIn("--scheduled-snapshots=false", created)
 
+    def _stalling_runtime(self, log_text="starting backup\ncheckpoint written", artifacts="4096 /data/stage-a-backup"):
+        """A runtime whose helper never stops, with every diagnostic probe answering."""
+        def runner(cmd, **kwargs):
+            joined = " ".join(cmd)
+            if "wait" in cmd:
+                return subprocess.CompletedProcess(cmd, 1, "", 'machine 7844153a692078 did not reach "stopped" within 45m0s: currently started')
+            if "logs" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, log_text, "")
+            if "exec" in cmd and "du -sk" in joined:
+                return subprocess.CompletedProcess(cmd, 0, artifacts, "")
+            if "exec" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, "muninndb-server tar", "")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        return stage.FlyRuntime(runner=runner)
+
+    def test_a_stalled_helper_is_described_before_it_is_destroyed(self):
+        """Run 30206002340 waited 45 minutes for the backup helper, destroyed it during
+        cleanup, and left the deadline message as the only evidence. The helper is still
+        running when the deadline expires, so the reading has to happen there or not at
+        all."""
+        identity = stage.build_identity("stall-test")
+        with self.assertRaises(stage.RehearsalUnknown) as caught:
+            self._stalling_runtime().wait_stopped(identity, "7844153a692078", 45 * 60)
+        detail = str(caught.exception)
+        self.assertIn('did not reach "stopped"', detail)        # the original failure survives
+        self.assertIn("checkpoint written", detail)             # what the command last said
+        self.assertIn("/data/stage-a-backup", detail)           # how far the archive got
+        self.assertIn("processes=muninndb-server,tar", detail)  # which step is still live
+
+    def test_stall_diagnostics_redact_per_line_without_blanking_the_capture(self):
+        """safe_detail blanks its whole input on one match, and a real capture reliably
+        contains one: the store holds a file named auth_secret and server lines carry a URL.
+        Whole-blob redaction would return [REDACTED] in exactly the case being explained, so
+        the matching line must redact alone."""
+        identity = stage.build_identity("stall-redact")
+        runtime = self._stalling_runtime(log_text="opening store\nlistening on http://10.0.0.1:8080\ntar: write error")
+        with self.assertRaises(stage.RehearsalUnknown) as caught:
+            runtime.wait_stopped(identity, "7844153a692078", 60)
+        detail = str(caught.exception)
+        self.assertNotIn("10.0.0.1", detail)          # the matching line never escapes
+        self.assertIn("[REDACTED", detail)            # and announces that it was dropped
+        self.assertIn("opening store", detail)        # its neighbours are still readable
+        self.assertIn("tar: write error", detail)
+
+    def test_stall_diagnostics_never_replace_the_failure_they_describe(self):
+        """A probe that fails must not become the reported cause. Every one of them is dead
+        here and the deadline is still what surfaces."""
+        identity = stage.build_identity("stall-blind")
+        def runner(cmd, **kwargs):
+            if "wait" in cmd:
+                return subprocess.CompletedProcess(cmd, 1, "", 'did not reach "stopped" within 45m0s')
+            raise subprocess.TimeoutExpired(cmd, 60)
+        with self.assertRaises(stage.RehearsalUnknown) as caught:
+            stage.FlyRuntime(runner=runner).wait_stopped(identity, "7844153a692078", 60)
+        detail = str(caught.exception)
+        self.assertIn('did not reach "stopped"', detail)
+        self.assertEqual(detail.count("<unavailable"), 3)
+
+    def test_safe_detail_budget_is_verbosity_only_and_never_relaxes_the_predicate(self):
+        """The wider budget widens what is checked as well as what is emitted, so a match
+        anywhere in the retained tail still blanks the whole field at either size."""
+        head = 'did not reach "stopped" at deadline '
+        long_reading = head + "z" * 800
+        self.assertNotIn(head.strip(), stage.safe_detail(long_reading))                              # default budget cuts the head
+        self.assertIn(head.strip(), stage.safe_detail(long_reading, stage.RECEIPT_DETAIL_CHARS))     # the receipt budget keeps it
+        for limit in (stage.SAFE_DETAIL_CHARS, stage.RECEIPT_DETAIL_CHARS):
+            self.assertEqual(stage.safe_detail("z" * 300 + " bearer abc", limit),
+                             "[REDACTED: sensitive diagnostic omitted]")
+
+    def test_receipt_detail_keeps_the_whole_stall_reading_and_still_redacts(self):
+        """A 400 character tail truncated the stalled-helper reading back to its last probe,
+        discarding both the deadline message and the logs. The wider budget is verbosity
+        only, so a secret inside it must still blank the field."""
+        with tempfile.TemporaryDirectory() as root:
+            base = {key: None for key in stage.RECEIPT_KEYS}
+            path = Path(root) / "wide.json"
+            detail = 'did not reach "stopped" ' + "logs=" + "x" * 900 + " processes=muninndb-server"
+            stage.write_receipt(path, {**base, "schema_version": 1, "status": "UNKNOWN", "detail": detail, "orphans": []})
+            written = json.loads(path.read_text())["detail"]
+            self.assertIn('did not reach "stopped"', written)   # the head is no longer cut off
+            self.assertIn("processes=muninndb-server", written)  # and the tail still survives
+            self.assertLessEqual(len(written), stage.RECEIPT_DETAIL_CHARS)
+            leaky = Path(root) / "leaky.json"
+            stage.write_receipt(leaky, {**base, "schema_version": 1, "status": "UNKNOWN", "orphans": [],
+                                        "detail": "y" * 500 + " authorization=abc"})
+            self.assertEqual(json.loads(leaky.read_text())["detail"], "[REDACTED: sensitive diagnostic omitted]")
+
     def test_receipt_is_allowlisted_redacted_and_mode_0600(self):
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / "receipt.json"

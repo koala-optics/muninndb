@@ -1232,6 +1232,32 @@ class StageAContractTests(unittest.TestCase):
         self.assertIn('did not reach "stopped"', detail)
         self.assertEqual(detail.count("<unavailable"), 3)
 
+    def test_every_fuzzy_context_actually_matches_a_primary_vault_record(self):
+        """A context matching nothing still returns a latency, and a fast one, so a stale
+        name would quietly drag the tail down instead of failing. The set is pinned to what
+        record_for actually emits rather than to a comment."""
+        spec, live = stage.CorpusSpec(), set()
+        for index in range(stage.MIN_RECORD_COUNT):
+            if stage.probe_kind(index) is None: continue   # only probe records carry entities
+            record = stage.record_for(spec, index)
+            if record["vault"] != "stage-a-primary": continue
+            for entity in record["memory"].get("entities", []): live.add(entity["name"])
+        self.assertTrue(live, "corpus emitted no primary-vault entity names at all")
+        for context in stage.FUZZY_CONTEXTS:
+            for term in context:
+                self.assertIn(term, live, f"fuzzy context {term!r} matches no primary-vault record")
+
+    def test_fuzzy_latency_is_sampled_enough_times_to_be_a_percentile(self):
+        """Two samples made the gate's p95 the slower of two readings. Run 30206002340
+        failed at 263.191 and run 30202877942 passed at 214.356 on that same instrument;
+        neither measured a distribution."""
+        self.assertGreaterEqual(stage.FUZZY_PASSES * len(stage.FUZZY_CONTEXTS), 20)
+        order = [c for _ in range(stage.FUZZY_PASSES) for c in stage.FUZZY_CONTEXTS]
+        self.assertEqual(len(set(order)), len(stage.FUZZY_CONTEXTS))       # every context used
+        self.assertTrue(all(a != b for a, b in zip(order, order[1:])),     # repeats interleaved,
+                        "a context repeats back to back and would read warm")  # never consecutive
+        self.assertEqual(stage.QUERY_P95_LIMIT_MS, 250.0)                  # threshold NOT relaxed
+
     def test_safe_detail_budget_is_verbosity_only_and_never_relaxes_the_predicate(self):
         """The wider budget widens what is checked as well as what is emitted, so a match
         anywhere in the retained tail still blanks the whole field at either size."""

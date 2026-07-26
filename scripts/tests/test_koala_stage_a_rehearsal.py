@@ -1196,12 +1196,19 @@ class StageAContractTests(unittest.TestCase):
                 return subprocess.CompletedProcess(cmd, 0, body, "")
             if "volumes" in cmd and "create" in cmd:
                 return subprocess.CompletedProcess(cmd, 0, json.dumps({"id": "vol_forked"}), "")
+            if "volumes" in cmd and "list" in cmd:
+                # A fork is created hydrating and is only mountable once it reads `created`,
+                # so create_volume now polls it and the fake has to answer that poll.
+                state = "restoring" if volume_polls.append(1) or len(volume_polls) < 2 else "created"
+                return subprocess.CompletedProcess(cmd, 0, json.dumps([{"id": "vol_forked", "state": state}]), "")
             return subprocess.CompletedProcess(cmd, 0, "", "")
+        volume_polls: list[int] = []
         runtime = stage.FlyRuntime(runner=runner)
         with mock.patch.object(stage.time, "sleep"):
             snapshot_id = runtime.snapshot(identity, "vol_source", timeout_s=30, interval_s=1)
-        self.assertEqual(snapshot_id, "vs_new")
-        self.assertEqual(runtime.create_volume(identity, identity.restore_volume_name, snapshot_id=snapshot_id), "vol_forked")
+            self.assertEqual(snapshot_id, "vs_new")
+            self.assertEqual(runtime.create_volume(identity, identity.restore_volume_name, snapshot_id=snapshot_id), "vol_forked")
+        self.assertGreaterEqual(len(volume_polls), 2, "a hydrating fork must be waited out, not mounted")
         created = [c for c in calls if "volumes" in c and "create" in c and "snapshots" not in c][0]
         self.assertEqual(created[created.index("--snapshot-id") + 1], "vs_new")
         self.assertIn("--scheduled-snapshots=false", created)
@@ -1875,5 +1882,108 @@ class StageAContractTests(unittest.TestCase):
         self.assertIn("--cleanup-only", workflow)
         self.assertIn("cleanup.json.sha256", workflow)
         self.assertIn("cleanup-exit-code", workflow)
+
+    def _volume_runtime(self, states):
+        """A runtime whose volume listing walks the given states, one per poll."""
+        seen = iter(states)
+        def runner(cmd, **kwargs):
+            if "volumes" in cmd and "list" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, json.dumps([{"id": "vol_f", "state": next(seen)}]), "")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        return stage.FlyRuntime(runner=runner)
+
+    def test_a_hydrating_fork_is_waited_out_rather_than_mounted(self):
+        """Runs 30217281791 and 30220383793 both mounted a fork still in `restoring`.
+
+        Measured on a disposable app: a 14 GB fork reported `restoring`, flyctl abandoned
+        its start-wait at ~62s with "machine failed to reach desired start state", and the
+        machine then started unaided at 3m13s with the data intact. The volume was never
+        broken and neither was the machine - the harness simply mounted too early.
+        """
+        identity = stage.build_identity("hydrate")
+        runtime = self._volume_runtime(["restoring", "restoring", "created"])
+        with mock.patch.object(stage.time, "sleep"):
+            self.assertIsInstance(runtime.wait_volume_hydrated(identity, "vol_f", interval_s=1), float)
+
+    def test_an_unexpected_volume_state_is_reported_not_waited_out(self):
+        """A terminal state must not be polled to the deadline and reported as a timeout."""
+        identity = stage.build_identity("hydrate-bad")
+        runtime = self._volume_runtime(["restoring", "failed"])
+        with mock.patch.object(stage.time, "sleep"):
+            with self.assertRaises(stage.RehearsalUnknown) as caught:
+                runtime.wait_volume_hydrated(identity, "vol_f", interval_s=1)
+        self.assertIn("unexpected state", str(caught.exception))
+
+    def test_a_fresh_volume_is_not_polled_for_hydration(self):
+        """Only a fork hydrates, so an unforked volume must not pay for a listing call."""
+        identity = stage.build_identity("fresh-vol"); calls = []
+        def runner(cmd, **kwargs):
+            calls.append(cmd)
+            if "volumes" in cmd and "create" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, json.dumps({"id": "vol_plain"}), "")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        runtime = stage.FlyRuntime(runner=runner)
+        self.assertEqual(runtime.create_volume(identity, identity.volume_name), "vol_plain")
+        self.assertFalse([c for c in calls if "volumes" in c and "list" in c])
+
+    def test_a_probe_may_skip_a_corpus_scale_gate_and_a_real_run_may_not(self):
+        """The probe's whole licence is skipping four gates, so the licence is bounded here.
+
+        A SKIPPED gate is neither FAILED nor UNKNOWN, so without this it would reduce to
+        PASSED and read exactly like a gate that was measured and cleared - which is the
+        shape of quietly weakening a gate to fit a smaller corpus.
+        """
+        gates = {
+            "semantic_probes": stage.Gate("PASSED", "probes passed"),
+            "store_footprint": stage.Gate("SKIPPED", "not judged at probe scale"),
+        }
+        self.assertEqual(stage.combine_status(gates, [], probe=True), "PASSED")
+        self.assertEqual(stage.combine_status(gates, []), "UNKNOWN")
+        self.assertEqual(stage.scale_gate(False, stage.Gate("FAILED", "over"), "store footprint").status, "FAILED")
+        self.assertEqual(stage.scale_gate(True, stage.Gate("FAILED", "over"), "store footprint").status, "SKIPPED")
+
+    def test_the_probe_corpus_and_the_qualification_corpus_cannot_be_swapped(self):
+        """Neither contract will accept the other's corpus, in either direction."""
+        probe_spec = stage.CorpusSpec(stage.TAIL_PROBE_SAMPLE_COUNT, 50, stage.DEFAULT_PAYLOAD_BYTES, "test-seed", "lexical")
+        full_spec = stage.CorpusSpec(payload_shape="lexical")
+        stage.validate_tail_probe_spec(probe_spec)
+        stage.validate_execute_spec(full_spec)
+        with self.assertRaises(stage.RehearsalUnknown):
+            stage.validate_execute_spec(probe_spec)
+        with self.assertRaises(stage.RehearsalUnknown):
+            stage.validate_tail_probe_spec(full_spec)
+        with self.assertRaises(stage.RehearsalUnknown):
+            stage.validate_tail_probe_spec(
+                stage.CorpusSpec(stage.TAIL_PROBE_SAMPLE_COUNT, 50, stage.MIN_PAYLOAD_BYTES, "test-seed", "opaque"))
+
+    def test_a_probe_refuses_the_full_corpus_before_it_provisions_anything(self):
+        """The probe is a mode, not a smaller run of the same mode, and it proves that early."""
+        identity = stage.build_identity("probe-corpus")
+        runtime = mock.Mock()
+        runtime.list_owned_resources.return_value = []
+        runtime.owned_machine_ids.return_value = []
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "probe-corpus.json"
+            self.assertEqual(
+                stage.execute(identity, stage.CorpusSpec(payload_shape="lexical"), path, runtime=runtime, probe=True), 2)
+            receipt = json.loads(path.read_text())
+        self.assertEqual(receipt["status"], "UNKNOWN")
+        self.assertIn("probe contract", receipt["detail"])
+        self.assertEqual(receipt["measurements"]["mode"], "tail_probe")
+        runtime.create_app.assert_not_called()
+        runtime.create_volume.assert_not_called()
+
+    def test_the_workflow_verdict_admits_only_the_qualification_pass(self):
+        """The probe's safety rests on this comparison, so it is asserted, not assumed.
+
+        `execute` renames a probe success to TAIL_PROBE_PASS. That only protects anything
+        while the workflow keeps testing for equality with PASSED - a later loosening to a
+        substring or prefix test would silently admit every probe receipt.
+        """
+        workflow = Path(__file__).resolve().parents[2] / ".github/workflows/koala-stage-a-rehearse.yml"
+        if not workflow.exists(): self.skipTest("workflow not present in this checkout")
+        text = workflow.read_text()
+        self.assertIn('receipt.get("status") != "PASSED"', text)
+        self.assertNotIn("TAIL_PROBE", text)
 
 if __name__ == "__main__": unittest.main()

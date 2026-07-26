@@ -830,26 +830,58 @@ class FlyRuntime:
             raise RehearsalUnknown(f"invalid CPU or memory measurement; command output was {captured.strip()[:200]!r}")
         try: cpu_percent, rss_kib = float(fields[0]), int(fields[1])
         except ValueError as exc: raise RehearsalUnknown("invalid CPU or memory values") from exc
-        if cpu_percent < 0 or rss_kib <= 0: raise RehearsalUnknown("missing MuninnDB process measurement")
+        if cpu_percent < 0 or rss_kib <= 0:
+            raise RehearsalUnknown("missing MuninnDB process measurement; processes present: "
+                                   f"{self.process_names(identity, machine_id)}")
         return ResourceSample(phase, cpu_percent, rss_kib * 1024)
+
+    def process_names(self, identity: RunIdentity, machine_id: str) -> str:
+        """List the process names actually visible, for a measurement that found none.
+
+        A reading of zero has two very different causes: MuninnDB has not started yet, or
+        it is running under a name the comm filter does not match. The receipt cannot
+        distinguish them without the inventory, and guessing wrong costs a full ~1.5 hour
+        cycle, which is how runs 30173477457, 30179378599 and 30181298432 were each spent.
+
+        Diagnostic only: it never turns a failed measurement into a passing one, and if the
+        probe itself fails the caller still raises on the original missing measurement.
+        """
+        probe = shell_command(
+            "awk 'FNR==1{if(match($0,/\\(.*\\)/))print substr($0,RSTART+1,RLENGTH-2)}' /proc/[0-9]*/stat"
+        )
+        try:
+            output = self.run(["machine", "exec", machine_id, "-a", identity.app_name,
+                               "--timeout", "30", probe]).stdout
+        except RehearsalError:
+            return "unavailable"
+        return ",".join(sorted(set(output.split())))[:200] or "none"
     def migration_samples(self, identity: RunIdentity, machine_id: str, timeout_s: float,
                           interval_s: float = 5.0) -> tuple[float, list[DiskSample], list[ResourceSample]]:
         started, deadline, disks, resources = time.monotonic(), time.monotonic() + timeout_s, [], []
+        last_error: RehearsalUnknown | None = None
         while time.monotonic() < deadline:
             status = self.machine_status(identity, machine_id).get("state")
-            if status == "started":
-                disks.append(self.disk_sample(identity, machine_id, "migration"))
-                resources.append(self.resource_sample(identity, machine_id, "migration"))
-                return time.monotonic() - started, disks, resources
             if status in {"stopped", "failed", "destroyed"}: raise RehearsalFailed(f"candidate stopped during migration: {status}")
-            if status in {"starting", "created"}:
+            if status in {"started", "starting", "created"}:
+                # Fly reports "started" when the VM boots, not when MuninnDB is serving, so
+                # the first poll routinely lands before any MuninnDB process exists. Run
+                # 30183128792 failed on exactly that: the exec succeeded and returned a
+                # real reading of zero processes. A not-yet-running process is therefore a
+                # retry condition until the deadline, never a measurement. This tolerates
+                # only the timing; the deadline still bounds it, a crashed candidate still
+                # fails immediately on the state check above, and an unmeasurable candidate
+                # still ends the run UNKNOWN rather than recording a zero.
                 try:
-                    disks.append(self.disk_sample(identity, machine_id, "migration"))
-                    resources.append(self.resource_sample(identity, machine_id, "migration"))
-                except RehearsalUnknown:
-                    pass
+                    disk = self.disk_sample(identity, machine_id, "migration")
+                    resource = self.resource_sample(identity, machine_id, "migration")
+                except RehearsalUnknown as exc:
+                    last_error = exc
+                else:
+                    disks.append(disk); resources.append(resource)
+                    if status == "started": return time.monotonic() - started, disks, resources
             time.sleep(interval_s)
-        raise RehearsalUnknown("migration readiness deadline expired")
+        expired = "migration readiness deadline expired"
+        raise RehearsalUnknown(f"{expired}; last sampling error: {last_error}" if last_error else expired)
     def _snapshots(self, identity: RunIdentity, volume_id: str) -> list[dict[str, str]]:
         result = self.json(["volumes", "snapshots", "list", volume_id, "-a", identity.app_name])
         if not isinstance(result, list):

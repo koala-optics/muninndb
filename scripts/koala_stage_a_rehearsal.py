@@ -1100,6 +1100,92 @@ class FlyRuntime:
                 return next(iter(new_created_ids))
             time.sleep(interval_s)
         raise RehearsalUnknown("snapshot creation deadline expired")
+    def owned_machine_ids(self, identity: RunIdentity) -> list[str]:
+        """List the machines Fly actually holds for this run, whatever the ledger believes.
+
+        The platform creates a machine before flyctl reports its ID, so a launch that fails
+        after creation returns no ID to record. Run 30220383793 lost its restore helper
+        exactly there: the machine existed, the ledger never learned of it, cleanup skipped
+        it, and the volume it still held then refused to be destroyed. Asking the platform
+        what exists closes that gap for every launch site at once, rather than guarding
+        each one separately.
+
+        Deliberately permissive where discover_owned_resources raises. This runs during
+        cleanup, where refusing to answer would strand the very resource it exists to find.
+        Ownership is still enforced by run metadata and production IDs are still excluded,
+        so a permissive read cannot widen what may be destroyed.
+        """
+        machines = self.json(["machines", "list", "-a", identity.app_name])
+        if not isinstance(machines, list):
+            raise RehearsalUnknown("machine listing returned invalid resources")
+        found = []
+        for machine in machines:
+            if not isinstance(machine, dict): continue
+            machine_id = str(machine.get("id", ""))
+            metadata = (machine.get("config") or {}).get("metadata") or {}
+            if (machine_id and machine_id not in PRODUCTION_MACHINE_IDS
+                    and metadata.get("koala_stage_a_run") == identity.run_id):
+                found.append(machine_id)
+        return found
+    def launch_failure_diagnostics(self, identity: RunIdentity, helper_name: str,
+                                   mounts: list[dict[str, str]]) -> str:
+        """Say why a helper never reached its start state, while the evidence still exists.
+
+        Runs 30217281791 and 30220383793 both died launching the restore helper, and all
+        flyctl offered was "machine failed to reach desired start state". That sentence
+        cannot distinguish a machine that never booted from one that booted and whose
+        command exited at once, and the two have opposite causes: the first points at the
+        volume being mounted, the second at the command being run.
+
+        Three facts separate them and none survives cleanup, so all three are read here:
+        the machine's state and exit events, its logs, and the reported state of the volume
+        it was asked to mount. The restore volume is a fork of a snapshot taken seconds
+        earlier, and Fly documents neither when such a fork becomes mountable nor that it
+        might not be, so the volume's own state is the first thing worth knowing.
+
+        Every probe is best effort and bounded, on the same reasoning as
+        stalled_helper_diagnostics: a diagnostic that raised would replace the failure it
+        exists to explain. Log lines are redacted per line for the reason given there.
+        """
+        parts: list[str] = []
+        match = None
+        try:
+            machines = self.json(["machines", "list", "-a", identity.app_name])
+            match = next((m for m in machines if isinstance(m, dict)
+                          and m.get("name") == helper_name), None)
+        except Exception as exc:
+            parts.append(f"machine=<unavailable: {safe_detail(str(exc))}>")
+        if match is None:
+            parts.append("machine=<absent: nothing was created>")
+        else:
+            machine_id = str(match.get("id", ""))
+            parts.append(f"machine={machine_id} state={match.get('state')}")
+            described = []
+            for event in (match.get("events") or [])[:STALL_DIAGNOSTIC_LINES]:
+                if not isinstance(event, dict): continue
+                exit_code = ((event.get("request") or {}).get("exit_event") or {}).get("exit_code")
+                described.append(f"{event.get('type')}:{event.get('status')}"
+                                 + (f":exit={exit_code}" if exit_code is not None else ""))
+            if described: parts.append("events=" + " / ".join(described))
+            try:
+                text = self.run(["logs", "-a", identity.app_name, "--machine", machine_id,
+                                 "--no-tail"], timeout=60).stdout
+                lines = [safe_detail(line) for line in
+                         text.splitlines()[-STALL_DIAGNOSTIC_LINES:] if line.strip()]
+                parts.append("logs=" + (" / ".join(lines) if lines else "<empty>"))
+            except Exception as exc:
+                parts.append(f"logs=<unavailable: {safe_detail(str(exc))}>")
+        for mount in mounts:
+            volume_id = str(mount.get("volume", ""))
+            try:
+                volumes = self.json(["volumes", "list", "-a", identity.app_name])
+                volume = next((v for v in volumes if isinstance(v, dict)
+                               and v.get("id") == volume_id), None)
+                parts.append(f"volume={volume_id} state="
+                             + (str(volume.get("state")) if volume else "<absent>"))
+            except Exception as exc:
+                parts.append(f"volume={volume_id} state=<unavailable: {safe_detail(str(exc))}>")
+        return " ".join(parts)
     def _offline_helper(self, identity: RunIdentity, image: str, role: str,
                         mounts: list[dict[str, str]], command: str) -> str:
         require_single_mount(mounts, role)
@@ -1107,9 +1193,15 @@ class FlyRuntime:
         config = json.dumps({"image": image, "init": {"exec": ["/bin/sh", "-c", command]},
             "restart": {"policy": "no"}, "guest": {"cpu_kind": "performance", "cpus": 16, "memory_mb": 32768},
             "mounts": mounts, "metadata": {"koala_stage_a_run": identity.run_id, "role": role}, "services": []}, sort_keys=True)
-        proc = self.run(["machine", "run", image, "-a", identity.app_name, "--region", FLY_REGION,
-            "--name", helper_name, "--machine-config", config, "--restart", "no",
-            "--skip-dns-registration", "--detach"])
+        try:
+            proc = self.run(["machine", "run", image, "-a", identity.app_name, "--region", FLY_REGION,
+                "--name", helper_name, "--machine-config", config, "--restart", "no",
+                "--skip-dns-registration", "--detach"])
+        except RehearsalUnknown as exc:
+            # The launch can fail after the machine exists, so the diagnosis is read here
+            # while it does. Cleanup finds the machine itself through owned_machine_ids.
+            raise RehearsalUnknown(f"{role} helper launch failed: {exc} || "
+                f"{self.launch_failure_diagnostics(identity, helper_name, mounts)}") from exc
         matches = re.findall(r"(?m)^\s*Machine ID:\s*([0-9a-f]+)\s*$", proc.stdout)
         if len(matches) != 1 or matches[0] in PRODUCTION_MACHINE_IDS:
             raise RehearsalUnknown(f"{role} helper ID missing")
@@ -1326,6 +1418,22 @@ def cleanup(runtime: FlyRuntime, identity: RunIdentity, ledger: ResourceLedger) 
     responses. It goes through the same redaction predicate as every other diagnostic.
     """
     results, orphans = {}, []
+    # A machine the ledger never learned of still holds its volume, and the volume destroy
+    # then fails on a binding to a machine nobody is going to destroy. That is how run
+    # 30220383793 reported an orphan. The platform is asked what survived before anything
+    # is destroyed, so a machine lost to a failed launch is destroyed in the ordinary order.
+    if ledger.app and not ledger.machine_id:
+        try:
+            surviving = runtime.owned_machine_ids(identity)
+        except Exception as exc:
+            surviving = []
+            results["machine_discovery_error"] = safe_detail(f"{type(exc).__name__}: {exc}")
+        if surviving:
+            ledger.machine_id, extra = surviving[0], surviving[1:]
+            results["machine_recovered"] = ledger.machine_id
+            # More than one is not a shape this harness produces, so it is reported rather
+            # than assumed away: an unexplained machine keeps failing the run.
+            orphans.extend(extra)
     for label in ("machine_id", "restore_volume_id", "backup_volume_id", "rollback_volume_id", "volume_id"):
         resource = getattr(ledger, label)
         if not resource: results[label] = "not_created"; continue

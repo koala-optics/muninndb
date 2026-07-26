@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -348,7 +349,7 @@ class StageAContractTests(unittest.TestCase):
             "The bounded df quiet-window witnesses disk settlement; it does not prove asynchronous FTS or provenance queues are empty.",
             "The candidate mirror is written to the run-owned Fly app repository; registry-repository retention is not covered by the machine and volume orphan scan.",
             "Fly machine-create rejects a digest-pinned config.image, so the candidate launches from the run-owned mirror tag; identity rests on the digest assertion taken before launch, not on the launch reference itself.",
-            "The pre-ingestion provisioning probe is mountless, so it proves candidate image and guest provisioning only; volume attachment, readiness, and every measured gate remain first exercised by the real machines.",
+            "The pre-ingestion provisioning probe is mountless, so it proves candidate image and guest provisioning and the machine exec shell transport only; volume attachment, readiness, the resource measurement itself, and every measured gate remain first exercised by the real machines.",
         ])
 
     def test_volume_command_is_encrypted_twenty_gb_and_unscheduled(self):
@@ -387,11 +388,11 @@ class StageAContractTests(unittest.TestCase):
         self.assertEqual(sample, stage.ResourceSample("migration", 37.5, 2 * 1024 * 1024))
 
     def test_resource_sample_reads_procfs_and_never_shells_out_to_ps(self):
-        """`ps -eo pcpu=,rss=,comm=` is procps-specific and BusyBox ps rejects it, which
-        produced empty stdout and the bare "invalid CPU or memory measurement" that ended
-        runs 30173477457 and 30179378599. This method only runs against the candidate
-        machine, so the incompatibility could not surface until roughly 1.5 hours into a
-        run. /proc is present on any Linux image; reverting to ps reintroduces the bug."""
+        """/proc is present on any Linux image, so it needs no procps binary and no
+        assumption about which ps variant the candidate ships. The original ps form was
+        also unrunnable for a second and more basic reason (see the word-split test
+        below): its pipe was consumed as a literal argv word. Reverting to a piped ps
+        reintroduces both faults at once."""
         identity = stage.build_identity("procfs-test")
         captured = []
         def runner(cmd, **kwargs):
@@ -414,6 +415,69 @@ class StageAContractTests(unittest.TestCase):
         with self.assertRaises(stage.RehearsalUnknown) as caught:
             runtime.resource_sample(identity, "machine", "migration")
         self.assertIn("ps: unrecognized option", str(caught.exception))
+
+    def test_shell_command_survives_the_word_split_that_machine_exec_performs(self):
+        """`flyctl machine exec` accepts ONE command string (cobra.RangeArgs(1, 2), sent as
+        fly.MachineExecRequest{Cmd: string}) and the API word-splits it and execs directly,
+        with no shell. A wrapper must therefore survive that split as exactly /bin/sh, -c,
+        and one intact script word. `df -Pk /data` always worked because it needs no shell;
+        every measurement command returned empty stdout because it did."""
+        script = "awk 'BEGIN{print 6*7}' /proc/uptime /proc/[0-9]*/stat"
+        self.assertEqual(shlex.split(stage.shell_command(script)), ["/bin/sh", "-c", script])
+
+    def test_shell_command_refuses_a_double_quote_rather_than_mangling_it(self):
+        """A double quote would terminate the wrapper's own quoting and silently truncate
+        the script mid-word, which is precisely the silent-mangling failure this wrapper
+        exists to end. Refusing loudly is the only safe behaviour."""
+        with self.assertRaises(stage.RehearsalUnknown):
+            stage.shell_command('echo "hello"')
+
+    def test_resource_sample_command_survives_the_word_split_intact(self):
+        """The measurement is worthless if the transport mangles it, so assert the real
+        command, not a stand-in: it must arrive as one shell invocation carrying the glob,
+        the command substitutions and the awk program intact."""
+        identity = stage.build_identity("wordsplit-test")
+        captured = []
+        def runner(cmd, **kwargs):
+            captured.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, "37.500 2048\n", "")
+        stage.FlyRuntime(runner=runner).resource_sample(identity, "machine", "migration")
+        tokens = shlex.split(captured[-1][-1])
+        self.assertEqual(tokens[:2], ["/bin/sh", "-c"])
+        self.assertEqual(len(tokens), 3)
+        self.assertIn("/proc/[0-9]*/stat", tokens[2])
+        self.assertIn(stage.PROCFS_RESOURCE_AWK, tokens[2])
+
+    def test_procfs_awk_program_carries_no_quote_of_either_kind(self):
+        """Single quotes delimit the program for /bin/sh and double quotes would break the
+        wrapper, so the program must avoid both. This is why it matches the comm field by
+        regex and prints without a printf format string."""
+        self.assertNotIn('"', stage.PROCFS_RESOURCE_AWK)
+        self.assertNotIn("'", stage.PROCFS_RESOURCE_AWK)
+
+    def test_exec_canary_rejects_output_that_is_not_the_expected_token(self):
+        """Empty stdout is the exact signature of the three lost runs, so the canary must
+        treat anything other than the expected token as a failure rather than a pass."""
+        identity = stage.build_identity("canary-test")
+        for output in ("", "\n", "sh: awk: not found\n", "6*7\n"):
+            runtime = stage.FlyRuntime(runner=lambda cmd, _o=output, **kw: subprocess.CompletedProcess(cmd, 0, _o, ""))
+            with self.assertRaises(stage.RehearsalUnknown):
+                runtime.exec_canary(identity, "machine")
+
+    def test_exec_canary_exercises_the_same_wrapping_as_the_resource_sample(self):
+        """The canary only forecloses a ~1.5 hour ingest if it fails whenever the real
+        measurement would, so it must use the same wrapper and the same quoting shape."""
+        identity = stage.build_identity("canary-shape")
+        captured = []
+        def runner(cmd, **kwargs):
+            captured.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, f"{stage.EXEC_CANARY_TOKEN}\n", "")
+        runtime = stage.FlyRuntime(runner=runner)
+        self.assertEqual(runtime.exec_canary(identity, "machine"), stage.EXEC_CANARY_TOKEN)
+        canary = shlex.split(captured[-1][-1])
+        self.assertEqual(canary[:2], ["/bin/sh", "-c"])
+        self.assertEqual(len(canary), 3)
+        self.assertIn("awk '", canary[2])
 
     def test_resource_sample_treats_a_missing_muninndb_process_as_failure_not_zero(self):
         """An empty reading is an application error, never a valid zero measurement."""

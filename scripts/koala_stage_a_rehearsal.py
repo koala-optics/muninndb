@@ -54,6 +54,20 @@ TARGET_STORE_BYTES = 6 * 1024**3
 VOLUME_SIZE_GB = 20
 MAX_PEAK_BYTES, MIN_FREE_PERCENT = 14 * 1024**3, 30.0
 MIGRATION_LIMIT_S, READINESS_LIMIT_S = 45 * 60, 5 * 60
+EXEC_CANARY_TOKEN = "42"
+# Sums CPU percent and RSS KiB over MuninnDB processes. Reads /proc/uptime as the first
+# input file so no command substitution is needed for uptime. Deliberately contains no
+# quote character of either kind: single quotes delimit it for /bin/sh, and double quotes
+# would terminate the shell_command wrapper's own quoting (see shell_command).
+PROCFS_RESOURCE_AWK = (
+    "NR==1{up=$1;next} "
+    "FNR==1{if(match($0,/\\(.*\\)/)==0)next;"
+    "comm=substr($0,RSTART+1,RLENGTH-2);"
+    "n=split(substr($0,RSTART+RLENGTH+1),f);if(n<22)next;"
+    "if(comm ~ /muninndb/){el=up-(f[20]/hz);"
+    "if(el>0)cpu+=100*((f[12]+f[13])/hz)/el;rss+=f[22]*pg/1024}} "
+    "END{print cpu+0,int(rss)}"
+)
 QUERY_P95_LIMIT_MS, STATUS_LIMIT_S = 250.0, 30.0
 RESTORE_LIMIT_S, ROLLBACK_LIMIT_S = 45 * 60, 30 * 60
 SNAPSHOT_LIMIT_S, SNAPSHOT_POLL_INTERVAL_S = 10 * 60, 5.0
@@ -504,6 +518,26 @@ def combine_status(gates: dict[str, Gate], orphans: Sequence[str]) -> str:
     if any(g.status == "FAILED" for g in gates.values()): return "FAILED"
     return "PASSED"
 
+def shell_command(script: str) -> str:
+    """Wrap a shell script so that `flyctl machine exec` actually runs it in a shell.
+
+    `machine exec` takes ONE command string (flyctl v0.4.52 internal/command/machine/exec.go
+    declares cobra.RangeArgs(1, 2) and sends fly.MachineExecRequest{Cmd: string}); the API
+    word-splits that string and execs it directly. There is no shell, so pipes, globs,
+    semicolons and $(...) are consumed as literal argv words rather than interpreted. That
+    is why `df -Pk /data` has always worked while every measurement command has returned
+    empty stdout. The offline helpers never hit this because they pass an explicit
+    ["/bin/sh", "-c", command] ARRAY through init.exec.
+
+    Wrapping in double quotes keeps the script one word through the API's split while
+    leaving single quotes available to the script itself, so the script must contain no
+    double quote. That constraint is asserted rather than escaped: silently mangling a
+    measurement command is the failure mode this whole function exists to end.
+    """
+    if '"' in script:
+        raise RehearsalUnknown("shell command must not contain a double quote")
+    return f'/bin/sh -c "{script}"'
+
 def safe_detail(value: str) -> str:
     compact = " ".join(value.split())[-400:]
     return "[REDACTED: sensitive diagnostic omitted]" if SENSITIVE_TEXT.search(compact) else compact
@@ -597,7 +631,7 @@ def receipt_document(
             "Fly machine-create rejects a digest-pinned config.image, so the candidate launches from the run-owned mirror tag; identity rests on the digest assertion taken before launch, not on the launch reference itself."
         )
         limitations.append(
-            "The pre-ingestion provisioning probe is mountless, so it proves candidate image and guest provisioning only; volume attachment, readiness, and every measured gate remain first exercised by the real machines."
+            "The pre-ingestion provisioning probe is mountless, so it proves candidate image and guest provisioning and the machine exec shell transport only; volume attachment, readiness, the resource measurement itself, and every measured gate remain first exercised by the real machines."
         )
     return {
         "schema_version": SCHEMA_VERSION,
@@ -779,15 +813,16 @@ class FlyRuntime:
         /proc is present on any Linux image, and the arithmetic reproduces exactly what ps
         computes: pcpu is (utime+stime)/HZ over process elapsed time, rss is the stat page
         count scaled to KiB. Semantics are therefore unchanged; only the source is.
+
+        The command is wrapped by shell_command because `machine exec` provides no shell
+        (see that function); the pipe in the original ps form and the command substitution
+        in the first /proc form were both consumed as literal argv words, which is why runs
+        30173477457, 30179378599 and 30181298432 all returned empty stdout.
         """
-        command = (
-            "up=$(cut -d' ' -f1 /proc/uptime); "
-            "awk -v up=\"$up\" -v hz=\"$(getconf CLK_TCK 2>/dev/null || echo 100)\" "
-            "-v pg=\"$(getconf PAGESIZE 2>/dev/null || echo 4096)\" '"
-            "FNR==1{o=index($0,\"(\"); c=index($0,\")\"); comm=substr($0,o+1,c-o-1); "
-            "n=split(substr($0,c+2),f,\" \"); if(n<22) next; "
-            "if(comm ~ /muninndb/){el=up-(f[20]/hz); if(el>0){cpu+=100*((f[12]+f[13])/hz)/el} rss+=f[22]*pg/1024}"
-            "} END{printf \"%.3f %d\\n\", cpu, rss}' /proc/[0-9]*/stat"
+        command = shell_command(
+            "awk -v hz=$(getconf CLK_TCK 2>/dev/null || echo 100) "
+            "-v pg=$(getconf PAGESIZE 2>/dev/null || echo 4096) "
+            "'" + PROCFS_RESOURCE_AWK + "' /proc/uptime /proc/[0-9]*/stat"
         )
         captured = self.run(["machine", "exec", machine_id, "-a", identity.app_name, "--timeout", "30", command]).stdout
         fields = captured.split()
@@ -905,7 +940,28 @@ class FlyRuntime:
         the real candidate machine.
         """
         validate_image(image, "candidate", expected_candidate=self.candidate_ref)
-        return self._offline_helper(identity, image, "preflight-probe", [], "true")
+        return self._offline_helper(identity, image, "preflight-probe", [], "sleep 120")
+
+    def exec_canary(self, identity: RunIdentity, machine_id: str) -> str:
+        """Prove `machine exec` reaches a real shell before the ingest commits 1.5 hours.
+
+        Runs the identical shell_command wrapping and single-quoted awk shape that the
+        migration resource sample uses, so a transport or quoting fault fails the run in
+        minutes. Runs 30173477457, 30179378599 and 30181298432 each spent a full corpus
+        ingest to discover that a measurement command returned empty stdout.
+
+        This proves the exec transport and the presence of a shell and awk. It does NOT
+        prove the resource measurement itself: the probe is mountless and runs no MuninnDB
+        process, so the summed CPU and RSS values are still first measured on the real
+        candidate machine.
+        """
+        command = shell_command("awk 'BEGIN{print 6*7}'")
+        captured = self.run(["machine", "exec", machine_id, "-a", identity.app_name,
+                             "--timeout", "30", command]).stdout
+        if captured.strip() != EXEC_CANARY_TOKEN:
+            raise RehearsalUnknown("machine exec shell canary failed; expected "
+                                   f"{EXEC_CANARY_TOKEN!r}, output was {captured.strip()[:200]!r}")
+        return captured.strip()
     def create_backup(self, identity: RunIdentity, volume_id: str, backup_volume_id: str,
                       image: str) -> tuple[str, str]:
         validate_image(image, "candidate", expected_candidate=self.candidate_ref)
@@ -1165,10 +1221,11 @@ def plan(identity: RunIdentity, spec: CorpusSpec, *, mode: str = "execute") -> d
         result["provisioning_probe"] = {
             "purpose": "surface candidate image and guest provisioning faults before the corpus ingest, not after it",
             "ordering": "immediately after the mirror digest assertion, before any volume or measured machine exists",
-            "shape": "mountless no-op machine using the same guest spec as every real machine, launched then destroyed",
+            "shape": "mountless machine using the same guest spec as every real machine, held briefly for one exec canary, then destroyed",
             "mounts": "none, so the measured source volume cannot be written before its empty disk sample",
+            "exec_canary": "runs the same shell wrapping and quoting the migration resource sample uses, and requires the exact expected output",
             "failure_policy": "UNKNOWN",
-            "coverage_limit": "image resolution, guest sizing, machine create and boot only; volume attachment is not covered",
+            "coverage_limit": "image resolution, guest sizing, machine create and boot, and the machine exec shell transport only; volume attachment and the resource measurement itself are not covered",
             "gate_effect": "none; no gate is added, removed, or relaxed",
         }
         result["falsification_evidence"] = {
@@ -1389,7 +1446,8 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
         validate_execute_spec(spec); validate_image(BASELINE_IMAGE, "baseline"); validate_image(CANDIDATE_IMAGE, "candidate"); runtime.preflight(identity)
         ledger.app = runtime.create_app(identity); candidate_ref = runtime.mirror_candidate(identity); runtime.install_auth(identity, auth_value)
         ledger.machine_id = runtime.provisioning_probe(identity, candidate_ref)
-        runtime.wait_stopped(identity, ledger.machine_id, READINESS_LIMIT_S)
+        runtime.wait_ready(identity, ledger.machine_id, READINESS_LIMIT_S)
+        runtime.exec_canary(identity, ledger.machine_id)
         runtime.destroy_machine(identity, ledger.machine_id); ledger.machine_id = None
         ledger.volume_id = runtime.create_volume(identity, identity.volume_name)
         ledger.machine_id = runtime.create_machine(identity, ledger.volume_id, BASELINE_IMAGE, "baseline")

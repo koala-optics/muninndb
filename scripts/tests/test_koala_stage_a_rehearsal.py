@@ -1016,6 +1016,7 @@ class StageAContractTests(unittest.TestCase):
         identity = stage.build_identity("mirror-order")
         runtime = mock.Mock()
         runtime.list_owned_resources.return_value = []
+        runtime.owned_machine_ids.return_value = []
         runtime.create_app.return_value = identity.app_name
         runtime.mirror_candidate.side_effect = stage.RehearsalUnknown("candidate mirror unavailable")
         with tempfile.TemporaryDirectory() as root:
@@ -1359,6 +1360,59 @@ class StageAContractTests(unittest.TestCase):
         self.assertEqual(results["restore_volume_id"], "destroyed")
         self.assertNotIn("restore_volume_id_error", results)
         self.assertEqual(runtime.destroy_volume.call_count, 2)
+
+    def test_cleanup_destroys_a_machine_the_ledger_never_learned_of(self):
+        identity = stage.build_identity("cleanup-recover"); runtime = mock.Mock()
+        runtime.owned_machine_ids.return_value = ["6835102a46d3e8"]
+        runtime.list_owned_resources.return_value = []
+        results, orphans = stage.cleanup(
+            runtime, identity,
+            stage.ResourceLedger(app=identity.app_name, restore_volume_id="vol_restore"))
+        self.assertEqual(orphans, [])
+        self.assertEqual(results["machine_recovered"], "6835102a46d3e8")
+        self.assertEqual(results["machine_id"], "destroyed")
+        runtime.destroy_machine.assert_called_once_with(identity, "6835102a46d3e8")
+        self.assertEqual(results["restore_volume_id"], "destroyed")
+
+    def test_owned_machine_ids_reports_only_this_run_and_never_production(self):
+        identity = stage.build_identity("owned-machines")
+        production = next(iter(stage.PRODUCTION_MACHINE_IDS))
+        def runner(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, 0, json.dumps([
+                {"id": "mine", "config": {"metadata": {"koala_stage_a_run": identity.run_id}}},
+                {"id": "theirs", "config": {"metadata": {"koala_stage_a_run": "other-run"}}},
+                {"id": production, "config": {"metadata": {"koala_stage_a_run": identity.run_id}}},
+                {"id": "nometa", "config": None},
+            ]), "")
+        self.assertEqual(stage.FlyRuntime(runner=runner).owned_machine_ids(identity), ["mine"])
+
+    def test_a_helper_that_never_starts_reports_its_state_and_its_volume(self):
+        identity = stage.build_identity("launch-fail")
+        def runner(cmd, **kwargs):
+            if cmd[1] == "machine" and cmd[2] == "run":
+                return subprocess.CompletedProcess(cmd, 1, "", "failed to reach desired start state")
+            if cmd[1] == "machines":
+                return subprocess.CompletedProcess(cmd, 0, json.dumps([{
+                    "id": "6835102a46d3e8",
+                    "name": f"koala-stage-a-{identity.run_id}-restore-copy",
+                    "state": "created",
+                    "events": [{"type": "exit", "status": "stopped",
+                                "request": {"exit_event": {"exit_code": 1}}}],
+                }]), "")
+            if cmd[1] == "logs":
+                return subprocess.CompletedProcess(cmd, 0, "extraction did not begin\n", "")
+            if cmd[1] == "volumes":
+                return subprocess.CompletedProcess(cmd, 0, json.dumps([
+                    {"id": "vol_restore", "state": "pending"}]), "")
+            raise AssertionError(cmd)
+        with self.assertRaises(stage.RehearsalUnknown) as caught:
+            stage.FlyRuntime(runner=runner)._offline_helper(
+                identity, "img", "restore-copy",
+                [{"volume": "vol_restore", "path": "/data"}], "true")
+        detail = str(caught.exception)
+        self.assertIn("machine=6835102a46d3e8 state=created", detail)
+        self.assertIn("exit=1", detail)
+        self.assertIn("volume=vol_restore state=pending", detail)
 
     def test_cleanup_discovery_is_exact_and_absent_is_idempotent(self):
         identity = stage.build_identity("discover-test")
@@ -1733,6 +1787,7 @@ class StageAContractTests(unittest.TestCase):
             )
         ]
         runtime.list_owned_resources.return_value = []
+        runtime.owned_machine_ids.return_value = []
         receipt = stage.CorpusReceipt(submitted=25000, accepted=25000, batches=500, manifest_sha256="a" * 64)
         settled = iter([
             {"settled": stage.DiskSample(name, used, 1000, 2000), "samples": [], "witness": "bounded-df-quiet-window"}

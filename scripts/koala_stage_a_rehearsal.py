@@ -55,13 +55,17 @@ VOLUME_SIZE_GB = 20
 MAX_PEAK_BYTES, MIN_FREE_PERCENT = 14 * 1024**3, 30.0
 MIGRATION_LIMIT_S, READINESS_LIMIT_S = 45 * 60, 5 * 60
 EXEC_CANARY_TOKEN = "42"
+PROCESS_INVENTORY_CHARS = 600
 # Sums CPU percent and RSS KiB over MuninnDB processes. Reads /proc/uptime as the first
 # input file so no command substitution is needed for uptime. Deliberately contains no
-# quote character of either kind: single quotes delimit it for /bin/sh, and double quotes
-# would terminate the shell_command wrapper's own quoting (see shell_command).
+# quote character of either kind and no backslash: single quotes delimit it for /bin/sh,
+# double quotes would terminate the shell_command wrapper's own quoting, and a backslash
+# does not survive the transport (see shell_command). The parenthesis literals are written
+# as bracket expressions for that last reason: /[(].*[)]/ needs no escape and is exactly
+# equivalent to /\(.*\)/ under mawk, gawk, and busybox awk alike.
 PROCFS_RESOURCE_AWK = (
     "NR==1{up=$1;next} "
-    "FNR==1{if(match($0,/\\(.*\\)/)==0)next;"
+    "FNR==1{if(match($0,/[(].*[)]/)==0)next;"
     "comm=substr($0,RSTART+1,RLENGTH-2);"
     "n=split(substr($0,RSTART+RLENGTH+1),f);if(n<22)next;"
     "if(comm ~ /muninndb/){el=up-(f[20]/hz);"
@@ -533,9 +537,20 @@ def shell_command(script: str) -> str:
     leaving single quotes available to the script itself, so the script must contain no
     double quote. That constraint is asserted rather than escaped: silently mangling a
     measurement command is the failure mode this whole function exists to end.
+
+    A backslash is refused for the same reason, and the refusal is not theoretical. Runs
+    30183128792 and 30185035316 both reported "missing MuninnDB process measurement" while
+    the shell canary passed, because the canary carries no backslash and the measurement
+    carried \\( and \\). Feeding the arriving program back through awk locally reproduces
+    the receipt exactly: with the escapes the program parses every process, and with the
+    backslashes dropped /(.*)/ matches the whole line, the field split behind it yields
+    nothing, and the parse count falls to zero on mawk and gawk alike. Write parenthesis
+    literals as the bracket expressions [(] and [)], which need no escape at all.
     """
     if '"' in script:
         raise RehearsalUnknown("shell command must not contain a double quote")
+    if "\\" in script:
+        raise RehearsalUnknown("shell command must not contain a backslash; it does not survive transport")
     return f'/bin/sh -c "{script}"'
 
 def safe_detail(value: str) -> str:
@@ -743,6 +758,7 @@ class FlyRuntime:
         if not MIRROR_REF.fullmatch(mirrored_ref): raise RehearsalUnknown("mirrored candidate reference is not a run-owned mirror tag")
         self.candidate_ref = mirrored_ref
         return self.candidate_ref
+
     def install_auth(self, identity: RunIdentity, auth_value: str) -> None:
         env_name = "MUNINN" + "_MCP_TOKEN"
         self.run(["secrets", "import", "-a", identity.app_name, "--stage"], stdin=f"{env_name}={auth_value}\nMUNINN_LOCAL_EMBED=0\n")
@@ -843,18 +859,29 @@ class FlyRuntime:
         distinguish them without the inventory, and guessing wrong costs a full ~1.5 hour
         cycle, which is how runs 30173477457, 30179378599 and 30181298432 were each spent.
 
+        Kernel threads are excluded by parentage, and truncation announces itself. Run
+        30185035316's inventory did neither: sixteen cpuhp threads sorted ahead of anything
+        useful, a silent 200 character cap cut the line mid-token at "(jb", and the one name
+        the probe existed to look for would have sorted past the cut. That inventory was
+        read as evidence MuninnDB never started, which it was not evidence of at all.
+
         Diagnostic only: it never turns a failed measurement into a passing one, and if the
         probe itself fails the caller still raises on the original missing measurement.
         """
         probe = shell_command(
-            "awk 'FNR==1{if(match($0,/\\(.*\\)/))print substr($0,RSTART+1,RLENGTH-2)}' /proc/[0-9]*/stat"
+            "awk 'FNR==1{if(match($0,/[(].*[)]/)==0)next;"
+            "n=split(substr($0,RSTART+RLENGTH+1),f);if(n<2)next;"
+            "if($1==2||f[2]==2)next;print substr($0,RSTART+1,RLENGTH-2)}' /proc/[0-9]*/stat"
         )
         try:
             output = self.run(["machine", "exec", machine_id, "-a", identity.app_name,
                                "--timeout", "30", probe]).stdout
         except RehearsalError:
             return "unavailable"
-        return ",".join(sorted(set(output.split())))[:200] or "none"
+        names = sorted(set(output.split()))
+        if not names: return "none"
+        joined = ",".join(names)
+        return joined if len(joined) <= PROCESS_INVENTORY_CHARS else f"{joined[:PROCESS_INVENTORY_CHARS]}...({len(names)} names, truncated)"
     def migration_samples(self, identity: RunIdentity, machine_id: str, timeout_s: float,
                           interval_s: float = 5.0) -> tuple[float, list[DiskSample], list[ResourceSample]]:
         started, deadline, disks, resources = time.monotonic(), time.monotonic() + timeout_s, [], []
@@ -1489,6 +1516,14 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
         measurements["disk_samples"].append(asdict(empty) | {"free_percent": empty.free_percent})
         proxy = runtime.proxy(identity, ledger.machine_id, local_port)
         client = client_factory(f"http://127.0.0.1:{local_port}/mcp", auth_value); client.initialize()
+        # A serving baseline is the only point in the run where a MuninnDB process is known
+        # to exist, so it is the only place the resource measurement can be witnessed rather
+        # than assumed. It never was: resource_sample is called nowhere but migration_samples,
+        # so runs 30183128792 and 30185035316 each paid a full corpus ingest to discover that
+        # the measurement could not read a process at all. Taking one here fails a broken
+        # measurement in minutes, against roughly 2.2 hours at the candidate transition, and
+        # it distinguishes a broken measurement from a candidate that never starts.
+        measurements["baseline_resource_sample"] = asdict(runtime.resource_sample(identity, ledger.machine_id, "baseline-serving"))
         def checkpoint(progress: IngestProgress) -> None:
             nonlocal corpus_receipt
             corpus_receipt = progress

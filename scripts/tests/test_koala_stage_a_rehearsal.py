@@ -416,6 +416,60 @@ class StageAContractTests(unittest.TestCase):
             runtime.resource_sample(identity, "machine", "migration")
         self.assertIn("ps: unrecognized option", str(caught.exception))
 
+    def test_migration_retries_while_muninndb_is_still_starting(self):
+        """Fly reports "started" when the VM boots, not when MuninnDB is serving, so the
+        first poll routinely finds no MuninnDB process. Run 30183128792 failed on exactly
+        that: a successful exec returning a real reading of zero. That is a retry
+        condition until the deadline, never a measurement."""
+        identity = stage.build_identity("migration-race")
+        readings = ["0.000 0\n", "0.000 0\n", "37.500 2048\n"]
+        def runner(cmd, **kwargs):
+            if "machines" in cmd and "list" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, json.dumps([{"id": "m1", "state": "started"}]), "")
+            if "exec" in cmd and "df -Pk /data" in cmd[-1]:
+                return subprocess.CompletedProcess(cmd, 0, "F 1K a a a M\n/d 100 40 60 40% /data\n", "")
+            return subprocess.CompletedProcess(cmd, 0, readings.pop(0) if readings else "37.500 2048\n", "")
+        runtime = stage.FlyRuntime(runner=runner)
+        with mock.patch.object(stage.time, "sleep"):
+            _, disks, resources = runtime.migration_samples(identity, "m1", 600.0, interval_s=0.0)
+        self.assertEqual(len(resources), 1)
+        self.assertEqual(len(disks), len(resources))
+        self.assertEqual(resources[0].rss_bytes, 2048 * 1024)
+
+    def test_migration_still_fails_when_muninndb_never_appears(self):
+        """Tolerating the startup race must not become tolerating an absent process: an
+        unmeasurable candidate still ends the run UNKNOWN rather than recording a zero."""
+        identity = stage.build_identity("migration-never")
+        def runner(cmd, **kwargs):
+            if "machines" in cmd and "list" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, json.dumps([{"id": "m1", "state": "started"}]), "")
+            if "exec" in cmd and "df -Pk /data" in cmd[-1]:
+                return subprocess.CompletedProcess(cmd, 0, "F 1K a a a M\n/d 100 40 60 40% /data\n", "")
+            return subprocess.CompletedProcess(cmd, 0, "0.000 0\n", "")
+        runtime = stage.FlyRuntime(runner=runner)
+        with mock.patch.object(stage.time, "sleep"):
+            with self.assertRaisesRegex(stage.RehearsalUnknown, "deadline expired"):
+                runtime.migration_samples(identity, "m1", 0.5, interval_s=0.0)
+
+    def test_migration_fails_fast_when_the_candidate_dies(self):
+        """The retry loop must not paper over a crashed candidate for the full window."""
+        identity = stage.build_identity("migration-dead")
+        runner = lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, json.dumps([{"id": "m1", "state": "failed"}]), "")
+        with self.assertRaises(stage.RehearsalFailed):
+            stage.FlyRuntime(runner=runner).migration_samples(identity, "m1", 600.0, interval_s=0.0)
+
+    def test_missing_process_measurement_names_the_processes_it_did_see(self):
+        """A reading of zero is either "not started yet" or "wrong name". The receipt must
+        distinguish them, because guessing wrong costs a full ~1.5 hour cycle."""
+        identity = stage.build_identity("process-inventory")
+        def runner(cmd, **kwargs):
+            if "exec" in cmd and "RSTART+1" in cmd[-1] and "cpu" not in cmd[-1]:
+                return subprocess.CompletedProcess(cmd, 0, "init\nsh\nsome-other-daemon\n", "")
+            return subprocess.CompletedProcess(cmd, 0, "0.000 0\n", "")
+        with self.assertRaises(stage.RehearsalUnknown) as caught:
+            stage.FlyRuntime(runner=runner).resource_sample(identity, "m1", "migration")
+        self.assertIn("some-other-daemon", str(caught.exception))
+
     def test_shell_command_survives_the_word_split_that_machine_exec_performs(self):
         """`flyctl machine exec` accepts ONE command string (cobra.RangeArgs(1, 2), sent as
         fly.MachineExecRequest{Cmd: string}) and the API word-splits it and execs directly,

@@ -386,6 +386,42 @@ class StageAContractTests(unittest.TestCase):
         sample = runtime.resource_sample(identity, "machine", "migration")
         self.assertEqual(sample, stage.ResourceSample("migration", 37.5, 2 * 1024 * 1024))
 
+    def test_resource_sample_reads_procfs_and_never_shells_out_to_ps(self):
+        """`ps -eo pcpu=,rss=,comm=` is procps-specific and BusyBox ps rejects it, which
+        produced empty stdout and the bare "invalid CPU or memory measurement" that ended
+        runs 30173477457 and 30179378599. This method only runs against the candidate
+        machine, so the incompatibility could not surface until roughly 1.5 hours into a
+        run. /proc is present on any Linux image; reverting to ps reintroduces the bug."""
+        identity = stage.build_identity("procfs-test")
+        captured = []
+        def runner(cmd, **kwargs):
+            captured.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, "37.500 2048\n", "")
+        runtime = stage.FlyRuntime(runner=runner)
+        runtime.resource_sample(identity, "machine", "migration")
+        command = captured[-1][-1]
+        self.assertIn("/proc/[0-9]*/stat", command)
+        self.assertIn("/proc/uptime", command)
+        self.assertNotIn("ps -eo", command)
+        self.assertNotRegex(command, r"(?<![a-z])ps\s")
+
+    def test_resource_sample_failure_quotes_the_output_it_actually_saw(self):
+        """Run 30173477457 cost a full ~1.5 hour cycle and then a second one because the
+        error named no command and quoted no output, so the cause could not be read off
+        the receipt. A failure must diagnose itself."""
+        identity = stage.build_identity("procfs-diagnostic")
+        runtime = stage.FlyRuntime(runner=lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, "ps: unrecognized option\n", ""))
+        with self.assertRaises(stage.RehearsalUnknown) as caught:
+            runtime.resource_sample(identity, "machine", "migration")
+        self.assertIn("ps: unrecognized option", str(caught.exception))
+
+    def test_resource_sample_treats_a_missing_muninndb_process_as_failure_not_zero(self):
+        """An empty reading is an application error, never a valid zero measurement."""
+        identity = stage.build_identity("procfs-zero")
+        runtime = stage.FlyRuntime(runner=lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, "0.000 0\n", ""))
+        with self.assertRaises(stage.RehearsalUnknown):
+            runtime.resource_sample(identity, "machine", "migration")
+
     def test_json_retries_malformed_output_with_fresh_invocation(self):
         responses = [
             subprocess.CompletedProcess([], 0, "temporary warning\n", ""),

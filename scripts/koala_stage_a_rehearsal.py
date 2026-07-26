@@ -766,10 +766,33 @@ class FlyRuntime:
         if len(rows) < 2 or len(rows[-1]) < 6: raise RehearsalUnknown("invalid disk measurement")
         total, used, available = map(int, rows[-1][1:4]); return DiskSample(phase, used * 1024, available * 1024, total * 1024)
     def resource_sample(self, identity: RunIdentity, machine_id: str, phase: str) -> ResourceSample:
-        command = "ps -eo pcpu=,rss=,comm= | awk '$3 ~ /muninndb/ {cpu+=$1; rss+=$2} END {printf \"%.3f %d\\n\", cpu, rss}'"
-        fields = self.run(["machine", "exec", machine_id, "-a", identity.app_name, "--timeout", "30", command]).stdout.split()
+        """Sum CPU percent and RSS across MuninnDB processes, reading /proc rather than ps.
+
+        The previous implementation shelled out to `ps -eo pcpu=,rss=,comm=`. That option
+        set is procps-specific and is rejected by BusyBox ps, which produced empty stdout
+        and the bare "invalid CPU or memory measurement" that ended runs 30173477457 and
+        30179378599. This method only ever runs against the CANDIDATE machine (via
+        migration_samples), so the incompatibility could not surface until a run first
+        reached the candidate transition, roughly 1.5 hours in, and the error text named
+        no command and quoted no output.
+
+        /proc is present on any Linux image, and the arithmetic reproduces exactly what ps
+        computes: pcpu is (utime+stime)/HZ over process elapsed time, rss is the stat page
+        count scaled to KiB. Semantics are therefore unchanged; only the source is.
+        """
+        command = (
+            "up=$(cut -d' ' -f1 /proc/uptime); "
+            "awk -v up=\"$up\" -v hz=\"$(getconf CLK_TCK 2>/dev/null || echo 100)\" "
+            "-v pg=\"$(getconf PAGESIZE 2>/dev/null || echo 4096)\" '"
+            "FNR==1{o=index($0,\"(\"); c=index($0,\")\"); comm=substr($0,o+1,c-o-1); "
+            "n=split(substr($0,c+2),f,\" \"); if(n<22) next; "
+            "if(comm ~ /muninndb/){el=up-(f[20]/hz); if(el>0){cpu+=100*((f[12]+f[13])/hz)/el} rss+=f[22]*pg/1024}"
+            "} END{printf \"%.3f %d\\n\", cpu, rss}' /proc/[0-9]*/stat"
+        )
+        captured = self.run(["machine", "exec", machine_id, "-a", identity.app_name, "--timeout", "30", command]).stdout
+        fields = captured.split()
         if len(fields) != 2:
-            raise RehearsalUnknown("invalid CPU or memory measurement")
+            raise RehearsalUnknown(f"invalid CPU or memory measurement; command output was {captured.strip()[:200]!r}")
         try: cpu_percent, rss_kib = float(fields[0]), int(fields[1])
         except ValueError as exc: raise RehearsalUnknown("invalid CPU or memory values") from exc
         if cpu_percent < 0 or rss_kib <= 0: raise RehearsalUnknown("missing MuninnDB process measurement")

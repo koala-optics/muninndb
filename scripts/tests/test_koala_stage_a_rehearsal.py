@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -508,6 +509,129 @@ class StageAContractTests(unittest.TestCase):
         regex and prints without a printf format string."""
         self.assertNotIn('"', stage.PROCFS_RESOURCE_AWK)
         self.assertNotIn("'", stage.PROCFS_RESOURCE_AWK)
+
+    def test_shell_command_refuses_a_backslash_because_transport_drops_it(self):
+        """Runs 30183128792 and 30185035316 both reported a missing process measurement
+        while the shell canary passed. The canary carries no backslash and the measurement
+        carried two, so the wrapper must refuse one rather than ship a program that arrives
+        subtly different from the one that was written."""
+        with self.assertRaises(stage.RehearsalUnknown):
+            stage.shell_command("awk '/\\(/{print}'")
+
+    def test_procfs_awk_program_carries_no_backslash(self):
+        """The parenthesis literals are bracket expressions for this reason. An escape that
+        does not survive transport turns the comm match into a whole-line match, which is
+        the exact shape of both lost runs' receipts."""
+        self.assertNotIn("\\", stage.PROCFS_RESOURCE_AWK)
+
+    def procfs_fixture(self, root):
+        """Write a /proc-shaped fixture: uptime, one MuninnDB process, one unrelated
+        daemon, one kernel thread."""
+        def stat(pid, comm, utime, stime, starttime, rss, ppid=1):
+            fields = ["S", str(ppid)] + ["0"] * 9 + [str(utime), str(stime)] + ["0"] * 6 + [str(starttime), "0", str(rss)]
+            return f"{pid} ({comm}) " + " ".join(fields) + "\n"
+        (root / "uptime").write_text("1000.00 900.00\n")
+        (root / "stat-muninndb").write_text(stat(42, "muninndb-server", 45000, 45000, 10000, 1000))
+        (root / "stat-other").write_text(stat(43, "some-other-daemon", 99000, 99000, 10000, 5000))
+        (root / "stat-kernel").write_text(stat(9, "cpuhp/0", 10, 10, 0, 0, ppid=2))
+        return [str(root / "uptime"), str(root / "stat-muninndb"),
+                str(root / "stat-other"), str(root / "stat-kernel")]
+
+    def test_procfs_awk_program_measures_a_real_process_table(self):
+        """The constant was only ever asserted as text. Runs 30183128792 and 30185035316
+        each paid a full corpus ingest to discover it could not read a process, so it is
+        executed here against a fixture with a known answer: 100% of one core and 4000 KiB
+        for the MuninnDB process, with the unrelated daemon and the kernel thread ignored."""
+        awk = shutil.which("mawk") or shutil.which("gawk") or shutil.which("awk")
+        if not awk: self.skipTest("no awk available")
+        with tempfile.TemporaryDirectory() as root:
+            inputs = self.procfs_fixture(Path(root))
+            proc = subprocess.run([awk, "-v", "hz=100", "-v", "pg=4096", stage.PROCFS_RESOURCE_AWK] + inputs,
+                                  capture_output=True, text=True, check=True)
+        self.assertEqual(proc.stdout.split(), ["100", "4000"])
+
+    def test_procfs_awk_program_reads_nothing_if_its_parenthesis_match_is_weakened(self):
+        """The regression witness for both lost runs. Dropping the escape, which is what the
+        transport did to the previous program, makes the comm match swallow the whole line
+        and the field split behind it return nothing, so every process is skipped and the
+        measurement reports zero rather than failing loudly."""
+        awk = shutil.which("mawk") or shutil.which("gawk") or shutil.which("awk")
+        if not awk: self.skipTest("no awk available")
+        weakened = stage.PROCFS_RESOURCE_AWK.replace("/[(].*[)]/", "/(.*)/")
+        self.assertNotEqual(weakened, stage.PROCFS_RESOURCE_AWK)
+        with tempfile.TemporaryDirectory() as root:
+            inputs = self.procfs_fixture(Path(root))
+            proc = subprocess.run([awk, "-v", "hz=100", "-v", "pg=4096", weakened] + inputs,
+                                  capture_output=True, text=True, check=True)
+        self.assertEqual(proc.stdout.split(), ["0", "0"])
+
+    def test_process_inventory_excludes_kernel_threads_and_announces_truncation(self):
+        """Run 30185035316's inventory sorted sixteen cpuhp threads ahead of everything and
+        then cut the line mid-token at a silent 200 character cap, so the one name it
+        existed to look for could not have appeared. Both faults are the point of this
+        test: kernel threads are filtered at the source, and a cut says it is a cut."""
+        identity = stage.build_identity("inventory-shape")
+        names = "\n".join(f"daemon-with-a-long-name-{index:03d}" for index in range(60))
+        def runner(cmd, **kwargs):
+            if "exec" in cmd and "RSTART+1" in cmd[-1] and "cpu" not in cmd[-1]:
+                return subprocess.CompletedProcess(cmd, 0, names + "\n", "")
+            return subprocess.CompletedProcess(cmd, 0, "0.000 0\n", "")
+        with self.assertRaises(stage.RehearsalUnknown) as caught:
+            stage.FlyRuntime(runner=runner).resource_sample(identity, "m1", "migration")
+        detail = str(caught.exception)
+        self.assertIn("60 names, truncated", detail)
+        self.assertIn("daemon-with-a-long-name-000", detail)
+
+    def test_resource_measurement_is_witnessed_on_the_serving_baseline_before_ingestion(self):
+        """resource_sample was only ever called from migration_samples, so a broken
+        measurement could not surface until a run had already spent a corpus ingest and a
+        45 minute migration window reaching the candidate. Runs 30183128792 and 30185035316
+        were spent that way. Taking one sample against the serving baseline, where a
+        MuninnDB process is known to exist, fails a broken measurement before the ingest
+        starts and separates it from a candidate that never starts."""
+        identity = stage.build_identity("baseline-witness")
+        runtime = mock.Mock()
+        runtime.create_app.return_value = identity.app_name
+        runtime.mirror_candidate.return_value = f"{stage.FLY_REGISTRY}/{identity.app_name}:{stage.CANDIDATE_MIRROR_TAG}"
+        runtime.create_volume.return_value = "vol_owned"
+        runtime.create_machine.return_value = "machine_owned"
+        runtime.provisioning_probe.return_value = "machine_probe"
+        runtime.proxy.return_value = mock.Mock(poll=mock.Mock(return_value=0))
+        runtime.disk_sample.return_value = stage.DiskSample("empty", 100, 900, 1000)
+        runtime.list_owned_resources.return_value = []
+        runtime.resource_sample.side_effect = stage.RehearsalUnknown("missing MuninnDB process measurement; processes present: init,hallpass")
+        client = mock.Mock()
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "witness.json"
+            self.assertEqual(stage.execute(identity, stage.CorpusSpec(payload_shape="lexical"), path,
+                                           runtime=runtime, client_factory=lambda _url, _auth: client), 2)
+            document = json.loads(path.read_text())
+        self.assertEqual(document["status"], "UNKNOWN")
+        self.assertIn("missing MuninnDB process measurement", document["detail"])
+        client.call.assert_not_called()
+        runtime.migration_samples.assert_not_called()
+        self.assertEqual(runtime.resource_sample.call_args.args[2], "baseline-serving")
+        self.assertEqual(document["orphans"], [])
+
+    def test_process_inventory_probe_filters_kernel_threads_by_parentage(self):
+        """Filtering has to happen on the machine, not in the receipt string, or a busy
+        kernel thread table crowds the answer out before it is ever transmitted."""
+        awk = shutil.which("mawk") or shutil.which("gawk") or shutil.which("awk")
+        if not awk: self.skipTest("no awk available")
+        identity = stage.build_identity("inventory-filter")
+        captured = []
+        def runner(cmd, **kwargs):
+            captured.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, "0.000 0\n", "")
+        with self.assertRaises(stage.RehearsalUnknown):
+            stage.FlyRuntime(runner=runner).resource_sample(identity, "m1", "migration")
+        probe = [c for c in captured if "RSTART+1" in c[-1] and "cpu" not in c[-1]][-1][-1]
+        self.assertNotIn("\\", probe)
+        program = shlex.split(probe)[2].split("'")[1]
+        with tempfile.TemporaryDirectory() as root:
+            inputs = self.procfs_fixture(Path(root))[1:]
+            proc = subprocess.run([awk, program] + inputs, capture_output=True, text=True, check=True)
+        self.assertEqual(sorted(proc.stdout.split()), ["muninndb-server", "some-other-daemon"])
 
     def test_exec_canary_rejects_output_that_is_not_the_expected_token(self):
         """Empty stdout is the exact signature of the three lost runs, so the canary must

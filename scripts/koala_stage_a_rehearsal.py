@@ -36,6 +36,7 @@ DEFAULT_PAYLOAD_SHAPE = "lexical"
 MIN_PAYLOAD_BYTES, MAX_PAYLOAD_BYTES = 1_000, 32_000
 CALIBRATION_SAMPLE_COUNT = 25_000
 CALIBRATION_LOW_PAYLOAD_BYTES, CALIBRATION_HIGH_PAYLOAD_BYTES = MIN_PAYLOAD_BYTES, 4_000
+TAIL_PROBE_SAMPLE_COUNT = 2_000
 FALSIFICATION_RUN_ID = "30108034677"
 FALSIFICATION_RECEIPT_SHA256 = "b89c4daf7d4b6b55d92f1754d65606b9406cfdd60156bc450ab00d5048de6d68"
 ABLATION_COHORTS = (
@@ -89,6 +90,8 @@ FUZZY_CONTEXTS = (("Stage A Entity 00",), ("Stage A Entity 01",), ("Stage A Enti
 FUZZY_PASSES = 3
 RESTORE_LIMIT_S, ROLLBACK_LIMIT_S = 45 * 60, 30 * 60
 SNAPSHOT_LIMIT_S, SNAPSHOT_POLL_INTERVAL_S = 10 * 60, 5.0
+VOLUME_READY_LIMIT_S, VOLUME_READY_POLL_INTERVAL_S = 15 * 60, 5.0
+VOLUME_READY_STATE, VOLUME_HYDRATING_STATES = "created", {"restoring", "pending", "creating"}
 HELPER_POLL_INTERVAL_S, HELPER_STATUS_RETRIES = 5.0, 5
 DESTROY_ATTEMPTS, DESTROY_RETRY_DELAY_S = 3, 5.0
 FLY_REGION, FLY_ORG, MCP_PORT = "ewr", "personal", 8750
@@ -257,6 +260,21 @@ def validate_execute_spec(spec: CorpusSpec) -> None:
     validate_spec(spec)
     if spec.payload_shape != DEFAULT_PAYLOAD_SHAPE or spec.payload_bytes != DEFAULT_PAYLOAD_BYTES:
         raise RehearsalUnknown("execute corpus differs from qualified lexical contract")
+
+def validate_tail_probe_spec(spec: CorpusSpec) -> None:
+    """Pin the probe corpus, exactly as calibration pins its own.
+
+    The probe shrinks the record COUNT and nothing else: payload shape and size stay on
+    the qualified lexical contract, so the semantic probes, the migration, the archive and
+    the restore command all run against the real record shape. Only the ingest gets short.
+    `validate_execute_spec` is deliberately untouched - a real run still requires the full
+    502,385, and a probe corpus can never reach it because the count is pinned here.
+    """
+    if spec.count != TAIL_PROBE_SAMPLE_COUNT:
+        raise RehearsalUnknown("tail-probe corpus differs from fixed probe contract")
+    if spec.payload_shape != DEFAULT_PAYLOAD_SHAPE or spec.payload_bytes != DEFAULT_PAYLOAD_BYTES:
+        raise RehearsalUnknown("tail-probe corpus differs from qualified lexical contract")
+    validate_spec(spec, minimum_count=TAIL_PROBE_SAMPLE_COUNT)
 
 def fnv1a_32(value: str) -> int:
     result = 2166136261
@@ -533,10 +551,23 @@ def wait_for_storage_quiet(
         time.sleep(interval_s)
     raise RehearsalUnknown("storage quiet-window deadline expired")
 
-def combine_status(gates: dict[str, Gate], orphans: Sequence[str]) -> str:
+def combine_status(gates: dict[str, Gate], orphans: Sequence[str], *, probe: bool = False) -> str:
+    """Reduce the gate set to one verdict, and refuse a skipped gate outside a probe.
+
+    Only the tail probe may skip a gate, and only the four whose thresholds are functions
+    of corpus size. A SKIPPED gate reaching a qualification run would otherwise read as a
+    pass, which is the exact shape of weakening a gate to make a corpus fit, so it is
+    forced to UNKNOWN here rather than trusted to never happen.
+    """
+    if any(g.status == "SKIPPED" for g in gates.values()) and not probe: return "UNKNOWN"
     if orphans or any(g.status == "UNKNOWN" for g in gates.values()): return "UNKNOWN"
     if any(g.status == "FAILED" for g in gates.values()): return "FAILED"
     return "PASSED"
+
+def scale_gate(probe: bool, gate: Gate, name: str) -> Gate:
+    """Keep a corpus-scale gate's real verdict, or record why the probe cannot judge it."""
+    if not probe: return gate
+    return Gate("SKIPPED", f"{name} is a function of corpus size and is not judged at probe scale")
 
 def require_single_mount(mounts: list[dict[str, str]], role: str) -> None:
     """Refuse a machine config Fly cannot launch.
@@ -814,12 +845,59 @@ class FlyRuntime:
     def install_auth(self, identity: RunIdentity, auth_value: str) -> None:
         env_name = "MUNINN" + "_MCP_TOKEN"
         self.run(["secrets", "import", "-a", identity.app_name, "--stage"], stdin=f"{env_name}={auth_value}\nMUNINN_LOCAL_EMBED=0\n")
+    def volume_state(self, identity: RunIdentity, volume_id: str) -> str:
+        volumes = self.json(["volumes", "list", "-a", identity.app_name])
+        if not isinstance(volumes, list): raise RehearsalUnknown("volume listing returned invalid shape")
+        matches = [v for v in volumes if isinstance(v, dict) and v.get("id") == volume_id]
+        if len(matches) != 1: raise RehearsalUnknown("volume state missing or ambiguous")
+        state = str(matches[0].get("state", ""))
+        if not state: raise RehearsalUnknown("volume state absent")
+        return state
+
+    def wait_volume_hydrated(self, identity: RunIdentity, volume_id: str, *,
+                             timeout_s: float = VOLUME_READY_LIMIT_S,
+                             interval_s: float = VOLUME_READY_POLL_INTERVAL_S) -> float:
+        """Hold until a forked volume finishes hydrating, because a mount before that fails.
+
+        A volume forked from a snapshot of a POPULATED volume is created in state
+        `restoring` and is not mountable until it reaches `created`. A machine asked to
+        mount it in the meantime sits in `created`, and `flyctl machine run` abandons its
+        own start-wait after about a minute and exits non-zero with "machine failed to
+        reach desired start state" - which is precisely how runs 30217281791 and
+        30220383793 died, both immediately after forking the backup volume.
+
+        The machine is not actually broken: measured directly on a disposable app, a 14 GB
+        fork reported `restoring`, flyctl gave up at ~62s, and the machine went on to start
+        by itself at 3m13s and read every byte through the fork. So the defect is the
+        harness mounting too early, not Fly failing. Waiting here fixes it at the single
+        place every fork is created, which covers the rollback fork as well - a phase no
+        rehearsal has ever reached, and which would otherwise have failed the same way.
+
+        A near-empty fork hydrates instantly and reports `created` on the first poll, which
+        is why this never appeared before the corpus was large, and why the first probe run
+        against an empty volume wrongly cleared the fork.
+        """
+        if timeout_s <= 0 or interval_s <= 0: raise RehearsalUnknown("invalid volume readiness contract")
+        started, deadline = time.monotonic(), time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            state = self.volume_state(identity, volume_id)
+            if state == VOLUME_READY_STATE: return time.monotonic() - started
+            # An unrecognised state is never waited out: it may be terminal, and polling a
+            # dead volume to the deadline would report a timeout instead of the real state.
+            if state not in VOLUME_HYDRATING_STATES:
+                raise RehearsalUnknown(f"forked volume entered unexpected state: {safe_detail(state)}")
+            time.sleep(interval_s)
+        raise RehearsalUnknown(f"forked volume did not finish hydrating within {timeout_s:.0f}s")
+
     def create_volume(self, identity: RunIdentity, name: str, *, snapshot_id: str | None = None) -> str:
         assert_owned(name, identity, "volume-name")
         args = ["volumes", "create", name, "-a", identity.app_name, "--region", FLY_REGION, "--size", str(VOLUME_SIZE_GB), "--scheduled-snapshots=false", "--yes"]
         if snapshot_id: args.extend(["--snapshot-id", snapshot_id])
         result = self.json(args); volume_id = str(result.get("id", "")) if isinstance(result, dict) else ""
         if not volume_id or volume_id in PRODUCTION_VOLUME_IDS: raise RehearsalUnknown("invalid or preserved volume ID")
+        # Only a fork hydrates; a fresh volume is mountable on return and polling it would
+        # add a listing call to every provisioning path for a state it already holds.
+        if snapshot_id: self.wait_volume_hydrated(identity, volume_id)
         return volume_id
     def create_machine(self, identity: RunIdentity, volume_id: str, image: str, role: str) -> str:
         if volume_id in PRODUCTION_VOLUME_IDS: raise RehearsalUnknown("refusing production volume")
@@ -1820,7 +1898,19 @@ def ablate(
     return exit_code
 
 def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runtime: FlyRuntime | None = None,
-            client_factory: Callable[[str, str], MCPClient] | None = None, local_port: int = 18750) -> int:
+            client_factory: Callable[[str, str], MCPClient] | None = None, local_port: int = 18750,
+            probe: bool = False) -> int:
+    """Run every Stage A phase. With probe=True, run them against a probe-scale corpus.
+
+    Fifteen rehearsals died one defect at a time because the tail phases - backup, volume
+    snapshot, fork, restore and rollback - are only ever reached after a roughly 50-minute
+    ingest of 502,385 records, so each tail defect cost a full run to find. The probe runs
+    the identical code path against 2,000 records, which puts the same faults minutes from
+    the start instead of an hour. It is the tail counterpart of `provisioning_probe`, which
+    already does this for the phases BEFORE the ingest, and it relaxes nothing: the four
+    corpus-scale gates are recorded SKIPPED rather than loosened, and the probe's own status
+    can never be PASSED, so the workflow's verdict step cannot accept it as qualification.
+    """
     runtime = runtime or FlyRuntime(); client_factory = client_factory or (lambda url, auth: MCPClient(url, auth))
     ledger, proxy = ResourceLedger(), None
     gates: dict[str, Gate] = {}; measurements: dict[str, Any] = {"disk_samples": [], "latencies": {}}
@@ -1829,7 +1919,8 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
     detail, status, exit_code = "rehearsal did not complete", "UNKNOWN", 2
     auth_value = secrets.token_urlsafe(32)
     try:
-        validate_execute_spec(spec); validate_image(BASELINE_IMAGE, "baseline"); validate_image(CANDIDATE_IMAGE, "candidate"); runtime.preflight(identity)
+        validate_tail_probe_spec(spec) if probe else validate_execute_spec(spec)
+        validate_image(BASELINE_IMAGE, "baseline"); validate_image(CANDIDATE_IMAGE, "candidate"); runtime.preflight(identity)
         ledger.app = runtime.create_app(identity); candidate_ref = runtime.mirror_candidate(identity); runtime.install_auth(identity, auth_value)
         ledger.machine_id = runtime.provisioning_probe(identity, candidate_ref)
         runtime.wait_ready(identity, ledger.machine_id, READINESS_LIMIT_S)
@@ -1874,7 +1965,7 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
         )
         measurements["storage_settlement_witness"] = quiet["witness"]
         measurements["direct_net_store_growth_bytes"] = settled.used_bytes - empty.used_bytes
-        gates["store_footprint"] = direct_store_growth_gate(empty, settled)
+        gates["store_footprint"] = scale_gate(probe, direct_store_growth_gate(empty, settled), "store footprint")
         baseline_counts, status_samples = query_counts(client); measurements["baseline_counts"] = baseline_counts
         gates["baseline_status"] = threshold_gate("baseline status", max(status_samples) / 1000, STATUS_LIMIT_S)
         require_legacy_baseline_counts(baseline_counts, spec)
@@ -1891,7 +1982,7 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
         migration_s = time.monotonic() - migration_started
         measurements["disk_samples"].extend(asdict(sample) | {"free_percent": sample.free_percent} for sample in migration_disks)
         measurements["migration_resources"] = [asdict(sample) for sample in migration_resources]
-        gates["migration_duration"] = threshold_gate("migration duration", migration_s, MIGRATION_LIMIT_S)
+        gates["migration_duration"] = scale_gate(probe, threshold_gate("migration duration", migration_s, MIGRATION_LIMIT_S), "migration duration")
         readiness_started = time.monotonic(); proxy = runtime.proxy(identity, ledger.machine_id, local_port); candidate = client_factory(f"http://127.0.0.1:{local_port}/mcp", auth_value); candidate.initialize()
         _, readiness_status_ms = query_count(candidate, "stage-a-primary")
         readiness_s = time.monotonic() - readiness_started
@@ -1911,10 +2002,10 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
         gates["semantic_probes"] = Gate("PASSED", "exact-concept, entity ordering, vault isolation, collision hydration, lifecycle filtering, and fuzzy reads passed")
         measurements["latencies"] = {name: latency_summary(values) for name, values in samples.items()}
         p95 = max(summary["p95_ms"] or 0 for summary in measurements["latencies"].values() if summary["count"])
-        gates["query_latency"] = threshold_gate("bounded query p95", p95, QUERY_P95_LIMIT_MS)
+        gates["query_latency"] = scale_gate(probe, threshold_gate("bounded query p95", p95, QUERY_P95_LIMIT_MS), "bounded query p95")
         post = runtime.disk_sample(identity, ledger.machine_id, "post-migration"); measurements["disk_samples"].append(asdict(post) | {"free_percent": post.free_percent})
         all_disk_samples = [empty, immediate, *quiet["samples"], *migration_disks, post]
-        gates["disk_headroom"] = disk_gate(all_disk_samples)
+        gates["disk_headroom"] = scale_gate(probe, disk_gate(all_disk_samples), "disk headroom")
         gates["resource_sampling"] = Gate("PASSED" if migration_resources else "UNKNOWN", "migration CPU and RSS samples captured", len(migration_resources))
         terminate_proxy(proxy); proxy = None; runtime.stop_machine(identity, ledger.machine_id); runtime.destroy_machine(identity, ledger.machine_id); ledger.machine_id = None
         ledger.machine_id = runtime.create_machine(identity, ledger.volume_id, candidate_ref, "clean-restart"); runtime.wait_ready(identity, ledger.machine_id, READINESS_LIMIT_S)
@@ -1979,13 +2070,19 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
     finally:
         try: terminate_proxy(proxy)
         except RehearsalError: status, exit_code, detail = "UNKNOWN", 2, "local proxy cleanup uncertain"
-        cleanup_result, orphans = cleanup(runtime, identity, ledger); computed = combine_status(gates, orphans)
+        cleanup_result, orphans = cleanup(runtime, identity, ledger); computed = combine_status(gates, orphans, probe=probe)
         if detail == "all measured Stage A phases completed": status, exit_code = computed, 0 if computed == "PASSED" else (1 if computed == "FAILED" else 2)
         if orphans: status, exit_code, detail = "UNKNOWN", 2, with_cleanup_concern(detail, orphans)
+        if probe and status == "PASSED":
+            # A probe proves the tail executes, never that the candidate qualifies: it
+            # ingested 2,000 records and did not judge four gates. Renaming the success
+            # is what keeps the workflow's `receipt.status == "PASSED"` check honest.
+            status, detail = "TAIL_PROBE_PASS", f"{detail} at probe scale; four corpus-scale gates not judged"
         write_receipt(receipt_path, receipt_document(
             identity, spec, status=status, exit_code=exit_code, detail=detail, ledger=ledger,
             measurements=measurements, gates=gates, cleanup_result=cleanup_result,
             orphans=orphans, corpus=corpus_receipt, candidate_ref=candidate_ref,
+            mode="tail_probe" if probe else "execute",
         ))
     return exit_code
 
@@ -1995,6 +2092,7 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--execute", action="store_true")
     mode.add_argument("--calibrate", action="store_true")
     mode.add_argument("--ablate", action="store_true")
+    mode.add_argument("--tail-probe", action="store_true")
     mode.add_argument("--cleanup-only", action="store_true")
     parser.add_argument("--run-id", required=True); parser.add_argument("--confirm"); parser.add_argument("--record-count", type=int)
     parser.add_argument("--plan-mode", choices=("execute", "calibrate", "ablate"), default="execute")
@@ -2007,14 +2105,15 @@ def main(argv: list[str] | None = None) -> int:
     try:
         identity = build_identity(args.run_id)
         calibrating = args.calibrate or args.ablate or (args.dry_run and args.plan_mode in {"calibrate", "ablate"})
+        default_count = TAIL_PROBE_SAMPLE_COUNT if args.tail_probe else (CALIBRATION_SAMPLE_COUNT if calibrating else DEFAULT_RECORD_COUNT)
         spec = CorpusSpec(
-            args.record_count if args.record_count is not None else (CALIBRATION_SAMPLE_COUNT if calibrating else DEFAULT_RECORD_COUNT),
+            args.record_count if args.record_count is not None else default_count,
             args.batch_size,
             args.payload_bytes if args.payload_bytes is not None else (CALIBRATION_LOW_PAYLOAD_BYTES if calibrating else DEFAULT_PAYLOAD_BYTES),
             args.seed,
             "opaque" if calibrating else DEFAULT_PAYLOAD_SHAPE,
         )
-        if not (args.execute or args.calibrate or args.ablate or args.cleanup_only):
+        if not (args.execute or args.calibrate or args.ablate or args.tail_probe or args.cleanup_only):
             print(json.dumps(plan(identity, spec, mode=args.plan_mode), indent=2 if args.json else None, sort_keys=True)); return 0
         if args.confirm != identity.confirmation:
             print("REFUSED: mutating mode requires the exact run-specific confirmation", file=sys.stderr); print(f"Required confirmation: {identity.confirmation}", file=sys.stderr); return 2
@@ -2022,7 +2121,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.cleanup_only: return cleanup_only(identity, args.receipt)
         if args.calibrate: return calibrate(identity, spec, args.receipt)
         if args.ablate: return ablate(identity, spec, args.receipt)
-        return execute(identity, spec, args.receipt)
+        return execute(identity, spec, args.receipt, probe=args.tail_probe)
     except RehearsalError as exc: print(f"Stage A refused: {safe_detail(str(exc))}", file=sys.stderr); return 2
 
 if __name__ == "__main__": raise SystemExit(main())

@@ -58,6 +58,7 @@ EXEC_CANARY_TOKEN = "42"
 PROCESS_INVENTORY_CHARS = 600
 STALL_DIAGNOSTIC_LINES = 20
 SAFE_DETAIL_CHARS, RECEIPT_DETAIL_CHARS = 400, 1600
+TRUNCATION_MARKER = " ...[truncated]... "
 # The backup archive lives beside the store because a Fly machine mounts one volume, so
 # the helper that writes it cannot also mount a separate backup volume.
 BACKUP_ARCHIVE_DIR = "/data"
@@ -88,6 +89,7 @@ FUZZY_CONTEXTS = (("Stage A Entity 00",), ("Stage A Entity 01",), ("Stage A Enti
 FUZZY_PASSES = 3
 RESTORE_LIMIT_S, ROLLBACK_LIMIT_S = 45 * 60, 30 * 60
 SNAPSHOT_LIMIT_S, SNAPSHOT_POLL_INTERVAL_S = 10 * 60, 5.0
+HELPER_POLL_INTERVAL_S, HELPER_STATUS_RETRIES = 5.0, 5
 FLY_REGION, FLY_ORG, MCP_PORT = "ewr", "personal", 8750
 BASELINE_IMAGE = "registry.fly.io/koala-muninndb:deployment-01KSWRX9GKW5M94MQQCBZSJZHS"
 BASELINE_DIGEST = "sha256:c06842e1452f2aab4c1f01207adf9406bfe757b4984da516568006f1f5c8ad86"
@@ -582,14 +584,25 @@ def shell_command(script: str) -> str:
     return f'/bin/sh -c "{script}"'
 
 def safe_detail(value: str, limit: int = SAFE_DETAIL_CHARS) -> str:
-    """Compact a diagnostic to a bounded tail, blanking it entirely if anything matches.
+    """Compact a diagnostic to a bounded excerpt, blanking it entirely if anything matches.
+
+    Both ends are kept. Run 30212272430 composed the flyctl error and the stalled-helper
+    reading into one string, and a tail-only budget dropped the error while keeping the
+    reading, so the receipt described what the helper was doing without saying what had
+    failed. The error had to be recovered from an older run that predated the reading.
+    The head is therefore preserved alongside the tail and the middle is dropped instead.
 
     The limit is a verbosity bound, not a safety one. Redaction is decided by
-    SENSITIVE_TEXT over whatever survives truncation, so a longer limit widens what is
-    checked as well as what is emitted and can never let through something a shorter one
-    would have caught. Only the budget varies by caller; the predicate never does.
+    SENSITIVE_TEXT over exactly the text that is returned, so nothing reaches a caller
+    unchecked. A match lying wholly inside the dropped middle is not emitted either, and
+    the marker between the halves keeps them from splicing into a match that neither end
+    contained. Only the budget varies by caller; the predicate never does.
     """
-    compact = " ".join(value.split())[-limit:]
+    compact = " ".join(value.split())
+    if len(compact) > limit:
+        budget = max(limit - len(TRUNCATION_MARKER), 2)
+        head = budget // 3
+        compact = f"{compact[:head]}{TRUNCATION_MARKER}{compact[head - budget:]}"
     return "[REDACTED: sensitive diagnostic omitted]" if SENSITIVE_TEXT.search(compact) else compact
 
 def atomic_write_json(path: Path, value: dict[str, Any]) -> None:
@@ -879,14 +892,37 @@ class FlyRuntime:
         return " | ".join(parts)
 
     def wait_stopped(self, identity: RunIdentity, machine_id: str, timeout_s: float) -> float:
-        started = time.monotonic()
-        try:
-            self.run(["machine", "wait", machine_id, "-a", identity.app_name, "--state", "stopped",
-                      "--wait-timeout", f"{math.ceil(timeout_s)}s"], timeout=math.ceil(timeout_s) + 30)
-        except RehearsalUnknown as exc:
-            raise RehearsalUnknown(
-                f"{exc} || helper still running at deadline: "
-                f"{self.stalled_helper_diagnostics(identity, machine_id)}") from exc
+        """Poll the helper's state until it stops, instead of holding one long wait call.
+
+        `flyctl machine wait` holds a single request open for the whole deadline. In run
+        30212272430 that call failed about a minute into a 45 minute budget while the
+        helper was still doing useful work: the archive was growing and tar and gzip were
+        both alive. One dropped long-lived request is not evidence that the helper failed,
+        yet it ended the rehearsal as though it were. Polling machine_status on the cadence
+        wait_ready already uses replaces that single 45 minute request with short
+        independent ones, and leaves the deadline itself unchanged.
+
+        Polling trades one fragile request for many short ones, and over a long wait there
+        are enough of them that a single transient error is likely, so a bounded run of
+        consecutive failures is absorbed rather than treated as a verdict. The count resets
+        on any successful reading, so a persistent fault still surfaces quickly and never
+        consumes the whole deadline in silence.
+        """
+        started, deadline, failures = time.monotonic(), time.monotonic() + timeout_s, 0
+        while True:
+            try:
+                state = self.machine_status(identity, machine_id).get("state"); failures = 0
+            except RehearsalUnknown as exc:
+                failures += 1
+                if failures > HELPER_STATUS_RETRIES: raise RehearsalUnknown(f"helper state unreadable: {exc}") from exc
+                state = None
+            if state == "stopped": break
+            if time.monotonic() >= deadline:
+                raise RehearsalUnknown(
+                    f"helper did not reach stopped within {math.ceil(timeout_s)}s, currently "
+                    f"{state} || reading at deadline: "
+                    f"{self.stalled_helper_diagnostics(identity, machine_id)}")
+            time.sleep(HELPER_POLL_INTERVAL_S)
         status = self.run(["machine", "status", machine_id, "-a", identity.app_name], timeout=60).stdout
         exit_codes = re.findall(r"exit_code\s*[=:]\s*([0-9]+)", status)
         if not exit_codes: raise RehearsalUnknown("offline helper exit code missing")

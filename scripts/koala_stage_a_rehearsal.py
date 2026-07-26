@@ -78,6 +78,14 @@ PROCFS_RESOURCE_AWK = (
     "END{print cpu+0,int(rss)}"
 )
 QUERY_P95_LIMIT_MS, STATUS_LIMIT_S = 250.0, 30.0
+# Every entity and group name that exists on a primary-vault probe record, with its match
+# count, derived from record_for rather than assumed: Entity 00 (2), 01 (2), 07 (1),
+# 42 (503), 43 (1), Group 0 (504), 1 (4), 2 (1). An absent name would return nothing and
+# contribute an unrepresentatively fast sample, so the set is exactly the non-empty ones.
+FUZZY_CONTEXTS = (("Stage A Entity 00",), ("Stage A Entity 01",), ("Stage A Entity 07",),
+                  ("Stage A Entity 42",), ("Stage A Entity 43",), ("Stage A Group 0",),
+                  ("Stage A Group 1",), ("Stage A Group 2",))
+FUZZY_PASSES = 3
 RESTORE_LIMIT_S, ROLLBACK_LIMIT_S = 45 * 60, 30 * 60
 SNAPSHOT_LIMIT_S, SNAPSHOT_POLL_INTERVAL_S = 10 * 60, 5.0
 FLY_REGION, FLY_ORG, MCP_PORT = "ewr", "personal", 8750
@@ -1333,6 +1341,25 @@ def run_lifecycle_probes(client: MCPClient, receipt: CorpusReceipt) -> None:
     if not isinstance(restored, dict) or restored.get("restored") is not True: raise RehearsalFailed("soft-delete restore failed")
 
 def run_query_probes(client: MCPClient, receipt: CorpusReceipt) -> dict[str, list[float]]:
+    """Time the bounded query surface that the query_latency gate reads.
+
+    The fuzzy probe used to take two samples, so its "p95" was arithmetically just the
+    slower of two readings. Run 30206002340 failed the gate on it at 263.191 against a
+    250ms limit; back-solving that run's reported p50 and max puts the two samples at
+    245.77 and 264.11, straddling the threshold. Run 30202877942 drew 214.356 from the
+    same two-sample instrument and passed. Neither run measured anything a percentile
+    could be computed from, so neither says whether RC2 fuzzy latency is acceptable.
+
+    The threshold is deliberately unchanged at 250ms. What changes is that the number is
+    now measurable: every non-empty context, three passes, 24 samples. Repeats are
+    interleaved a full cycle apart rather than run back to back, and because p95 is a tail
+    statistic the warm repeats move the median without flattering the tail.
+
+    This is a harder gate than the one it replaces, not a softer one. The old pair queried
+    Entity 00 and Group 2, which match 2 and 1 records; the set below also queries
+    Entity 42 and Group 0, which match 503 and 504. Those were never measured before, so a
+    failure here is a real reading of a case the gate previously skipped.
+    """
     samples: dict[str, list[float]] = {"exact": [], "entity": [], "read": [], "fuzzy": []}
     for index, concept in enumerate(COLLISION_CONCEPTS):
         result, latency = client.call("muninn_find_by_concept", {"vault": "stage-a-primary", "concept": concept, "limit": 50})
@@ -1343,8 +1370,9 @@ def run_query_probes(client: MCPClient, receipt: CorpusReceipt) -> dict[str, lis
         if entity == "Stage A Entity 42": verify_entity_ordering(result, list(reversed(receipt.retained_ids["ordering"])))
     for memory_id in receipt.retained_ids["ordering"][:10]:
         _, latency = client.call("muninn_read", {"vault": "stage-a-primary", "id": memory_id}); samples["read"].append(latency)
-    for context in (["Stage A Entity 00"], ["Stage A Group 2"]):
-        _, latency = client.call("muninn_recall", {"vault": "stage-a-primary", "context": context, "limit": 10}); samples["fuzzy"].append(latency)
+    for _ in range(FUZZY_PASSES):
+        for context in FUZZY_CONTEXTS:
+            _, latency = client.call("muninn_recall", {"vault": "stage-a-primary", "context": list(context), "limit": 10}); samples["fuzzy"].append(latency)
     isolated_concept = "stage-a/isolation/0000097"
     cross, _ = client.call("muninn_find_by_concept", {"vault": "stage-a-primary", "concept": isolated_concept, "limit": 50})
     if result_ids(cross): raise RehearsalFailed("vault isolation failed")

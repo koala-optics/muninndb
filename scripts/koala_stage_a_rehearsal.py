@@ -1642,7 +1642,11 @@ def run_query_probes(client: MCPClient, receipt: CorpusReceipt) -> dict[str, lis
     return samples
 
 def plan(identity: RunIdentity, spec: CorpusSpec, *, mode: str = "execute") -> dict[str, Any]:
-    if mode in {"calibrate", "ablate"}: validate_calibration_spec(spec)
+    # Each plan mode is held to its OWN corpus contract, so a plan can never render a
+    # corpus its run would refuse. Without the probe branch, `--plan-mode execute`
+    # rejects the 2,000-record probe corpus and the workflow cannot render its artifact.
+    if mode == "tail-probe": validate_tail_probe_spec(spec)
+    elif mode in {"calibrate", "ablate"}: validate_calibration_spec(spec)
     else: validate_execute_spec(spec)
     validate_image(BASELINE_IMAGE, "baseline"); validate_image(CANDIDATE_IMAGE, "candidate")
     result = {"mode": f"{mode}-plan", "run_id": identity.run_id, "confirmation_required_for_execute": identity.confirmation,
@@ -2095,7 +2099,7 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--tail-probe", action="store_true")
     mode.add_argument("--cleanup-only", action="store_true")
     parser.add_argument("--run-id", required=True); parser.add_argument("--confirm"); parser.add_argument("--record-count", type=int)
-    parser.add_argument("--plan-mode", choices=("execute", "calibrate", "ablate"), default="execute")
+    parser.add_argument("--plan-mode", choices=("execute", "calibrate", "ablate", "tail-probe"), default="execute")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE); parser.add_argument("--payload-bytes", type=int)
     parser.add_argument("--seed", default="koala-stage-a-v1"); parser.add_argument("--receipt", type=Path, default=Path("stage-a-receipt.json")); parser.add_argument("--json", action="store_true")
     return parser
@@ -2104,8 +2108,9 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         identity = build_identity(args.run_id)
+        probing = args.tail_probe or (args.dry_run and args.plan_mode == "tail-probe")
         calibrating = args.calibrate or args.ablate or (args.dry_run and args.plan_mode in {"calibrate", "ablate"})
-        default_count = TAIL_PROBE_SAMPLE_COUNT if args.tail_probe else (CALIBRATION_SAMPLE_COUNT if calibrating else DEFAULT_RECORD_COUNT)
+        default_count = TAIL_PROBE_SAMPLE_COUNT if probing else (CALIBRATION_SAMPLE_COUNT if calibrating else DEFAULT_RECORD_COUNT)
         spec = CorpusSpec(
             args.record_count if args.record_count is not None else default_count,
             args.batch_size,

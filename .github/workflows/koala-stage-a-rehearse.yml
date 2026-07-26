@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: Plan only by default; execute requires separate authorization and exact confirmation
+        description: Plan only by default; execute requires separate authorization and exact confirmation. tail-probe runs the identical tail path at probe scale and can never qualify anything.
         required: true
         default: plan
         type: choice
@@ -12,6 +12,7 @@ on:
           - plan
           - calibrate
           - ablate
+          - tail-probe
           - execute
       run_id:
         description: Unique lowercase run ID (4-32 characters)
@@ -74,6 +75,10 @@ jobs:
             plan_mode=ablate
             record_count=25000
             payload_bytes=1000
+          elif test "$MODE" = "tail-probe"; then
+            plan_mode=tail-probe
+            record_count=2000
+            payload_bytes=4000
           else
             plan_mode=execute
             record_count=502385
@@ -124,7 +129,7 @@ jobs:
           flyctl version
 
       - name: Install pinned crane
-        if: inputs.mode == 'execute'
+        if: inputs.mode == 'execute' || inputs.mode == 'tail-probe'
         shell: bash
         env:
           CRANE_VERSION: v0.21.7
@@ -140,7 +145,7 @@ jobs:
           crane version
 
       - name: Authenticate candidate source and Fly registries
-        if: inputs.mode == 'execute'
+        if: inputs.mode == 'execute' || inputs.mode == 'tail-probe'
         shell: bash
         env:
           GHCR_USERNAME: ${{ github.actor }}
@@ -197,6 +202,9 @@ jobs:
           elif test "$MODE" = "ablate"; then
             deadline=180m
             mode_flag=--ablate
+          elif test "$MODE" = "tail-probe"; then
+            deadline=90m
+            mode_flag=--tail-probe
           else
             deadline=300m
             mode_flag=--execute
@@ -244,6 +252,8 @@ jobs:
       - name: Enforce rehearsal verdict
         if: always()
         shell: bash
+        env:
+          MODE: ${{ inputs.mode }}
         run: |
           set -euo pipefail
           test -f /tmp/koala-stage-a/exit-code
@@ -252,11 +262,21 @@ jobs:
           test "$(cat /tmp/koala-stage-a/cleanup-exit-code)" = "0"
           python3 - <<'PY'
           import json
+          import os
           from pathlib import Path
           receipt = json.loads(Path("/tmp/koala-stage-a/receipt.json").read_text())
           cleanup = json.loads(Path("/tmp/koala-stage-a/cleanup.json").read_text())
-          if receipt.get("status") != "PASSED":
+          mode = os.environ["MODE"]
+          # The accepted status is chosen by the DISPATCHED mode and compared by equality,
+          # so a probe receipt can never satisfy a qualification run and a qualification
+          # pass can never be produced by a probe. The receipt must additionally declare
+          # the mode it ran as, so the two cannot be confused even if a status were.
+          expected_status = "TAIL_PROBE_PASS" if mode == "tail-probe" else "PASSED"
+          expected_mode = "tail_probe" if mode == "tail-probe" else mode
+          if receipt.get("status") != expected_status:
               raise SystemExit("rehearsal receipt did not pass")
+          if receipt.get("measurements", {}).get("mode") != expected_mode:
+              raise SystemExit("rehearsal receipt mode does not match the dispatched mode")
           if cleanup.get("status") != "PASSED" or cleanup.get("orphans"):
               raise SystemExit("independent cleanup did not pass")
           PY

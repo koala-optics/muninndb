@@ -1974,16 +1974,40 @@ class StageAContractTests(unittest.TestCase):
         runtime.create_volume.assert_not_called()
 
     def test_the_workflow_verdict_admits_only_the_qualification_pass(self):
-        """The probe's safety rests on this comparison, so it is asserted, not assumed.
+        """The probe's safety rests on these comparisons, so they are asserted, not assumed.
 
         `execute` renames a probe success to TAIL_PROBE_PASS. That only protects anything
-        while the workflow keeps testing for equality with PASSED - a later loosening to a
-        substring or prefix test would silently admit every probe receipt.
+        while the workflow decides the accepted status from the DISPATCHED mode and
+        compares by equality - a later loosening to a substring or prefix test, or an
+        unconditional acceptance of TAIL_PROBE_PASS, would silently admit every probe
+        receipt into a qualification run.
         """
         workflow = Path(__file__).resolve().parents[2] / ".github/workflows/koala-stage-a-rehearse.yml"
         if not workflow.exists(): self.skipTest("workflow not present in this checkout")
         text = workflow.read_text()
-        self.assertIn('receipt.get("status") != "PASSED"', text)
-        self.assertNotIn("TAIL_PROBE", text)
+        # The probe status is reachable ONLY through the probe dispatch mode.
+        self.assertIn('expected_status = "TAIL_PROBE_PASS" if mode == "tail-probe" else "PASSED"', text)
+        # Both comparisons stay equalities.
+        self.assertIn('receipt.get("status") != expected_status', text)
+        self.assertIn('receipt.get("measurements", {}).get("mode") != expected_mode', text)
+        self.assertIn('expected_mode = "tail_probe" if mode == "tail-probe" else mode', text)
+        # The dispatched mode reaches the verdict as an environment variable, never
+        # interpolated into the script body where it would be a shell-injection vector.
+        self.assertIn('mode = os.environ["MODE"]', text)
+        self.assertNotIn("${{ inputs.mode }} ", text)
+
+    def test_the_probe_plan_mode_pins_the_probe_corpus(self):
+        """A plan must be held to the same corpus contract as the run it describes.
+
+        `--plan-mode execute` refuses the probe corpus and `--plan-mode tail-probe`
+        refuses the qualification corpus, so neither mode can render a plan for a
+        corpus its own run would reject.
+        """
+        identity = stage.build_identity("plan-corpus-guard")
+        probe_spec = stage.CorpusSpec(stage.TAIL_PROBE_SAMPLE_COUNT, stage.DEFAULT_BATCH_SIZE, stage.DEFAULT_PAYLOAD_BYTES, "seed", stage.DEFAULT_PAYLOAD_SHAPE)
+        full_spec = stage.CorpusSpec(stage.DEFAULT_RECORD_COUNT, stage.DEFAULT_BATCH_SIZE, stage.DEFAULT_PAYLOAD_BYTES, "seed", stage.DEFAULT_PAYLOAD_SHAPE)
+        self.assertEqual(stage.plan(identity, probe_spec, mode="tail-probe")["record_count"], stage.TAIL_PROBE_SAMPLE_COUNT)
+        with self.assertRaises(stage.RehearsalError): stage.plan(identity, probe_spec, mode="execute")
+        with self.assertRaises(stage.RehearsalError): stage.plan(identity, full_spec, mode="tail-probe")
 
 if __name__ == "__main__": unittest.main()

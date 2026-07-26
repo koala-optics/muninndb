@@ -1996,6 +1996,45 @@ class StageAContractTests(unittest.TestCase):
         self.assertIn('mode = os.environ["MODE"]', text)
         self.assertNotIn("${{ inputs.mode }} ", text)
 
+    def test_the_probe_ingests_its_own_corpus_rather_than_the_qualification_floor(self):
+        """The probe corpus must clear the INGEST floor, not just the entry contract.
+
+        `validate_tail_probe_spec` admits the 2,000-record corpus at the top of `execute`,
+        but `ingest_corpus` re-validates through `iter_records`, whose own `minimum_count`
+        defaults to the full qualification count. Run 30225546284 provisioned, launched the
+        baseline, and then refused its own corpus one call later with "record count below
+        required scale". Nothing caught it because every full-path test patches
+        `ingest_corpus` out and swallows its kwargs, so the floor it was handed was never
+        asserted anywhere. It is asserted here, in both halves: the trap itself, and the
+        value `execute` actually threads.
+        """
+        spec = stage.CorpusSpec(stage.TAIL_PROBE_SAMPLE_COUNT, 50, stage.DEFAULT_PAYLOAD_BYTES, "seed", stage.DEFAULT_PAYLOAD_SHAPE)
+        stage.validate_tail_probe_spec(spec)
+        with self.assertRaises(stage.RehearsalError): next(stage.iter_records(spec))
+        self.assertEqual(
+            sum(1 for _ in stage.iter_records(spec, minimum_count=stage.TAIL_PROBE_SAMPLE_COUNT)),
+            stage.TAIL_PROBE_SAMPLE_COUNT,
+        )
+        identity = stage.build_identity("probe-ingest-floor")
+        gib = 1024**3
+        runtime = mock.Mock()
+        runtime.create_app.return_value = identity.app_name
+        runtime.mirror_candidate.return_value = "registry.fly.io/probe:mirror"
+        runtime.create_volume.return_value = "vol_probe"
+        runtime.create_machine.return_value = "machine_probe"
+        runtime.disk_sample.return_value = stage.DiskSample("baseline-empty", 100 * 1024**2, 19 * gib, 20 * gib)
+        runtime.resource_sample.return_value = stage.ResourceSample("baseline-serving", 5.0, 1024)
+        runtime.list_owned_resources.return_value = []
+        seen: dict[str, object] = {}
+        def fake_ingest(_client, _cohort, **kwargs):
+            seen.update(kwargs)
+            raise stage.RehearsalUnknown("halted once the ingest floor was observed")
+        with tempfile.TemporaryDirectory() as root, \
+             mock.patch.object(stage, "ingest_corpus", side_effect=fake_ingest):
+            stage.execute(identity, spec, Path(root) / "probe.json", runtime=runtime,
+                          client_factory=lambda *_a: mock.Mock(), probe=True)
+        self.assertEqual(seen.get("minimum_count"), stage.TAIL_PROBE_SAMPLE_COUNT)
+
     def test_the_probe_plan_mode_pins_the_probe_corpus(self):
         """A plan must be held to the same corpus contract as the run it describes.
 

@@ -1957,7 +1957,16 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
                 ledger=ledger, measurements=measurements, gates=gates, cleanup_result={}, orphans=[],
                 corpus=progress, candidate_ref=candidate_ref,
             ))
-        corpus_receipt = ingest_corpus(client, spec, progress=checkpoint)
+        # `ingest_corpus` re-validates the corpus through `iter_records`, whose own floor
+        # defaults to the FULL qualification count. Passing the entry contract at the top
+        # of this function is not enough: run 30225546284 provisioned, launched the
+        # baseline, and then refused its own probe corpus here with "record count below
+        # required scale". calibrate and ablate already thread their floor the same way.
+        corpus_receipt = ingest_corpus(
+            client, spec,
+            minimum_count=TAIL_PROBE_SAMPLE_COUNT if probe else MIN_RECORD_COUNT,
+            progress=checkpoint,
+        )
         immediate = runtime.disk_sample(identity, ledger.machine_id, "baseline-immediate")
         require_disk_safety(immediate)
         measurements["disk_samples"].append(asdict(immediate) | {"free_percent": immediate.free_percent})

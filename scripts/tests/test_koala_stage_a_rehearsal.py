@@ -1046,16 +1046,47 @@ class StageAContractTests(unittest.TestCase):
 
     def test_offline_helper_requires_stopped_zero_exit(self):
         identity = stage.build_identity("wait-test"); calls = []
+        def runner_for(status_output, log=False):
+            def runner(cmd, **kwargs):
+                if log: calls.append(cmd)
+                if "list" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, json.dumps([{"id": "abc123", "state": "stopped"}]), "")
+                return subprocess.CompletedProcess(cmd, 0, status_output if "status" in cmd else "", "")
+            return runner
+        stage.FlyRuntime(runner=runner_for("state = stopped\nexit_code = 0\n", log=True)).wait_stopped(identity, "abc123", 30)
+        self.assertIn("list", calls[0]); self.assertIn("status", calls[1])
+        with self.assertRaises(stage.RehearsalFailed):
+            stage.FlyRuntime(runner=runner_for("exit_code = 7\n")).wait_stopped(identity, "abc123", 30)
+        with self.assertRaises(stage.RehearsalUnknown):
+            stage.FlyRuntime(runner=runner_for("state = stopped\n")).wait_stopped(identity, "abc123", 30)
+
+    def test_a_dropped_state_reading_no_longer_ends_the_rehearsal(self):
+        """Run 30212272430 lost a 45 minute budget to one failed long-lived wait call while
+        the helper was still working: the archive was growing and tar and gzip were both
+        alive. State is read in short independent polls now, so one unreadable reading is
+        absorbed and the helper still gets its deadline."""
+        identity = stage.build_identity("wait-transient"); states = ["started", None, "started", "stopped"]
         def runner(cmd, **kwargs):
-            calls.append(cmd)
-            output = "state = stopped\nexit_code = 0\n" if "status" in cmd else ""
-            return subprocess.CompletedProcess(cmd, 0, output, "")
-        stage.FlyRuntime(runner=runner).wait_stopped(identity, "abc123", 30)
-        self.assertIn("stopped", calls[0]); self.assertIn("status", calls[1])
-        bad = stage.FlyRuntime(runner=lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, "exit_code = 7\n" if "status" in cmd else "", ""))
-        with self.assertRaises(stage.RehearsalFailed): bad.wait_stopped(identity, "abc123", 30)
-        unknown = stage.FlyRuntime(runner=lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, "state = stopped\n" if "status" in cmd else "", ""))
-        with self.assertRaises(stage.RehearsalUnknown): unknown.wait_stopped(identity, "abc123", 30)
+            if "list" in cmd:
+                state = states.pop(0)
+                if state is None: return subprocess.CompletedProcess(cmd, 1, "", "connection reset by peer")
+                return subprocess.CompletedProcess(cmd, 0, json.dumps([{"id": "abc123", "state": state}]), "")
+            return subprocess.CompletedProcess(cmd, 0, "state = stopped\nexit_code = 0\n" if "status" in cmd else "", "")
+        with mock.patch.object(stage, "HELPER_POLL_INTERVAL_S", 0):
+            stage.FlyRuntime(runner=runner).wait_stopped(identity, "abc123", 45 * 60)
+        self.assertEqual(states, [])   # it polled through the dropped reading rather than giving up
+
+    def test_an_unreadable_helper_state_fails_instead_of_spinning_out_the_deadline(self):
+        """Absorbing transient errors must not turn a persistent fault into a 45 minute
+        silence, so the run of consecutive failures is bounded and only resets on a read."""
+        identity = stage.build_identity("wait-blind"); attempts = []
+        def runner(cmd, **kwargs):
+            attempts.append(cmd); return subprocess.CompletedProcess(cmd, 1, "", "api unavailable")
+        with mock.patch.object(stage, "HELPER_POLL_INTERVAL_S", 0):
+            with self.assertRaises(stage.RehearsalUnknown) as caught:
+                stage.FlyRuntime(runner=runner).wait_stopped(identity, "abc123", 45 * 60)
+        self.assertIn("helper state unreadable", str(caught.exception))
+        self.assertLessEqual(len(attempts), stage.HELPER_STATUS_RETRIES + 1)
 
     def test_restore_helper_rebuilds_from_the_archive_alone_on_one_volume(self):
         """The restore volume is a fork of the volume the archive sits on, so it arrives
@@ -1178,8 +1209,8 @@ class StageAContractTests(unittest.TestCase):
         """A runtime whose helper never stops, with every diagnostic probe answering."""
         def runner(cmd, **kwargs):
             joined = " ".join(cmd)
-            if "wait" in cmd:
-                return subprocess.CompletedProcess(cmd, 1, "", 'machine 7844153a692078 did not reach "stopped" within 45m0s: currently started')
+            if "list" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, json.dumps([{"id": "7844153a692078", "state": "started"}]), "")
             if "logs" in cmd:
                 return subprocess.CompletedProcess(cmd, 0, log_text, "")
             if "exec" in cmd and "du -sk" in joined:
@@ -1196,9 +1227,10 @@ class StageAContractTests(unittest.TestCase):
         all."""
         identity = stage.build_identity("stall-test")
         with self.assertRaises(stage.RehearsalUnknown) as caught:
-            self._stalling_runtime().wait_stopped(identity, "7844153a692078", 45 * 60)
+            self._stalling_runtime().wait_stopped(identity, "7844153a692078", 0)
         detail = str(caught.exception)
-        self.assertIn('did not reach "stopped"', detail)        # the original failure survives
+        self.assertIn("did not reach stopped", detail)          # the original failure survives
+        self.assertIn("currently started", detail)              # with the state it was left in
         self.assertIn("checkpoint written", detail)             # what the command last said
         self.assertIn("/data/stage-a-backup", detail)           # how far the archive got
         self.assertIn("processes=muninndb-server,tar", detail)  # which step is still live
@@ -1211,7 +1243,7 @@ class StageAContractTests(unittest.TestCase):
         identity = stage.build_identity("stall-redact")
         runtime = self._stalling_runtime(log_text="opening store\nlistening on http://10.0.0.1:8080\ntar: write error")
         with self.assertRaises(stage.RehearsalUnknown) as caught:
-            runtime.wait_stopped(identity, "7844153a692078", 60)
+            runtime.wait_stopped(identity, "7844153a692078", 0)
         detail = str(caught.exception)
         self.assertNotIn("10.0.0.1", detail)          # the matching line never escapes
         self.assertIn("[REDACTED", detail)            # and announces that it was dropped
@@ -1223,13 +1255,13 @@ class StageAContractTests(unittest.TestCase):
         here and the deadline is still what surfaces."""
         identity = stage.build_identity("stall-blind")
         def runner(cmd, **kwargs):
-            if "wait" in cmd:
-                return subprocess.CompletedProcess(cmd, 1, "", 'did not reach "stopped" within 45m0s')
+            if "list" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, json.dumps([{"id": "7844153a692078", "state": "started"}]), "")
             raise subprocess.TimeoutExpired(cmd, 60)
         with self.assertRaises(stage.RehearsalUnknown) as caught:
-            stage.FlyRuntime(runner=runner).wait_stopped(identity, "7844153a692078", 60)
+            stage.FlyRuntime(runner=runner).wait_stopped(identity, "7844153a692078", 0)
         detail = str(caught.exception)
-        self.assertIn('did not reach "stopped"', detail)
+        self.assertIn("did not reach stopped", detail)
         self.assertEqual(detail.count("<unavailable"), 3)
 
     def test_every_fuzzy_context_actually_matches_a_primary_vault_record(self):
@@ -1258,16 +1290,21 @@ class StageAContractTests(unittest.TestCase):
                         "a context repeats back to back and would read warm")  # never consecutive
         self.assertEqual(stage.QUERY_P95_LIMIT_MS, 250.0)                  # threshold NOT relaxed
 
-    def test_safe_detail_budget_is_verbosity_only_and_never_relaxes_the_predicate(self):
-        """The wider budget widens what is checked as well as what is emitted, so a match
-        anywhere in the retained tail still blanks the whole field at either size."""
-        head = 'did not reach "stopped" at deadline '
-        long_reading = head + "z" * 800
-        self.assertNotIn(head.strip(), stage.safe_detail(long_reading))                              # default budget cuts the head
-        self.assertIn(head.strip(), stage.safe_detail(long_reading, stage.RECEIPT_DETAIL_CHARS))     # the receipt budget keeps it
+    def test_safe_detail_keeps_both_ends_and_never_relaxes_the_predicate(self):
+        """Run 30212272430's receipt described what the helper was doing without saying what
+        had failed, because a tail-only budget dropped the head. Both ends survive now, and
+        the budget stays a verbosity bound: a match in what is emitted still blanks it."""
+        head, tail = "flyctl machine wait failed", "processes=gzip,tar"
+        reading = f"{head} {'z' * 2000} {tail}"
         for limit in (stage.SAFE_DETAIL_CHARS, stage.RECEIPT_DETAIL_CHARS):
+            excerpt = stage.safe_detail(reading, limit)
+            self.assertIn(head, excerpt)                                  # what actually failed
+            self.assertIn(tail, excerpt)                                  # and what it was doing
+            self.assertIn(stage.TRUNCATION_MARKER.strip(), excerpt)       # the gap is declared
+            self.assertLessEqual(len(excerpt), limit)                     # the budget still binds
             self.assertEqual(stage.safe_detail("z" * 300 + " bearer abc", limit),
                              "[REDACTED: sensitive diagnostic omitted]")
+        self.assertEqual(stage.safe_detail("short reading"), "short reading")   # untruncated text is untouched
 
     def test_receipt_detail_keeps_the_whole_stall_reading_and_still_redacts(self):
         """A 400 character tail truncated the stalled-helper reading back to its last probe,
@@ -1282,6 +1319,13 @@ class StageAContractTests(unittest.TestCase):
             self.assertIn('did not reach "stopped"', written)   # the head is no longer cut off
             self.assertIn("processes=muninndb-server", written)  # and the tail still survives
             self.assertLessEqual(len(written), stage.RECEIPT_DETAIL_CHARS)
+            over = Path(root) / "over.json"
+            composed = "flyctl machine wait failed: connection reset " + "x" * 4000 + " processes=gzip,tar"
+            stage.write_receipt(over, {**base, "schema_version": 1, "status": "UNKNOWN", "detail": composed, "orphans": []})
+            written_over = json.loads(over.read_text())["detail"]
+            self.assertIn("flyctl machine wait failed", written_over)   # run 30212272430 lost exactly this
+            self.assertIn("processes=gzip,tar", written_over)           # without losing the reading
+            self.assertLessEqual(len(written_over), stage.RECEIPT_DETAIL_CHARS)
             leaky = Path(root) / "leaky.json"
             stage.write_receipt(leaky, {**base, "schema_version": 1, "status": "UNKNOWN", "orphans": [],
                                         "detail": "y" * 500 + " authorization=abc"})

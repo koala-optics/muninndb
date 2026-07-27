@@ -354,7 +354,7 @@ class StageAContractTests(unittest.TestCase):
             "The pre-ingestion provisioning probe is mountless, so it proves candidate image and guest provisioning and the machine exec shell transport only; volume attachment, readiness, the resource measurement itself, and every measured gate remain first exercised by the real machines.",
             "query_latency is judged net of a transport baseline because every query crosses a WireGuard tunnel to the guest; the 150ms net limit is bounded above four observed readings (117.5/82.5/77.8/90.1), which is a thin basis, and the baseline is inferred from the cheapest query classes rather than measured server-side.",
             "restore_cold_query_s and rollback_cold_query_s are now measured, and they REFUTE the premise the cold-query budget was built on: run 30283211992 returned 0.0398s and 0.0387s for a concept lookup against a freshly forked store. A cold fork is not slow on its metadata call (0.077s/0.159s on run 30270851093) or on its data call. COLD_QUERY_LIMIT_S therefore stands at roughly 23,000 times the only observed cost of the thing it bounds. It is retained as a bound below the phase gate it feeds, not as a calibrated figure, and nothing here explains why a 60-second socket budget expired three times on calls now measured in tens of milliseconds.",
-            "Which call exhausted the 60-second socket budget in runs 30228878183, 30235793478 and 30270851093 remains unrecorded, and the earlier inference here was withdrawn: rollback_counts is a local written into measurements only after run_query_probes returns, so its absence never excluded query_counts. query_counts walks stage-a-primary AND stage-a-isolation, and the cold-query wait probes only stage-a-primary, so the isolation vault was never eliminated. What IS established for run 30283211992 is that its detail was the bare constant raised by _post, and that every RehearsalFailed raised below the retry loop already carried its method, which places that failure at the JSON-RPC protocol layer rather than in tool semantics. Both classes out of _post now name their method and vault and carry the server's own error code, message and data, so the cause is reported rather than reconstructed.",
+            "The rollback failure is now named rather than inferred. Run 30290534176, a tail probe at 2000 records, reported muninn_read(stage-a-primary): MCP JSON-RPC error code=-32000 message=tool error: engram not found - a server-defined tool error, not -32601 for a missing method and not -32602 for a bad vault. Control flow makes it sharper: run_query_probes raises on its FIRST failure and failed on the third step, so the two before it completed against the same connection to the same forked store, and both assert strict equality against the ids the harness retained at ingest. The fork's own concept and entity indexes returned those exact ids, and then the fork's read path denied the first of them, which rules out a stale, foreign or wrongly-namespaced id: the store produced the id itself. Ingest runs on BASELINE_IMAGE, the legacy machine is stopped AND destroyed before ledger.snapshot_id is taken, and run_query_probes with the same corpus receipt passes on the candidate after migration and on the candidate rebuilt from the archive, so the inconsistency is specific to the legacy image reading a fork of its own snapshot. Whether the fork introduced it or inherited it is NOT established, and the new baseline_read_witness gate is what discriminates: muninn_read was never exercised on the baseline machine, so a legacy image that could never point-read these ids at all would have looked identical for twenty dispatches. Not established either: which call exhausted the 60-second socket budget in runs 30228878183, 30235793478 and 30270851093, nor why it ever expired on calls now measured in tens of milliseconds.",
         ])
 
     def test_volume_command_is_encrypted_twenty_gb_and_unscheduled(self):
@@ -1588,6 +1588,73 @@ class StageAContractTests(unittest.TestCase):
         self.assertTrue(general in source, "the hard-delete swallow itself is gone")
         self.assertTrue(source.index(narrowed) < source.index(general),
                         "the general clause precedes the protocol clause, so it swallows it")
+
+    def _read_client(self, denied=frozenset()):
+        """A client whose muninn_read answers, or refuses with the server's own tool error."""
+        class ReadClient:
+            def __init__(self): self.reads = []
+            def call(inner, method, arguments, **kwargs):
+                inner.reads.append((method, arguments))
+                if arguments["id"] in denied:
+                    raise stage.RehearsalProtocolFailed(
+                        f"{method}({arguments['vault']}): MCP JSON-RPC error code=-32000 "
+                        "message=tool error: engram not found")
+                return {"id": arguments["id"]}, 1.0
+        return ReadClient()
+
+    def test_the_baseline_witness_reads_the_same_records_the_fork_denied(self):
+        """Run 30290534176 failed on muninn_read of retained_ids["ordering"][:10] against the
+        rollback fork. A witness that asked about a DIFFERENT set, vault or method would not be
+        comparable with it, and comparability is the entire value of the witness."""
+        receipt = stage.CorpusReceipt(retained_ids={"ordering": [f"ord-{i:02d}" for i in range(25)]})
+        client = self._read_client()
+        gate = stage.baseline_read_witness(client, receipt)
+        self.assertEqual(gate.status, "PASSED")
+        self.assertEqual([method for method, _ in client.reads], ["muninn_read"] * 10)
+        self.assertEqual([args["id"] for _, args in client.reads],
+                         [f"ord-{i:02d}" for i in range(10)],
+                         "the witness reads a different id set than run_query_probes")
+        self.assertTrue(all(args["vault"] == "stage-a-primary" for _, args in client.reads),
+                        "the witness reads a different vault than the one that failed")
+        self.assertEqual(stage.BASELINE_READ_WITNESS_IDS, 10,
+                         "the witness slice no longer mirrors run_query_probes' [:10]")
+
+    def test_a_denied_baseline_read_fails_the_gate_and_carries_the_servers_message(self):
+        """A gate rather than a raise, so ONE run reports both the baseline and the fork; but a
+        FAILED gate still fails the run via receipt_status, so it can never pass quietly. The
+        count distinguishes a read path that resolves nothing from one absent record."""
+        ordering = [f"ord-{i:02d}" for i in range(10)]
+        receipt = stage.CorpusReceipt(retained_ids={"ordering": ordering})
+        one = stage.baseline_read_witness(self._read_client(denied={"ord-03"}), receipt)
+        self.assertEqual(one.status, "FAILED")
+        self.assertIn("ok=9/10", one.detail)
+        self.assertIn("engram not found", one.detail,
+                      "the gate discards the server's own explanation")
+        self.assertIn("-32000", one.detail)
+        allden = stage.baseline_read_witness(self._read_client(denied=set(ordering)), receipt)
+        self.assertEqual(allden.status, "FAILED")
+        self.assertIn("ok=0/10", allden.detail)
+        # A FAILED gate has to be load-bearing or the non-raising design hides the defect.
+        # Asserted at probe scale too, since the probe is where this witness will first run.
+        self.assertEqual(stage.combine_status({"w": allden}, []), "FAILED",
+                         "a failed witness no longer fails the run, so it reports nothing")
+        self.assertEqual(stage.combine_status({"w": allden}, [], probe=True), "FAILED",
+                         "a failed witness is swallowed at probe scale")
+        # An absent id set must not read as evidence: 0 == 0 would otherwise PASS.
+        empty = stage.baseline_read_witness(self._read_client(), stage.CorpusReceipt(retained_ids={"ordering": []}))
+        self.assertEqual(empty.status, "FAILED",
+                         "a witness that could not run is being counted as a pass")
+
+    def test_the_baseline_witness_runs_on_the_baseline_before_the_snapshot(self):
+        """Placement IS the experiment. After the snapshot, or on the candidate, it answers a
+        question nobody asked: whether the LEGACY image could ever point-read these ids is only
+        observable on the live baseline machine, before its volume is forked."""
+        source = inspect.getsource(stage.execute)
+        witness, snapshot = 'gates["baseline_read_witness"]', "ledger.snapshot_id = runtime.snapshot("
+        self.assertTrue(witness in source, "the baseline read witness is not wired into execute")
+        self.assertTrue(snapshot in source, "the pre-migration snapshot moved; re-check placement")
+        self.assertTrue(source.index(witness) < source.index(snapshot),
+                        "the witness runs after the snapshot, so it no longer tests the baseline")
 
     def _probe_fixture(self):
         """A receipt plus exactly the scripted responses run_query_probes consumes, in order."""

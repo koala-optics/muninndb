@@ -65,6 +65,10 @@ TRUNCATION_MARKER = " ...[truncated]... "
 # the composed detail well inside RECEIPT_DETAIL_CHARS even with the method and vault prefix,
 # so a verbose server error can never crowd out the part that names the call.
 JSON_RPC_DETAIL_CHARS = 200
+# Mirrors the [:10] slice run_query_probes reads, so the baseline witness and the fork probe
+# ask about the SAME records. If those two ever disagree the comparison is worthless, which is
+# the entire value of the witness.
+BASELINE_READ_WITNESS_IDS = 10
 # The backup archive lives beside the store because a Fly machine mounts one volume, so
 # the helper that writes it cannot also mount a separate backup volume.
 BACKUP_ARCHIVE_DIR = "/data"
@@ -839,7 +843,7 @@ def receipt_document(
             "restore_cold_query_s and rollback_cold_query_s are now measured, and they REFUTE the premise the cold-query budget was built on: run 30283211992 returned 0.0398s and 0.0387s for a concept lookup against a freshly forked store. A cold fork is not slow on its metadata call (0.077s/0.159s on run 30270851093) or on its data call. COLD_QUERY_LIMIT_S therefore stands at roughly 23,000 times the only observed cost of the thing it bounds. It is retained as a bound below the phase gate it feeds, not as a calibrated figure, and nothing here explains why a 60-second socket budget expired three times on calls now measured in tens of milliseconds."
         )
         limitations.append(
-            "Which call exhausted the 60-second socket budget in runs 30228878183, 30235793478 and 30270851093 remains unrecorded, and the earlier inference here was withdrawn: rollback_counts is a local written into measurements only after run_query_probes returns, so its absence never excluded query_counts. query_counts walks stage-a-primary AND stage-a-isolation, and the cold-query wait probes only stage-a-primary, so the isolation vault was never eliminated. What IS established for run 30283211992 is that its detail was the bare constant raised by _post, and that every RehearsalFailed raised below the retry loop already carried its method, which places that failure at the JSON-RPC protocol layer rather than in tool semantics. Both classes out of _post now name their method and vault and carry the server's own error code, message and data, so the cause is reported rather than reconstructed."
+            "The rollback failure is now named rather than inferred. Run 30290534176, a tail probe at 2000 records, reported muninn_read(stage-a-primary): MCP JSON-RPC error code=-32000 message=tool error: engram not found - a server-defined tool error, not -32601 for a missing method and not -32602 for a bad vault. Control flow makes it sharper: run_query_probes raises on its FIRST failure and failed on the third step, so the two before it completed against the same connection to the same forked store, and both assert strict equality against the ids the harness retained at ingest. The fork's own concept and entity indexes returned those exact ids, and then the fork's read path denied the first of them, which rules out a stale, foreign or wrongly-namespaced id: the store produced the id itself. Ingest runs on BASELINE_IMAGE, the legacy machine is stopped AND destroyed before ledger.snapshot_id is taken, and run_query_probes with the same corpus receipt passes on the candidate after migration and on the candidate rebuilt from the archive, so the inconsistency is specific to the legacy image reading a fork of its own snapshot. Whether the fork introduced it or inherited it is NOT established, and the new baseline_read_witness gate is what discriminates: muninn_read was never exercised on the baseline machine, so a legacy image that could never point-read these ids at all would have looked identical for twenty dispatches. Not established either: which call exhausted the 60-second socket budget in runs 30228878183, 30235793478 and 30270851093, nor why it ever expired on calls now measured in tens of milliseconds."
         )
     return {
         "schema_version": SCHEMA_VERSION,
@@ -1817,6 +1821,51 @@ def run_lifecycle_probes(client: MCPClient, receipt: CorpusReceipt) -> None:
     restored, _ = client.call("muninn_restore", {"vault": "stage-a-primary", "id": target})
     if not isinstance(restored, dict) or restored.get("restored") is not True: raise RehearsalFailed("soft-delete restore failed")
 
+def baseline_read_witness(client: MCPClient, receipt: CorpusReceipt) -> Gate:
+    """Point-read, on the ORIGINAL baseline machine, the exact ids the rollback fork denied.
+
+    Run 30290534176 pinned the rollback failure to `muninn_read(stage-a-primary): MCP JSON-RPC
+    error code=-32000 message=tool error: engram not found`, and control flow makes that
+    reading sharper than the line itself. run_query_probes raises on its FIRST failure and it
+    failed on the third step, so the two steps before it completed against the same connection
+    to the same forked store: muninn_find_by_concept returned exactly
+    retained_ids["collision"][index] (strict equality, else "collision hydration failed"), and
+    muninn_find_by_entity returned exactly the reversed retained_ids["ordering"] (strict
+    equality inside verify_entity_ordering). The fork's own indexes handed those ids back, and
+    then the fork's read path said the first of them does not exist. A stale, foreign or
+    wrongly-namespaced id is therefore ruled out - the store produced the id itself.
+
+    What is NOT known is whether the fork introduced that inconsistency or inherited it.
+    muninn_read is never exercised on the baseline machine: baseline_legacy_counts checks
+    counts, and baseline_status checks muninn_status, so a legacy image that could never
+    point-read these ids at all would have looked identical for twenty dispatches. This
+    witness closes that gap on the live baseline, before the snapshot is taken, which is the
+    only place the question can be asked without a second dispatch.
+
+    It is a Gate rather than a raise, deliberately. A raise here aborts before the fork is
+    ever built, so the run would answer one half of the question and cost another dispatch to
+    answer the other; as a gate, one run reports both halves. It cannot hide a failure either:
+    receipt_status returns FAILED when ANY gate is FAILED, so a failed witness fails the run
+    without truncating it. This is not an error being treated as a valid empty result - the
+    server's own message is carried into the detail, and the gate goes FAILED.
+
+    ok is recorded as a count because 0-of-10 and 9-of-10 are different defects: the first is a
+    read path that resolves nothing, the second is one absent record. An empty id set fails
+    rather than passes, since a witness that could not run must never read as evidence.
+    """
+    ids = receipt.retained_ids["ordering"][:BASELINE_READ_WITNESS_IDS]
+    if not ids: return Gate("FAILED", "no retained ordering ids to point-read on the baseline", 0, 0)
+    ok, first_error = 0, ""
+    for memory_id in ids:
+        try:
+            client.call("muninn_read", {"vault": "stage-a-primary", "id": memory_id}); ok += 1
+        except RehearsalError as exc:
+            if not first_error: first_error = safe_detail(str(exc), JSON_RPC_DETAIL_CHARS)
+    detail = f"baseline point-read of retained ordering ids ok={ok}/{len(ids)}"
+    if first_error: detail = f"{detail} first_error={first_error}"
+    return Gate("PASSED" if ok == len(ids) else "FAILED", detail, ok, len(ids))
+
+
 def run_query_probes(client: MCPClient, receipt: CorpusReceipt, *,
                      timeout_s: float | None = None) -> dict[str, list[float]]:
     """Time the bounded query surface that the query_latency gate reads.
@@ -2217,6 +2266,7 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
             sum(baseline_counts.values()),
             spec.count + spec.batch_size + 1,
         )
+        gates["baseline_read_witness"] = baseline_read_witness(client, corpus_receipt)
         terminate_proxy(proxy); proxy = None; runtime.stop_machine(identity, ledger.machine_id); runtime.destroy_machine(identity, ledger.machine_id); ledger.machine_id = None
         ledger.snapshot_id = runtime.snapshot(identity, ledger.volume_id)
         migration_started = time.monotonic(); ledger.machine_id = runtime.create_machine(identity, ledger.volume_id, candidate_ref, "candidate")

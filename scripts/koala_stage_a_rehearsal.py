@@ -134,21 +134,21 @@ RESTORE_LIMIT_S, ROLLBACK_LIMIT_S = 45 * 60, 30 * 60
 # It re-proved what initialize() and wait_ready already establish - the server is up - and
 # bought no coverage at all.
 #
-# What that run did buy is a pinned failure window. rollback_first_query_s was recorded and
-# rollback_counts was not, and query_counts provably issues the muninn_status that had just
-# answered in 0.159s, so the timeout is inside run_query_probes: find_by_concept,
-# find_by_entity, read, and the 24-sample fuzzy sweep. Those touch indexes and data blocks.
-# The restore path survives them because its helper machine rebuilds the store from the
-# archive and warms every block first; the rollback fork is queried cold and directly.
+# What that run did buy is a pinned historical failure window. rollback_first_query_s was
+# recorded and rollback_counts was not, and query_counts provably issues the muninn_status
+# that had just answered in 0.159s, so the old snapshot-fork path timed out inside
+# run_query_probes: find_by_concept, find_by_entity, read, or the 24-sample fuzzy sweep.
+# Those touch indexes and data blocks. The corrected topology no longer uses that fork for
+# operational rollback: archive restore rebuilds candidate data on a clone, while rollback
+# remounts the untouched original volume with the legacy image.
 #
-# So the budget below now covers a cold DATA query, and it is applied per probe on the cold
-# paths rather than only to a single warm-up call - warming one concept lookup cannot warm
+# The budget below covers a DATA query after each fresh machine launch and is applied per
+# probe rather than only to a single warm-up call - warming one concept lookup cannot warm
 # the entity index, the read path, or the fuzzy path, and guessing which one faults first is
 # how #72 went wrong. This stays a WAIT, not a gate: RESTORE_LIMIT_S and ROLLBACK_LIMIT_S are
 # unchanged and still judge their phases, so the per-probe budget can never let a phase run
-# past the limit that governs it. 15 minutes is bounded below the phase gate it feeds; the
-# measurement is the point, since time-to-first-data-query after a rollback is the
-# disaster-recovery figure this rehearsal exists to produce.
+# past the limit that governs it. The measurements now distinguish separately qualified
+# disaster recovery from retained-original operational rollback.
 COLD_QUERY_LIMIT_S, COLD_QUERY_POLL_INTERVAL_S = 15 * 60, 5.0
 SNAPSHOT_LIMIT_S, SNAPSHOT_POLL_INTERVAL_S = 10 * 60, 5.0
 VOLUME_READY_LIMIT_S, VOLUME_READY_POLL_INTERVAL_S = 15 * 60, 5.0
@@ -216,6 +216,7 @@ class RunIdentity:
     run_id: str
     app_name: str
     volume_name: str
+    candidate_volume_name: str
     backup_volume_name: str
     restore_volume_name: str
     rollback_volume_name: str
@@ -273,6 +274,7 @@ class Gate:
 class ResourceLedger:
     app: str | None = None
     volume_id: str | None = None
+    candidate_volume_id: str | None = None
     backup_volume_id: str | None = None
     restore_volume_id: str | None = None
     rollback_volume_id: str | None = None
@@ -289,6 +291,7 @@ def build_identity(run_id: str) -> RunIdentity:
         run_id,
         app_name,
         f"{volume_prefix}_src",
+        f"{volume_prefix}_can",
         f"{volume_prefix}_bak",
         f"{volume_prefix}_rst",
         f"{volume_prefix}_rbk",
@@ -298,7 +301,8 @@ def build_identity(run_id: str) -> RunIdentity:
     return identity
 
 def assert_not_production(identity: RunIdentity) -> None:
-    volumes = (identity.volume_name, identity.backup_volume_name, identity.restore_volume_name, identity.rollback_volume_name)
+    volumes = (identity.volume_name, identity.candidate_volume_name, identity.backup_volume_name,
+               identity.restore_volume_name, identity.rollback_volume_name)
     if identity.app_name == PRODUCTION_APP or not identity.app_name.startswith("koala-stage-a-"):
         raise RehearsalUnknown("refusing production or non-Stage-A app name")
     if len(set(volumes)) != len(volumes) or any(
@@ -314,6 +318,7 @@ def assert_owned(value: str, identity: RunIdentity, kind: str) -> None:
         "app-name": {identity.app_name},
         "volume-name": {
             identity.volume_name,
+            identity.candidate_volume_name,
             identity.backup_volume_name,
             identity.restore_volume_name,
             identity.rollback_volume_name,
@@ -893,10 +898,10 @@ def receipt_document(
             "query_latency is judged net of a transport baseline because every query crosses a WireGuard tunnel to the guest; the 150ms net limit is bounded above four observed readings (117.5/82.5/77.8/90.1), which is a thin basis, and the baseline is inferred from the cheapest query classes rather than measured server-side."
         )
         limitations.append(
-            "restore_cold_query_s and rollback_cold_query_s are now measured, and they REFUTE the premise the cold-query budget was built on: run 30283211992 returned 0.0398s and 0.0387s for a concept lookup against a freshly forked store. A cold fork is not slow on its metadata call (0.077s/0.159s on run 30270851093) or on its data call. COLD_QUERY_LIMIT_S therefore stands at roughly 23,000 times the only observed cost of the thing it bounds. It is retained as a bound below the phase gate it feeds, not as a calibrated figure, and nothing here explains why a 60-second socket budget expired three times on calls now measured in tens of milliseconds."
+            "Operational rollback is tested by remounting the retained original volume with the legacy image; candidate archive restore separately tests disaster recovery. Neither path authorizes production deployment."
         )
         limitations.append(
-            "WITHDRAWN, and the withdrawal is the finding. The previous text here attributed muninn_read(stage-a-primary): MCP JSON-RPC error code=-32000 message=tool error: engram not found to the rollback fork failing to read its own snapshot. That was wrong. Runs 30290534176 and 30302595011 both carried that detail from the HARD-DELETE CHECK, where a failed read is the PASS condition, and neither run ever reached the rollback phase: hard_delete_cleanup, backup_restore and pre_migration_rollback are all ABSENT from both receipts, and cleanup records backup_volume_id, restore_volume_id and rollback_volume_id as not_created. The cause was this harness, not MuninnDB. #74 raised RehearsalProtocolFailed for every JSON-RPC error object regardless of code, and the hard-delete check re-raises protocol errors rather than counting them as proof of deletion, so the server correctly reporting a purged record became fatal. Fixed by classifying -32000..-32099 as RehearsalToolFailed in _post. The analytical error is worth recording separately: the receipts were read for the gates PRESENT and not for the gates MISSING, and the missing three named the phase. What the rollback failure IS remains open. Run 30283211992 failed pre_migration_rollback at 502385 records with the opaque pre-#74 detail MCP JSON-RPC error, while run 30225846042, a tail probe at 2000 records on the same image acef6be, PASSED pre_migration_rollback in 30.07s against an 1800s limit with rollback_counts matching the exact known legacy fingerprint. So the rollback failure does not reproduce at probe scale and no tail probe can settle it; only a full execute run can. baseline_read_witness PASSED at ok=2/2 on the live baseline machine, which establishes only that the legacy image point-reads its own retained ordering ids, and cannot discriminate whether a fork inherits or introduces an inconsistency, because these runs never build a fork. Not established either: which call exhausted the 60-second socket budget in runs 30228878183, 30235793478 and 30270851093, nor why it ever expired on calls now measured in tens of milliseconds."
+            "Historical correction: runs 30290534176 and 30302595011 stopped at hard-delete verification, not rollback. A -32000 tool-level 'engram not found' response is the hard-delete pass condition; protocol faults still fail closed."
         )
     return {
         "schema_version": SCHEMA_VERSION,
@@ -1084,25 +1089,18 @@ class FlyRuntime:
     def wait_volume_hydrated(self, identity: RunIdentity, volume_id: str, *,
                              timeout_s: float = VOLUME_READY_LIMIT_S,
                              interval_s: float = VOLUME_READY_POLL_INTERVAL_S) -> float:
-        """Hold until a forked volume finishes hydrating, because a mount before that fails.
+        """Hold a fork until stable `created` before this harness mounts it.
 
-        A volume forked from a snapshot of a POPULATED volume is created in state
-        `restoring` and is not mountable until it reaches `created`. A machine asked to
-        mount it in the meantime sits in `created`, and `flyctl machine run` abandons its
-        own start-wait after about a minute and exits non-zero with "machine failed to
-        reach desired start state" - which is precisely how runs 30217281791 and
-        30220383793 died, both immediately after forking the backup volume.
+        Fly permits mounting while a fork is hydrating and lazily fetches missing blocks,
+        but that is not deterministic enough for a qualification launch. Measured on a
+        disposable app, a 14 GB fork reported `restoring`, flyctl abandoned its start-wait
+        at ~62s, and the machine started unaided at 3m13s with the data intact. Runs
+        30217281791 and 30220383793 hit that same launch race after forking the backup
+        volume. Waiting here chooses stable launch behavior; it does not claim Fly forbids
+        hydration-time mounts.
 
-        The machine is not actually broken: measured directly on a disposable app, a 14 GB
-        fork reported `restoring`, flyctl gave up at ~62s, and the machine went on to start
-        by itself at 3m13s and read every byte through the fork. So the defect is the
-        harness mounting too early, not Fly failing. Waiting here fixes it at the single
-        place every fork is created, which covers the rollback fork as well - a phase no
-        rehearsal has ever reached, and which would otherwise have failed the same way.
-
-        A near-empty fork hydrates instantly and reports `created` on the first poll, which
-        is why this never appeared before the corpus was large, and why the first probe run
-        against an empty volume wrongly cleared the fork.
+        A near-empty fork reaches `created` on the first poll, which is why the race did not
+        appear before the corpus was large.
         """
         if timeout_s <= 0 or interval_s <= 0: raise RehearsalUnknown("invalid volume readiness contract")
         started, deadline = time.monotonic(), time.monotonic() + timeout_s
@@ -1445,8 +1443,8 @@ class FlyRuntime:
         Three facts separate them and none survives cleanup, so all three are read here:
         the machine's state and exit events, its logs, and the reported state of the volume
         it was asked to mount. The restore volume is a fork of a snapshot taken seconds
-        earlier, and Fly documents neither when such a fork becomes mountable nor that it
-        might not be, so the volume's own state is the first thing worth knowing.
+        earlier. Fly permits hydration-time mounts, but the volume state is still the first
+        useful fact when a deterministic machine launch fails.
 
         Every probe is best effort and bounded, on the same reasoning as
         stalled_helper_diagnostics: a diagnostic that raised would replace the failure it
@@ -1656,6 +1654,7 @@ class FlyRuntime:
         by_name: dict[str, str] = {}
         allowed_names = {
             identity.volume_name,
+            identity.candidate_volume_name,
             identity.backup_volume_name,
             identity.restore_volume_name,
             identity.rollback_volume_name,
@@ -1670,6 +1669,7 @@ class FlyRuntime:
             app=identity.app_name,
             machine_id=machine_ids[0] if machine_ids else None,
             volume_id=by_name.get(identity.volume_name),
+            candidate_volume_id=by_name.get(identity.candidate_volume_name),
             backup_volume_id=by_name.get(identity.backup_volume_name),
             restore_volume_id=by_name.get(identity.restore_volume_name),
             rollback_volume_id=by_name.get(identity.rollback_volume_name),
@@ -1739,7 +1739,8 @@ def cleanup(runtime: FlyRuntime, identity: RunIdentity, ledger: ResourceLedger) 
             # More than one is not a shape this harness produces, so it is reported rather
             # than assumed away: an unexplained machine keeps failing the run.
             orphans.extend(extra)
-    for label in ("machine_id", "restore_volume_id", "backup_volume_id", "rollback_volume_id", "volume_id"):
+    for label in ("machine_id", "restore_volume_id", "backup_volume_id", "rollback_volume_id",
+                  "candidate_volume_id", "volume_id"):
         resource = getattr(ledger, label)
         if not resource: results[label] = "not_created"; continue
         failure: Exception | None = None
@@ -1892,15 +1893,14 @@ def baseline_read_witness(client: MCPClient, receipt: CorpusReceipt) -> Gate:
     The gate is kept because its narrow claim is still worth a receipt and costs nothing.
     muninn_read is otherwise never exercised on the baseline machine - baseline_legacy_counts
     checks counts and baseline_status checks muninn_status - so a legacy image that could not
-    point-read its own retained ids would have looked identical for twenty dispatches. Measured
-    on run 30302595011: PASSED, ok=2/2 at probe scale. What it CANNOT do is discriminate whether
-    a fork inherits or introduces an inconsistency, which is what it was claimed to do: that
-    needs a run that actually builds a fork, and run 30225846042 showed the rollback phase
-    passing at probe scale, so it needs a full execute run.
+    point-read its own retained ids would have looked healthy. Measured on run 30302595011:
+    PASSED, ok=2/2 at probe scale. The corrected topology gives the witness a direct role: it
+    establishes that the untouched original is readable before the candidate clone is made,
+    and the retained-original rollback repeats those reads after candidate qualification.
 
-    It is a Gate rather than a raise, deliberately. A raise here aborts before the fork is
-    ever built, so the run would answer one half of the question and cost another dispatch to
-    answer the other; as a gate, one run reports both halves. It cannot hide a failure either:
+    It is a Gate rather than a raise, deliberately. A raise here would abort before candidate
+    qualification and retained-original rollback, costing another dispatch to test the full
+    topology; as a gate, one run reports every phase. It cannot hide a failure either:
     combine_status returns FAILED when ANY gate is FAILED, so a failed witness fails the run
     without truncating it. This is not an error being treated as a valid empty result - the
     server's own message is carried into the detail, and the gate goes FAILED.
@@ -1928,9 +1928,10 @@ def run_query_probes(client: MCPClient, receipt: CorpusReceipt, *,
 
     `timeout_s` raises the per-call SOCKET budget without touching what is measured or
     judged. It defaults to None, so the gated candidate path keeps the client's 60 seconds
-    exactly as before; the restore and rollback paths pass COLD_QUERY_LIMIT_S because a fork
-    queried cold must fault in index and data blocks that a warm store already holds. Three
-    runs died in here on the 60-second default (30228878183, 30235793478, 30270851093).
+    exactly as before; the restore and rollback paths pass COLD_QUERY_LIMIT_S because each
+    starts a fresh machine and exercises index and data paths that may not be warm. Three
+    historical snapshot-fork runs died here on the 60-second default (30228878183,
+    30235793478, 30270851093); operational rollback no longer uses that topology.
 
     Raising a socket budget cannot flatter a latency reading: the budget decides when to give
     up, and the timer records how long the answer actually took. It cannot loosen a gate
@@ -1989,8 +1990,9 @@ def plan(identity: RunIdentity, spec: CorpusSpec, *, mode: str = "execute") -> d
               "record_count": spec.count, "batch_size": spec.batch_size,
               "payload_bytes": spec.payload_bytes, "payload_shape": spec.payload_shape, "volume_gb": VOLUME_SIZE_GB,
               "generated_resources": {"app": identity.app_name, "source_volume": identity.volume_name,
+                                      "candidate_volume": identity.candidate_volume_name,
                                       "backup_volume": identity.backup_volume_name, "restore_volume": identity.restore_volume_name,
-                                      "rollback_volume": identity.rollback_volume_name},
+                                      "rollback_volume": "cleanup-compatibility-only"},
               "note": "plan-only: zero Fly mutations, credentials, network queries, or production access"}
     if mode == "execute":
         result["storage_qualification"] = {
@@ -2039,6 +2041,13 @@ def plan(identity: RunIdentity, spec: CorpusSpec, *, mode: str = "execute") -> d
             "logical_counts": logical_vault_counts(spec),
             "baseline_exact_legacy_fingerprint": legacy_baseline_counts(spec),
             "candidate_requires_exact_logical_counts": True,
+        }
+        result["rollback_qualification"] = {
+            "topology": "retained-original-volume",
+            "candidate_source": "stable clone of the completed pre-migration snapshot",
+            "operational_rollback": "legacy image remounts the untouched original volume",
+            "disaster_recovery": "candidate archive restore is qualified separately",
+            "legacy_rollback_volume": "cleanup compatibility only; never created by execute",
         }
         result["limitations"] = [
             "Synthetic rehearsal is not production deployment authorization.",
@@ -2325,7 +2334,23 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
         gates["baseline_read_witness"] = baseline_read_witness(client, corpus_receipt)
         terminate_proxy(proxy); proxy = None; runtime.stop_machine(identity, ledger.machine_id); runtime.destroy_machine(identity, ledger.machine_id); ledger.machine_id = None
         ledger.snapshot_id = runtime.snapshot(identity, ledger.volume_id)
-        migration_started = time.monotonic(); ledger.machine_id = runtime.create_machine(identity, ledger.volume_id, candidate_ref, "candidate")
+        clone_started = time.monotonic()
+        ledger.candidate_volume_id = runtime.create_volume(
+            identity,
+            identity.candidate_volume_name,
+            snapshot_id=ledger.snapshot_id,
+        )
+        measurements["candidate_clone_to_stable_s"] = time.monotonic() - clone_started
+        measurements["volume_topology"] = {
+            "candidate_source": "pre-migration-snapshot",
+            "pre_migration_snapshot_id": ledger.snapshot_id,
+            "original_volume_id": ledger.volume_id,
+            "candidate_volume_id": ledger.candidate_volume_id,
+            "operational_rollback": "retained-original-volume",
+            "legacy_rollback_volume": "not_created",
+        }
+        migration_started = time.monotonic(); ledger.machine_id = runtime.create_machine(
+            identity, ledger.candidate_volume_id, candidate_ref, "candidate")
         candidate_ready, migration_disks, migration_resources = runtime.migration_samples(identity, ledger.machine_id, MIGRATION_LIMIT_S)
         migration_s = time.monotonic() - migration_started
         measurements["disk_samples"].extend(asdict(sample) | {"free_percent": sample.free_percent} for sample in migration_disks)
@@ -2365,16 +2390,16 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
         gates["disk_headroom"] = scale_gate(probe, disk_gate(all_disk_samples), "disk headroom")
         gates["resource_sampling"] = Gate("PASSED" if migration_resources else "UNKNOWN", "migration CPU and RSS samples captured", len(migration_resources))
         terminate_proxy(proxy); proxy = None; runtime.stop_machine(identity, ledger.machine_id); runtime.destroy_machine(identity, ledger.machine_id); ledger.machine_id = None
-        ledger.machine_id = runtime.create_machine(identity, ledger.volume_id, candidate_ref, "clean-restart"); runtime.wait_ready(identity, ledger.machine_id, READINESS_LIMIT_S)
+        ledger.machine_id = runtime.create_machine(identity, ledger.candidate_volume_id, candidate_ref, "clean-restart"); runtime.wait_ready(identity, ledger.machine_id, READINESS_LIMIT_S)
         runtime.stop_machine(identity, ledger.machine_id, force=True); runtime.destroy_machine(identity, ledger.machine_id); ledger.machine_id = None
-        ledger.machine_id = runtime.create_machine(identity, ledger.volume_id, candidate_ref, "crash-restart"); runtime.wait_ready(identity, ledger.machine_id, READINESS_LIMIT_S)
+        ledger.machine_id = runtime.create_machine(identity, ledger.candidate_volume_id, candidate_ref, "crash-restart"); runtime.wait_ready(identity, ledger.machine_id, READINESS_LIMIT_S)
         gates["restart_durability"] = Gate("PASSED", "clean and forced-crash restarts reached readiness")
         runtime.stop_machine(identity, ledger.machine_id); runtime.destroy_machine(identity, ledger.machine_id); ledger.machine_id = None
         hard_delete_id = corpus_receipt.retained_ids["hard_delete"][0]
-        hard_delete_helper = runtime.hard_delete(identity, ledger.volume_id, candidate_ref, "stage-a-primary", hard_delete_id)
+        hard_delete_helper = runtime.hard_delete(identity, ledger.candidate_volume_id, candidate_ref, "stage-a-primary", hard_delete_id)
         ledger.machine_id = hard_delete_helper; runtime.wait_stopped(identity, hard_delete_helper, READINESS_LIMIT_S)
         runtime.destroy_machine(identity, hard_delete_helper); ledger.machine_id = None
-        ledger.machine_id = runtime.create_machine(identity, ledger.volume_id, candidate_ref, "hard-delete-check"); runtime.wait_ready(identity, ledger.machine_id, READINESS_LIMIT_S)
+        ledger.machine_id = runtime.create_machine(identity, ledger.candidate_volume_id, candidate_ref, "hard-delete-check"); runtime.wait_ready(identity, ledger.machine_id, READINESS_LIMIT_S)
         proxy = runtime.proxy(identity, ledger.machine_id, local_port); hard_delete_client = client_factory(f"http://127.0.0.1:{local_port}/mcp", auth_value); hard_delete_client.initialize()
         deleted_concept, _ = hard_delete_client.call("muninn_find_by_concept", {"vault": "stage-a-primary", "concept": "stage-a/concept/0043", "limit": 50})
         deleted_entity, _ = hard_delete_client.call("muninn_find_by_entity", {"vault": "stage-a-primary", "entity_name": "Stage A Entity 43", "limit": 50})
@@ -2403,7 +2428,7 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
         gates["hard_delete_cleanup"] = Gate("PASSED", "offline hard delete removed primary and reverse-index reachability")
         runtime.stop_machine(identity, ledger.machine_id); runtime.destroy_machine(identity, ledger.machine_id); ledger.machine_id = None
         backup_started = time.monotonic()
-        backup_helper, backup_path = runtime.create_backup(identity, ledger.volume_id, candidate_ref)
+        backup_helper, backup_path = runtime.create_backup(identity, ledger.candidate_volume_id, candidate_ref)
         ledger.machine_id = backup_helper; runtime.wait_stopped(identity, backup_helper, RESTORE_LIMIT_S)
         measurements["backup_duration_s"] = time.monotonic() - backup_started
         runtime.destroy_machine(identity, backup_helper); ledger.machine_id = None
@@ -2411,7 +2436,7 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
         # The archive is on the source volume, and a Fly machine mounts one volume, so it
         # reaches the restore volume by fork rather than by a second mount. The restore
         # helper then deletes the forked store and rebuilds it from the archive alone.
-        backup_snapshot_id = runtime.snapshot(identity, ledger.volume_id)
+        backup_snapshot_id = runtime.snapshot(identity, ledger.candidate_volume_id)
         measurements["backup_snapshot_id"] = backup_snapshot_id
         ledger.restore_volume_id = runtime.create_volume(identity, identity.restore_volume_name, snapshot_id=backup_snapshot_id)
         restore_helper = runtime.create_restore(identity, ledger.restore_volume_id, candidate_ref, backup_path)
@@ -2426,8 +2451,10 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
         measurements["restored_latencies"] = {name: latency_summary(values) for name, values in restored_samples.items()}
         measurements["restore_to_query_s"] = time.monotonic() - restore_started; gates["backup_restore"] = threshold_gate("restore-to-query", measurements["restore_to_query_s"], RESTORE_LIMIT_S)
         runtime.stop_machine(identity, ledger.machine_id); runtime.destroy_machine(identity, ledger.machine_id); ledger.machine_id = None
-        rollback_started = time.monotonic(); ledger.rollback_volume_id = runtime.create_volume(identity, identity.rollback_volume_name, snapshot_id=ledger.snapshot_id)
-        ledger.machine_id = runtime.create_machine(identity, ledger.rollback_volume_id, BASELINE_IMAGE, "rollback"); runtime.wait_ready(identity, ledger.machine_id, READINESS_LIMIT_S)
+        rollback_started = time.monotonic()
+        ledger.machine_id = runtime.create_machine(
+            identity, ledger.volume_id, BASELINE_IMAGE, "rollback")
+        runtime.wait_ready(identity, ledger.machine_id, READINESS_LIMIT_S)
         proxy = runtime.proxy(identity, ledger.machine_id, local_port); rollback_client = client_factory(f"http://127.0.0.1:{local_port}/mcp", auth_value); rollback_client.initialize()
         measurements["rollback_cold_query_s"] = wait_cold_query(rollback_client, "stage-a-primary")
         rollback_counts, _ = query_counts(rollback_client); rollback_samples = run_query_probes(rollback_client, corpus_receipt, timeout_s=COLD_QUERY_LIMIT_S); terminate_proxy(proxy); proxy = None
@@ -2437,7 +2464,12 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
             "counts": rollback_counts,
         }
         measurements["rollback_latencies"] = {name: latency_summary(values) for name, values in rollback_samples.items()}
-        measurements["rollback_check_s"] = time.monotonic() - rollback_started; gates["pre_migration_rollback"] = threshold_gate("pre-migration rollback", measurements["rollback_check_s"], ROLLBACK_LIMIT_S)
+        measurements["rollback_check_s"] = time.monotonic() - rollback_started
+        gates["pre_migration_rollback"] = threshold_gate(
+            "retained-original pre-migration rollback",
+            measurements["rollback_check_s"],
+            ROLLBACK_LIMIT_S,
+        )
         detail = "all measured Stage A phases completed"
     except RehearsalError as exc: status, exit_code, detail = exc.status, 1 if exc.status == "FAILED" else 2, safe_detail(str(exc), RECEIPT_DETAIL_CHARS)
     except Exception as exc: status, exit_code, detail = "UNKNOWN", 2, f"unexpected {type(exc).__name__}"

@@ -47,7 +47,7 @@ class StageAContractTests(unittest.TestCase):
         identity = stage.build_identity("contract-123")
         self.assertTrue(identity.app_name.startswith("koala-stage-a-contract-123"))
         self.assertEqual(identity.confirmation, stage.build_identity("contract-123").confirmation)
-        bad = stage.RunIdentity("x", stage.PRODUCTION_APP, "ksa_1234567890_src", "ksa_1234567890_bak", "ksa_1234567890_rst", "ksa_1234567890_rbk", "x")
+        bad = stage.RunIdentity("x", stage.PRODUCTION_APP, "ksa_1234567890_src", "ksa_1234567890_can", "ksa_1234567890_bak", "ksa_1234567890_rst", "ksa_1234567890_rbk", "x")
         with self.assertRaises(stage.RehearsalUnknown): stage.assert_not_production(bad)
 
     def test_volume_names_follow_fly_contract_and_are_deterministic(self):
@@ -56,23 +56,26 @@ class StageAContractTests(unittest.TestCase):
         other = stage.build_identity("contract-456")
         first_names = (
             first.volume_name,
+            first.candidate_volume_name,
             first.backup_volume_name,
             first.restore_volume_name,
             first.rollback_volume_name,
         )
         other_names = (
             other.volume_name,
+            other.candidate_volume_name,
             other.backup_volume_name,
             other.restore_volume_name,
             other.rollback_volume_name,
         )
         self.assertEqual(first_names, (
             repeated.volume_name,
+            repeated.candidate_volume_name,
             repeated.backup_volume_name,
             repeated.restore_volume_name,
             repeated.rollback_volume_name,
         ))
-        self.assertEqual(len(set(first_names)), 4)
+        self.assertEqual(len(set(first_names)), 5)
         self.assertNotEqual(first_names, other_names)
         self.assertTrue(all(stage.FLY_VOLUME_NAME_RE.fullmatch(name) for name in first_names))
 
@@ -82,6 +85,7 @@ class StageAContractTests(unittest.TestCase):
             identity.run_id,
             identity.app_name,
             "koala-stage-a-invalid-source",
+            identity.candidate_volume_name,
             identity.backup_volume_name,
             identity.restore_volume_name,
             identity.rollback_volume_name,
@@ -92,6 +96,7 @@ class StageAContractTests(unittest.TestCase):
             identity.app_name,
             identity.volume_name,
             identity.volume_name,
+            identity.backup_volume_name,
             identity.restore_volume_name,
             identity.rollback_volume_name,
             identity.confirmation,
@@ -353,8 +358,8 @@ class StageAContractTests(unittest.TestCase):
             "Fly machine-create rejects a digest-pinned config.image, so the candidate launches from the run-owned mirror tag; identity rests on the digest assertion taken before launch, not on the launch reference itself.",
             "The pre-ingestion provisioning probe is mountless, so it proves candidate image and guest provisioning and the machine exec shell transport only; volume attachment, readiness, the resource measurement itself, and every measured gate remain first exercised by the real machines.",
             "query_latency is judged net of a transport baseline because every query crosses a WireGuard tunnel to the guest; the 150ms net limit is bounded above four observed readings (117.5/82.5/77.8/90.1), which is a thin basis, and the baseline is inferred from the cheapest query classes rather than measured server-side.",
-            "restore_cold_query_s and rollback_cold_query_s are now measured, and they REFUTE the premise the cold-query budget was built on: run 30283211992 returned 0.0398s and 0.0387s for a concept lookup against a freshly forked store. A cold fork is not slow on its metadata call (0.077s/0.159s on run 30270851093) or on its data call. COLD_QUERY_LIMIT_S therefore stands at roughly 23,000 times the only observed cost of the thing it bounds. It is retained as a bound below the phase gate it feeds, not as a calibrated figure, and nothing here explains why a 60-second socket budget expired three times on calls now measured in tens of milliseconds.",
-            "WITHDRAWN, and the withdrawal is the finding. The previous text here attributed muninn_read(stage-a-primary): MCP JSON-RPC error code=-32000 message=tool error: engram not found to the rollback fork failing to read its own snapshot. That was wrong. Runs 30290534176 and 30302595011 both carried that detail from the HARD-DELETE CHECK, where a failed read is the PASS condition, and neither run ever reached the rollback phase: hard_delete_cleanup, backup_restore and pre_migration_rollback are all ABSENT from both receipts, and cleanup records backup_volume_id, restore_volume_id and rollback_volume_id as not_created. The cause was this harness, not MuninnDB. #74 raised RehearsalProtocolFailed for every JSON-RPC error object regardless of code, and the hard-delete check re-raises protocol errors rather than counting them as proof of deletion, so the server correctly reporting a purged record became fatal. Fixed by classifying -32000..-32099 as RehearsalToolFailed in _post. The analytical error is worth recording separately: the receipts were read for the gates PRESENT and not for the gates MISSING, and the missing three named the phase. What the rollback failure IS remains open. Run 30283211992 failed pre_migration_rollback at 502385 records with the opaque pre-#74 detail MCP JSON-RPC error, while run 30225846042, a tail probe at 2000 records on the same image acef6be, PASSED pre_migration_rollback in 30.07s against an 1800s limit with rollback_counts matching the exact known legacy fingerprint. So the rollback failure does not reproduce at probe scale and no tail probe can settle it; only a full execute run can. baseline_read_witness PASSED at ok=2/2 on the live baseline machine, which establishes only that the legacy image point-reads its own retained ordering ids, and cannot discriminate whether a fork inherits or introduces an inconsistency, because these runs never build a fork. Not established either: which call exhausted the 60-second socket budget in runs 30228878183, 30235793478 and 30270851093, nor why it ever expired on calls now measured in tens of milliseconds.",
+            "Operational rollback is tested by remounting the retained original volume with the legacy image; candidate archive restore separately tests disaster recovery. Neither path authorizes production deployment.",
+            "Historical correction: runs 30290534176 and 30302595011 stopped at hard-delete verification, not rollback. A -32000 tool-level 'engram not found' response is the hard-delete pass condition; protocol faults still fail closed.",
         ])
 
     def test_volume_command_is_encrypted_twenty_gb_and_unscheduled(self):
@@ -1010,8 +1015,8 @@ class StageAContractTests(unittest.TestCase):
         self.assertEqual(runtime.candidate_ref, stage.CANDIDATE_IMAGE)
 
     def test_candidate_mirror_refuses_production_repository(self):
-        production = stage.RunIdentity("x", stage.PRODUCTION_APP, "ksa_1234567890_src", "ksa_1234567890_bak",
-                                       "ksa_1234567890_rst", "ksa_1234567890_rbk", "x")
+        production = stage.RunIdentity("x", stage.PRODUCTION_APP, "ksa_1234567890_src", "ksa_1234567890_can",
+                                       "ksa_1234567890_bak", "ksa_1234567890_rst", "ksa_1234567890_rbk", "x")
         runner, calls = self.mirror_runner(stage.CANDIDATE_DIGEST)
         with self.assertRaises(stage.RehearsalUnknown): stage.FlyRuntime(runner=runner).mirror_candidate(production)
         self.assertEqual(calls, [])
@@ -1201,8 +1206,8 @@ class StageAContractTests(unittest.TestCase):
             if "volumes" in cmd and "create" in cmd:
                 return subprocess.CompletedProcess(cmd, 0, json.dumps({"id": "vol_forked"}), "")
             if "volumes" in cmd and "list" in cmd:
-                # A fork is created hydrating and is only mountable once it reads `created`,
-                # so create_volume now polls it and the fake has to answer that poll.
+                # Fly permits mounting a hydrating fork, but this harness waits for the stable
+                # `created` state because disposable runs observed early launch waits fail.
                 state = "restoring" if volume_polls.append(1) or len(volume_polls) < 2 else "created"
                 return subprocess.CompletedProcess(cmd, 0, json.dumps([{"id": "vol_forked", "state": state}]), "")
             return subprocess.CompletedProcess(cmd, 0, "", "")
@@ -1672,13 +1677,14 @@ class StageAContractTests(unittest.TestCase):
         return ReadClient()
 
     def test_the_baseline_witness_reads_the_same_records_run_query_probes_reads(self):
-        """run_query_probes point-reads retained_ids["ordering"][:10] on the restore and rollback
-        forks. A witness that asked about a DIFFERENT set, vault or method would not be comparable
-        with it, and comparability is the only value this gate has.
+        """run_query_probes point-reads retained_ids["ordering"][:10] after archive restore
+        and retained-original rollback. A witness that asked about a different set, vault, or
+        method would not establish that the same original records were readable before cloning
+        and after candidate qualification.
 
-        (The claim this test carried when written - that run 30290534176 failed on that same read
-        against the rollback fork - was wrong. That run failed at the hard-delete check and never
-        built a fork. The mirroring requirement below is unaffected.)"""
+        The claim this test carried when written - that run 30290534176 failed on that same read
+        against a rollback fork - was wrong. That run failed at the hard-delete check and never
+        reached rollback. The corrected topology no longer creates that fork."""
         receipt = stage.CorpusReceipt(retained_ids={"ordering": [f"ord-{i:02d}" for i in range(25)]})
         client = self._read_client()
         gate = stage.baseline_read_witness(client, receipt)
@@ -1693,9 +1699,11 @@ class StageAContractTests(unittest.TestCase):
                          "the witness slice no longer mirrors run_query_probes' [:10]")
 
     def test_a_denied_baseline_read_fails_the_gate_and_carries_the_servers_message(self):
-        """A gate rather than a raise, so ONE run reports both the baseline and the fork; but a
-        FAILED gate still fails the run via receipt_status, so it can never pass quietly. The
-        count distinguishes a read path that resolves nothing from one absent record."""
+        """A gate rather than a raise lets one run report the baseline and every later phase.
+
+        A FAILED gate still fails the run via receipt_status, so it can never pass quietly. The
+        count distinguishes a read path that resolves nothing from one absent record.
+        """
         ordering = [f"ord-{i:02d}" for i in range(10)]
         receipt = stage.CorpusReceipt(retained_ids={"ordering": ordering})
         one = stage.baseline_read_witness(self._read_client(denied={"ord-03"}), receipt)
@@ -1728,6 +1736,96 @@ class StageAContractTests(unittest.TestCase):
         self.assertTrue(snapshot in source, "the pre-migration snapshot moved; re-check placement")
         self.assertTrue(source.index(witness) < source.index(snapshot),
                         "the witness runs after the snapshot, so it no longer tests the baseline")
+
+    def test_candidate_uses_a_stable_snapshot_clone_and_rollback_reuses_the_original(self):
+        """The candidate may mutate only a clone; operational rollback keeps the original."""
+        source = inspect.getsource(stage.execute)
+        snapshot = "ledger.snapshot_id = runtime.snapshot(identity, ledger.volume_id)"
+        clone = "ledger.candidate_volume_id = runtime.create_volume("
+        candidate = "ledger.candidate_volume_id, candidate_ref, \"candidate\""
+        rollback = "ledger.volume_id, BASELINE_IMAGE, \"rollback\""
+        self.assertIn(snapshot, source)
+        self.assertIn(clone, source)
+        self.assertIn("identity.candidate_volume_name", source)
+        self.assertIn("snapshot_id=ledger.snapshot_id", source)
+        self.assertIn(candidate, source)
+        self.assertIn(rollback, source)
+        self.assertLess(source.index(snapshot), source.index(clone))
+        self.assertLess(source.index(clone), source.index(candidate))
+        self.assertLess(source.index(candidate), source.index(rollback))
+        self.assertNotIn("ledger.rollback_volume_id = runtime.create_volume", source)
+
+    def test_all_candidate_mutations_use_the_candidate_clone(self):
+        source = inspect.getsource(stage.execute)
+        required = (
+            'ledger.candidate_volume_id, candidate_ref, "clean-restart"',
+            'ledger.candidate_volume_id, candidate_ref, "crash-restart"',
+            "runtime.hard_delete(identity, ledger.candidate_volume_id, candidate_ref",
+            'ledger.candidate_volume_id, candidate_ref, "hard-delete-check"',
+            "runtime.create_backup(identity, ledger.candidate_volume_id, candidate_ref)",
+            "runtime.snapshot(identity, ledger.candidate_volume_id)",
+        )
+        for call in required:
+            self.assertIn(call, source)
+        original_snapshot = source.index("ledger.snapshot_id = runtime.snapshot(identity, ledger.volume_id)")
+        rollback = source.index('ledger.volume_id, BASELINE_IMAGE, "rollback"')
+        between = source[original_snapshot:rollback]
+        self.assertEqual(
+            between.count("ledger.volume_id"),
+            2,
+            "the retained original is referenced after snapshot for something other than topology evidence or rollback",
+        )
+
+    def test_plan_and_receipt_disclose_retained_original_rollback(self):
+        identity = stage.build_identity("topology-plan")
+        rendered = stage.plan(identity, stage.CorpusSpec(payload_shape="lexical"))
+        self.assertEqual(rendered["rollback_qualification"]["topology"], "retained-original-volume")
+        self.assertEqual(rendered["generated_resources"]["candidate_volume"], identity.candidate_volume_name)
+        self.assertEqual(rendered["generated_resources"]["rollback_volume"], "cleanup-compatibility-only")
+        document = stage.receipt_document(
+            identity,
+            stage.CorpusSpec(payload_shape="lexical"),
+            status="UNKNOWN",
+            exit_code=2,
+            detail="test",
+            ledger=stage.ResourceLedger(),
+            measurements={},
+            gates={},
+            cleanup_result={"rollback_volume_id": "not_created"},
+            orphans=[],
+            corpus=None,
+            mode="execute",
+        )
+        self.assertTrue(any("retained original" in item for item in document["limitations"]))
+        self.assertFalse(any("rollback failure IS remains open" in item for item in document["limitations"]))
+
+    def test_candidate_volume_is_discovered_and_cleaned_independently(self):
+        identity = stage.build_identity("candidate-cleanup")
+        runtime = mock.Mock()
+        runtime.list_owned_resources.return_value = []
+        ledger = stage.ResourceLedger(
+            candidate_volume_id="vol_candidate",
+            rollback_volume_id=None,
+        )
+        results, orphans = stage.cleanup(runtime, identity, ledger)
+        self.assertEqual(orphans, [])
+        self.assertEqual(results["candidate_volume_id"], "destroyed")
+        self.assertEqual(results["rollback_volume_id"], "not_created")
+        runtime.destroy_volume.assert_called_once_with(identity, "vol_candidate")
+
+        def runner(cmd, **kwargs):
+            if cmd[1] == "status":
+                return subprocess.CompletedProcess(cmd, 0, "ok", "")
+            if "machines" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, "[]", "")
+            if "volumes" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, json.dumps([
+                    {"id": "vol_candidate", "name": identity.candidate_volume_name},
+                ]), "")
+            raise AssertionError(cmd)
+        discovered = stage.FlyRuntime(runner=runner).discover_owned_resources(identity)
+        self.assertEqual(discovered.candidate_volume_id, "vol_candidate")
+        self.assertIsNone(discovered.rollback_volume_id)
 
     def _probe_fixture(self):
         """A receipt plus exactly the scripted responses run_query_probes consumes, in order."""
@@ -2363,13 +2461,14 @@ class StageAContractTests(unittest.TestCase):
             return subprocess.CompletedProcess(cmd, 0, "", "")
         return stage.FlyRuntime(runner=runner)
 
-    def test_a_hydrating_fork_is_waited_out_rather_than_mounted(self):
-        """Runs 30217281791 and 30220383793 both mounted a fork still in `restoring`.
+    def test_a_hydrating_fork_is_waited_out_before_this_harness_mounts_it(self):
+        """Fly permits hydration-time mounts, but this harness needs deterministic launch.
 
         Measured on a disposable app: a 14 GB fork reported `restoring`, flyctl abandoned
         its start-wait at ~62s with "machine failed to reach desired start state", and the
         machine then started unaided at 3m13s with the data intact. The volume was never
-        broken and neither was the machine - the harness simply mounted too early.
+        broken and neither was the machine; waiting for stable `created` avoids that launch
+        race without claiming Fly forbids mounting a hydrating fork.
         """
         identity = stage.build_identity("hydrate")
         runtime = self._volume_runtime(["restoring", "restoring", "created"])

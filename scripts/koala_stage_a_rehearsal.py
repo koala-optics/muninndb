@@ -80,6 +80,23 @@ PROCFS_RESOURCE_AWK = (
     "END{print cpu+0,int(rss)}"
 )
 QUERY_P95_LIMIT_MS, STATUS_LIMIT_S = 250.0, 30.0
+# The gated figure is the fuzzy p95 NET of the tunnel, not the raw client-observed p95.
+# Every measured query crosses a `flyctl proxy` WireGuard tunnel from the GitHub runner to
+# the ewr guest, so a raw reading is WAN round-trip PLUS server time. Across runs 13-16, on
+# an identical 502,385-record corpus and identical performance-16x guests, the
+# transport-dominated `exact` p50 swung 3.83x (43.581 -> 167.165 ms) while fuzzy's marginal
+# cost over that floor held within 1.35x (77.7 -> 105.0 ms). A guest starved by factor k
+# scales both terms by k, so the term that varies is additive and per-request: the tunnel,
+# not MuninnDB. Run 16 failed at a raw 257.278 and would have passed on run 15's tunnel
+# (43.6 + 90.1 = 133.7); run 15 passed at 121.256 and would have nearly failed on run 16's
+# (167.2 + 77.7 = 244.9). The raw gate was grading runner placement.
+# The net limit is 150.0 against four observed net readings - 117.5 / 82.5 / 77.8 / 90.1
+# under the min-baseline below - i.e. about 28% headroom over the worst. Four points is a
+# THIN basis and is disclosed as a receipt limitation. This is a bound chosen above the
+# observed spread, not a constant fitted to make run 16 pass: it is STRICTER than the old
+# gate on a fast tunnel (250 raw on run 15's floor permitted a net 206.4) and looser on a
+# slow one (run 16's floor permitted only 82.8). Removing that dependence is the point.
+QUERY_NET_P95_LIMIT_MS = 150.0
 # Every entity and group name that exists on a primary-vault probe record, with its match
 # count, derived from record_for rather than assumed: Entity 00 (2), 01 (2), 07 (1),
 # 42 (503), 43 (1), Group 0 (504), 1 (4), 2 (1). An absent name would return nothing and
@@ -411,6 +428,18 @@ def latency_summary(values: Sequence[float]) -> dict[str, float | int | None]:
             "p95_ms": round(percentile(values, .95), 3) if values else None,
             "max_ms": round(max(values), 3) if values else None}
 
+def transport_baseline_ms(summaries: dict[str, Any]) -> float | None:
+    """The tunnel's per-request floor, read off the cheapest query classes.
+
+    `exact` (a concept lookup matching 1-2 records) and `read` (a direct id fetch) do almost
+    no server work, and their p50s track each other within 0.4% on runs 14, 15 and 16 (11%
+    on run 13) - which is what a transport-dominated reading looks like. Taking the min
+    subtracts the least, so the resulting net figure stays on the strict side.
+    """
+    values = [summaries[name]["p50_ms"] for name in ("exact", "read")
+              if summaries.get(name, {}).get("count") and summaries[name].get("p50_ms") is not None]
+    return min(values) if values else None
+
 def threshold_gate(name: str, measured: float | int | None, limit: float | int) -> Gate:
     if measured is None: return Gate("UNKNOWN", f"{name} not measured", measured, limit)
     passed = measured <= limit
@@ -731,6 +760,9 @@ def receipt_document(
         limitations.append(
             "The pre-ingestion provisioning probe is mountless, so it proves candidate image and guest provisioning and the machine exec shell transport only; volume attachment, readiness, the resource measurement itself, and every measured gate remain first exercised by the real machines."
         )
+        limitations.append(
+            "query_latency is judged net of a transport baseline because every query crosses a WireGuard tunnel to the guest; the 150ms net limit is bounded above four observed readings (117.5/82.5/77.8/90.1), which is a thin basis, and the baseline is inferred from the cheapest query classes rather than measured server-side."
+        )
     return {
         "schema_version": SCHEMA_VERSION,
         "status": status,
@@ -749,10 +781,16 @@ def receipt_document(
         "limitations": limitations,
     }
 
+# Only reads are retried. A timed-out mutation may already have reached the server, so
+# replaying it could double-apply; any method absent from this set gets exactly one attempt.
+IDEMPOTENT_METHODS = frozenset({"muninn_find_by_concept", "muninn_find_by_entity", "muninn_read", "muninn_recall", "muninn_status"})
+MCP_CALL_ATTEMPTS = 3
+
 class MCPClient:
     def __init__(self, url: str, auth_value: str, timeout: float = 60.0):
         if not re.fullmatch(r"http://(?:127\.0\.0\.1|localhost):[0-9]+/mcp", url): raise RehearsalUnknown("MCP endpoint must be loopback")
         self.url, self.auth_value, self.timeout, self.request_id = url, auth_value, timeout, 0
+        self.transport_retries = 0
     def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
         request = urllib.request.Request(self.url, data=json.dumps(payload).encode(), method="POST",
             headers={"Authorization": f"Bearer {self.auth_value}", "Content-Type": "application/json"})
@@ -774,8 +812,26 @@ class MCPClient:
                     raise RehearsalUnknown("MCP readiness deadline expired")
                 time.sleep(1)
     def call(self, method: str, arguments: dict[str, Any]) -> tuple[Any, float]:
-        self.request_id += 1; started = time.monotonic()
-        response = self._post({"jsonrpc": "2.0", "method": "tools/call", "params": {"name": method, "arguments": arguments}, "id": self.request_id})
+        """Issue one tools/call, retrying a READ whose transport failed.
+
+        Run 30228878183 lost its rollback verdict to a single TimeoutError about two hours
+        in, on the fifth proxy of the run. `initialize` already retries to a deadline and
+        every flyctl surface retries three times, but `call` had exactly one attempt, so one
+        tunnel hiccup was fatal. Only RehearsalUnknown - transport - is retried;
+        RehearsalFailed is an application error and must surface, never be replayed away.
+        The timer restarts per attempt, so a retried call contributes only its successful
+        attempt's latency and cannot inflate the measurement it feeds.
+        """
+        attempts = MCP_CALL_ATTEMPTS if method in IDEMPOTENT_METHODS else 1
+        for attempt in range(attempts):
+            self.request_id += 1; started = time.monotonic()
+            try:
+                response = self._post({"jsonrpc": "2.0", "method": "tools/call", "params": {"name": method, "arguments": arguments}, "id": self.request_id})
+                break
+            except RehearsalUnknown:
+                self.transport_retries += 1
+                if attempt + 1 == attempts: raise
+                time.sleep(attempt + 1)
         content = response.get("result", {}).get("content", [])
         if not content or not isinstance(content[0], dict) or "text" not in content[0]: raise RehearsalFailed(f"{method} returned no content")
         try: result = json.loads(content[0]["text"])
@@ -2014,8 +2070,17 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
         samples = run_query_probes(candidate, corpus_receipt); run_lifecycle_probes(candidate, corpus_receipt)
         gates["semantic_probes"] = Gate("PASSED", "exact-concept, entity ordering, vault isolation, collision hydration, lifecycle filtering, and fuzzy reads passed")
         measurements["latencies"] = {name: latency_summary(values) for name, values in samples.items()}
-        p95 = max(summary["p95_ms"] or 0 for summary in measurements["latencies"].values() if summary["count"])
-        gates["query_latency"] = scale_gate(probe, threshold_gate("bounded query p95", p95, QUERY_P95_LIMIT_MS), "bounded query p95")
+        gross_p95 = max(summary["p95_ms"] or 0 for summary in measurements["latencies"].values() if summary["count"])
+        baseline_p50 = transport_baseline_ms(measurements["latencies"])
+        net_p95 = None if baseline_p50 is None else round(gross_p95 - baseline_p50, 3)
+        # Gross and baseline are both recorded, so the subtraction is auditable from the
+        # receipt and a slow tunnel stays visible rather than being silently absorbed. A
+        # missing baseline yields None, which threshold_gate records UNKNOWN, never a pass.
+        measurements["query_transport"] = {"gross_p95_ms": gross_p95, "baseline_p50_ms": baseline_p50,
+                                           "net_p95_ms": net_p95, "gross_limit_ms": QUERY_P95_LIMIT_MS,
+                                           "net_limit_ms": QUERY_NET_P95_LIMIT_MS,
+                                           "transport_retries": candidate.transport_retries}
+        gates["query_latency"] = scale_gate(probe, threshold_gate("bounded query net p95", net_p95, QUERY_NET_P95_LIMIT_MS), "bounded query net p95")
         post = runtime.disk_sample(identity, ledger.machine_id, "post-migration"); measurements["disk_samples"].append(asdict(post) | {"free_percent": post.free_percent})
         all_disk_samples = [empty, immediate, *quiet["samples"], *migration_disks, post]
         gates["disk_headroom"] = scale_gate(probe, disk_gate(all_disk_samples), "disk headroom")

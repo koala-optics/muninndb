@@ -65,6 +65,13 @@ TRUNCATION_MARKER = " ...[truncated]... "
 # the composed detail well inside RECEIPT_DETAIL_CHARS even with the method and vault prefix,
 # so a verbose server error can never crowd out the part that names the call.
 JSON_RPC_DETAIL_CHARS = 200
+# JSON-RPC 2.0 reserves -32000..-32099 for implementation-defined SERVER errors, which is the
+# band a tool raising "engram not found" lands in. Outside that band the reserved protocol codes
+# live (-32700 parse, -32600 invalid request, -32601 method not found, -32602 invalid params,
+# -32603 internal). The distinction is not cosmetic: one means the server answered at tool level,
+# the other means the request never reached tool semantics, and the hard-delete check's PASS
+# condition depends on telling them apart.
+JSON_RPC_SERVER_ERROR_MIN, JSON_RPC_SERVER_ERROR_MAX = -32099, -32000
 # Mirrors the [:10] slice run_query_probes reads, so the baseline witness and the fork probe
 # ask about the SAME records. If those two ever disagree the comparison is worthless, which is
 # the entire value of the witness.
@@ -171,13 +178,37 @@ class RehearsalFailed(RehearsalError): status = "FAILED"
 class RehearsalUnknown(RehearsalError): pass
 
 class RehearsalProtocolFailed(RehearsalFailed):
-    """A JSON-RPC error object came back, so the request never reached tool semantics.
+    """A JSON-RPC PROTOCOL error came back, so the request never reached tool semantics.
 
     Separated from RehearsalFailed because the two mean opposite things to a caller that
     EXPECTS a failure. The hard-delete check reads a purged record and treats any
     RehearsalFailed as proof the record is gone; a protocol error there is not evidence of
     deletion, it is evidence the question was never answered. Still FAILED, not UNKNOWN: the
     server responded, and a response saying no is a result.
+
+    Raised only for codes OUTSIDE the -32000..-32099 server band. #74 raised this class for
+    every error object regardless of code, which is what broke runs 30290534176 and
+    30302595011 - see RehearsalToolFailed.
+    """
+
+class RehearsalToolFailed(RehearsalFailed):
+    """The server answered, at tool level, with an implementation-defined error.
+
+    A SIBLING of RehearsalProtocolFailed rather than a subclass, and that is the whole
+    mechanism: the hard-delete check already reads `except RehearsalProtocolFailed: raise`
+    followed by `except RehearsalFailed: pass`, so a tool error falls to the second clause and
+    counts as proof the record is gone, while a protocol fault still re-raises. No new branch
+    at the call site; the classification moves into _post where the code is actually visible.
+
+    Why this exists: #74 collapsed the distinction, raising RehearsalProtocolFailed for ANY
+    error object. Runs 30290534176 and 30302595011 then died at the hard-delete check on
+    `code=-32000 message=tool error: engram not found` - the server correctly reporting the
+    record was purged, which is that check's PASS condition, re-raised as fatal. Both runs
+    stopped three gates short of the rollback phase they were dispatched to measure, and the
+    identical detail was misread as a rollback failure because the ABSENT gates were not read.
+
+    Everywhere else this is an ordinary RehearsalFailed: still FAILED, still never retried by
+    `call`, still carrying the server's own code and message into the receipt.
     """
 
 @dataclass(frozen=True)
@@ -720,6 +751,28 @@ def json_rpc_detail(error: Any) -> str:
         parts.append(f"data={json.dumps(fields['data'], default=str)[:JSON_RPC_DETAIL_CHARS]}")
     return " ".join(parts)
 
+def json_rpc_failure(error: Any) -> RehearsalFailed:
+    """Choose the exception class by error code: did the server answer, or not?
+
+    The single question this answers is whether a caller that EXPECTS a failure may treat this
+    one as evidence. Inside -32000..-32099 the server answered at tool level, so a hard-delete
+    read that comes back "engram not found" is proof the record is gone. Outside that band the
+    request never reached tool semantics, so the same caller learned nothing.
+
+    An absent, non-integer, or out-of-band code is classed PROTOCOL, not tool, because the two
+    mistakes are not symmetric. Calling a protocol fault a tool error would let the hard-delete
+    gate PASS on a server that never answered - the exact hazard #74 was built to close, and a
+    false PASS is a qualification defect. Calling a tool error a protocol fault costs a
+    dispatch, which is what runs 30290534176 and 30302595011 cost. Bounded loss over silent
+    acquittal, consistent with the rest of this harness treating an error as never a valid
+    empty result.
+    """
+    code = error.get("code") if isinstance(error, dict) else None
+    detail = f"MCP JSON-RPC error {json_rpc_detail(error)}"
+    if isinstance(code, int) and JSON_RPC_SERVER_ERROR_MIN <= code <= JSON_RPC_SERVER_ERROR_MAX:
+        return RehearsalToolFailed(detail)
+    return RehearsalProtocolFailed(detail)
+
 def safe_detail(value: str, limit: int = SAFE_DETAIL_CHARS) -> str:
     """Compact a diagnostic to a bounded excerpt, blanking it entirely if anything matches.
 
@@ -843,7 +896,7 @@ def receipt_document(
             "restore_cold_query_s and rollback_cold_query_s are now measured, and they REFUTE the premise the cold-query budget was built on: run 30283211992 returned 0.0398s and 0.0387s for a concept lookup against a freshly forked store. A cold fork is not slow on its metadata call (0.077s/0.159s on run 30270851093) or on its data call. COLD_QUERY_LIMIT_S therefore stands at roughly 23,000 times the only observed cost of the thing it bounds. It is retained as a bound below the phase gate it feeds, not as a calibrated figure, and nothing here explains why a 60-second socket budget expired three times on calls now measured in tens of milliseconds."
         )
         limitations.append(
-            "The rollback failure is now named rather than inferred. Run 30290534176, a tail probe at 2000 records, reported muninn_read(stage-a-primary): MCP JSON-RPC error code=-32000 message=tool error: engram not found - a server-defined tool error, not -32601 for a missing method and not -32602 for a bad vault. Control flow makes it sharper: run_query_probes raises on its FIRST failure and failed on the third step, so the two before it completed against the same connection to the same forked store, and both assert strict equality against the ids the harness retained at ingest. The fork's own concept and entity indexes returned those exact ids, and then the fork's read path denied the first of them, which rules out a stale, foreign or wrongly-namespaced id: the store produced the id itself. Ingest runs on BASELINE_IMAGE, the legacy machine is stopped AND destroyed before ledger.snapshot_id is taken, and run_query_probes with the same corpus receipt passes on the candidate after migration and on the candidate rebuilt from the archive, so the inconsistency is specific to the legacy image reading a fork of its own snapshot. Whether the fork introduced it or inherited it is NOT established, and the new baseline_read_witness gate is what discriminates: muninn_read was never exercised on the baseline machine, so a legacy image that could never point-read these ids at all would have looked identical for twenty dispatches. Not established either: which call exhausted the 60-second socket budget in runs 30228878183, 30235793478 and 30270851093, nor why it ever expired on calls now measured in tens of milliseconds."
+            "WITHDRAWN, and the withdrawal is the finding. The previous text here attributed muninn_read(stage-a-primary): MCP JSON-RPC error code=-32000 message=tool error: engram not found to the rollback fork failing to read its own snapshot. That was wrong. Runs 30290534176 and 30302595011 both carried that detail from the HARD-DELETE CHECK, where a failed read is the PASS condition, and neither run ever reached the rollback phase: hard_delete_cleanup, backup_restore and pre_migration_rollback are all ABSENT from both receipts, and cleanup records backup_volume_id, restore_volume_id and rollback_volume_id as not_created. The cause was this harness, not MuninnDB. #74 raised RehearsalProtocolFailed for every JSON-RPC error object regardless of code, and the hard-delete check re-raises protocol errors rather than counting them as proof of deletion, so the server correctly reporting a purged record became fatal. Fixed by classifying -32000..-32099 as RehearsalToolFailed in _post. The analytical error is worth recording separately: the receipts were read for the gates PRESENT and not for the gates MISSING, and the missing three named the phase. What the rollback failure IS remains open. Run 30283211992 failed pre_migration_rollback at 502385 records with the opaque pre-#74 detail MCP JSON-RPC error, while run 30225846042, a tail probe at 2000 records on the same image acef6be, PASSED pre_migration_rollback in 30.07s against an 1800s limit with rollback_counts matching the exact known legacy fingerprint. So the rollback failure does not reproduce at probe scale and no tail probe can settle it; only a full execute run can. baseline_read_witness PASSED at ok=2/2 on the live baseline machine, which establishes only that the legacy image point-reads its own retained ordering ids, and cannot discriminate whether a fork inherits or introduces an inconsistency, because these runs never build a fork. Not established either: which call exhausted the 60-second socket budget in runs 30228878183, 30235793478 and 30270851093, nor why it ever expired on calls now measured in tens of milliseconds."
         )
     return {
         "schema_version": SCHEMA_VERSION,
@@ -880,7 +933,10 @@ class MCPClient:
             with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=self.timeout if timeout_s is None else timeout_s) as response:
                 parsed = json.loads(response.read().decode())
         except (OSError, ValueError, urllib.error.URLError) as exc: raise RehearsalUnknown(f"MCP transport failed: {type(exc).__name__}") from exc
-        if parsed.get("error"): raise RehearsalProtocolFailed(f"MCP JSON-RPC error {json_rpc_detail(parsed['error'])}")
+        # Classified here rather than at the call sites: this is the only place the error code is
+        # in scope, and a site that re-derived it from the message string would be exactly the
+        # string-matching the typed classes exist to avoid.
+        if parsed.get("error"): raise json_rpc_failure(parsed["error"])
         return parsed
     def initialize(self, timeout_s: float = READINESS_LIMIT_S) -> None:
         deadline = time.monotonic() + timeout_s
@@ -1822,30 +1878,30 @@ def run_lifecycle_probes(client: MCPClient, receipt: CorpusReceipt) -> None:
     if not isinstance(restored, dict) or restored.get("restored") is not True: raise RehearsalFailed("soft-delete restore failed")
 
 def baseline_read_witness(client: MCPClient, receipt: CorpusReceipt) -> Gate:
-    """Point-read, on the ORIGINAL baseline machine, the exact ids the rollback fork denied.
+    """Point-read, on the ORIGINAL baseline machine, the exact ids run_query_probes reads later.
 
-    Run 30290534176 pinned the rollback failure to `muninn_read(stage-a-primary): MCP JSON-RPC
-    error code=-32000 message=tool error: engram not found`, and control flow makes that
-    reading sharper than the line itself. run_query_probes raises on its FIRST failure and it
-    failed on the third step, so the two steps before it completed against the same connection
-    to the same forked store: muninn_find_by_concept returned exactly
-    retained_ids["collision"][index] (strict equality, else "collision hydration failed"), and
-    muninn_find_by_entity returned exactly the reversed retained_ids["ordering"] (strict
-    equality inside verify_entity_ordering). The fork's own indexes handed those ids back, and
-    then the fork's read path said the first of them does not exist. A stale, foreign or
-    wrongly-namespaced id is therefore ruled out - the store produced the id itself.
+    The reason given for this gate when it was built was wrong and is withdrawn. It read run
+    30290534176's `muninn_read(stage-a-primary): MCP JSON-RPC error code=-32000 message=tool
+    error: engram not found` as the rollback fork denying an id its own indexes had just
+    returned, and reasoned from run_query_probes' control flow accordingly. That detail came
+    from the hard-delete check instead, where a failed read is the PASS condition, and the run
+    never reached the rollback phase at all: hard_delete_cleanup, backup_restore and
+    pre_migration_rollback are absent from its receipt and no fork volume was created. The
+    cause was #74 collapsing tool errors into protocol errors, since fixed in _post.
 
-    What is NOT known is whether the fork introduced that inconsistency or inherited it.
-    muninn_read is never exercised on the baseline machine: baseline_legacy_counts checks
-    counts, and baseline_status checks muninn_status, so a legacy image that could never
-    point-read these ids at all would have looked identical for twenty dispatches. This
-    witness closes that gap on the live baseline, before the snapshot is taken, which is the
-    only place the question can be asked without a second dispatch.
+    The gate is kept because its narrow claim is still worth a receipt and costs nothing.
+    muninn_read is otherwise never exercised on the baseline machine - baseline_legacy_counts
+    checks counts and baseline_status checks muninn_status - so a legacy image that could not
+    point-read its own retained ids would have looked identical for twenty dispatches. Measured
+    on run 30302595011: PASSED, ok=2/2 at probe scale. What it CANNOT do is discriminate whether
+    a fork inherits or introduces an inconsistency, which is what it was claimed to do: that
+    needs a run that actually builds a fork, and run 30225846042 showed the rollback phase
+    passing at probe scale, so it needs a full execute run.
 
     It is a Gate rather than a raise, deliberately. A raise here aborts before the fork is
     ever built, so the run would answer one half of the question and cost another dispatch to
     answer the other; as a gate, one run reports both halves. It cannot hide a failure either:
-    receipt_status returns FAILED when ANY gate is FAILED, so a failed witness fails the run
+    combine_status returns FAILED when ANY gate is FAILED, so a failed witness fails the run
     without truncating it. This is not an error being treated as a valid empty result - the
     server's own message is carried into the detail, and the gate goes FAILED.
 
@@ -2329,6 +2385,15 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
         # evidence of deletion - it means the question was never answered - so it is re-raised
         # rather than counted as proof. Ordered before the general clause because
         # RehearsalProtocolFailed IS a RehearsalFailed and would otherwise be swallowed by it.
+        #
+        # The expected answer here is RehearsalToolFailed: a purged record reads back
+        # `code=-32000 message=tool error: engram not found`, which is the server saying the
+        # record is gone. That class is a SIBLING of RehearsalProtocolFailed, so it lands on the
+        # general clause below and counts as proof, with no branch of its own. This ordering is
+        # therefore only correct while _post classifies by code - when #74 raised
+        # RehearsalProtocolFailed for every error object, the narrowed clause swallowed the PASS
+        # condition and killed runs 30290534176 and 30302595011 here, three gates short of the
+        # rollback phase they were dispatched to measure.
         except RehearsalProtocolFailed: raise
         except RehearsalFailed: pass
         else: raise RehearsalFailed("hard-deleted record remained readable")

@@ -60,6 +60,11 @@ PROCESS_INVENTORY_CHARS = 600
 STALL_DIAGNOSTIC_LINES = 20
 SAFE_DETAIL_CHARS, RECEIPT_DETAIL_CHARS = 400, 1600
 TRUNCATION_MARKER = " ...[truncated]... "
+# A JSON-RPC error object is server-controlled and arbitrarily large, so each of its three
+# fields is capped independently before it can reach the receipt. Three fields at 200 leaves
+# the composed detail well inside RECEIPT_DETAIL_CHARS even with the method and vault prefix,
+# so a verbose server error can never crowd out the part that names the call.
+JSON_RPC_DETAIL_CHARS = 200
 # The backup archive lives beside the store because a Fly machine mounts one volume, so
 # the helper that writes it cannot also mount a separate backup volume.
 BACKUP_ARCHIVE_DIR = "/data"
@@ -160,6 +165,16 @@ RECEIPT_KEYS = frozenset({"schema_version", "status", "exit_code", "run_id", "so
 class RehearsalError(RuntimeError): status = "UNKNOWN"
 class RehearsalFailed(RehearsalError): status = "FAILED"
 class RehearsalUnknown(RehearsalError): pass
+
+class RehearsalProtocolFailed(RehearsalFailed):
+    """A JSON-RPC error object came back, so the request never reached tool semantics.
+
+    Separated from RehearsalFailed because the two mean opposite things to a caller that
+    EXPECTS a failure. The hard-delete check reads a purged record and treats any
+    RehearsalFailed as proof the record is gone; a protocol error there is not evidence of
+    deletion, it is evidence the question was never answered. Still FAILED, not UNKNOWN: the
+    server responded, and a response saying no is a result.
+    """
 
 @dataclass(frozen=True)
 class RunIdentity:
@@ -672,6 +687,35 @@ def shell_command(script: str) -> str:
         raise RehearsalUnknown("shell command must not contain a backslash; it does not survive transport")
     return f'/bin/sh -c "{script}"'
 
+def json_rpc_detail(error: Any) -> str:
+    """Render a JSON-RPC error object into a bounded, receipt-safe string.
+
+    Run 30283211992 lost its rollback diagnosis to one discarded value. The rollback store
+    returned a JSON-RPC error, the server had therefore already said exactly what was wrong,
+    and the raise site threw the whole object away and wrote the constant "MCP JSON-RPC error"
+    instead. The receipt named no code, no message, no method and no vault, so a 66-minute run
+    produced a failure that could only be guessed at - the same shape as the bare
+    "MCP transport failed: TimeoutError" that cost runs 16, 17 and 18 their diagnosis.
+
+    `data` is included even though it is arbitrary-shaped and server-controlled. Omitting it is
+    cheap to justify and expensive to be wrong about: if the cause is in there, leaving it out
+    costs another full run to learn what one string would have said. It is rendered with
+    json.dumps(default=str) so an unserializable payload degrades to its repr rather than
+    raising inside the error path - a diagnostic helper that can itself throw would replace the
+    server's error with its own.
+
+    Each field is capped independently rather than the composed string, so a verbose message
+    cannot crowd out the code and a large data blob cannot crowd out either. safe_detail still
+    applies downstream; this bound exists so that what reaches it is already the informative
+    part. A non-dict error is carried as its message rather than dropped, because a server that
+    violates the JSON-RPC shape is itself the finding.
+    """
+    fields = error if isinstance(error, dict) else {"message": error}
+    parts = [f"code={fields.get('code')}", f"message={str(fields.get('message', ''))[:JSON_RPC_DETAIL_CHARS]}"]
+    if "data" in fields:
+        parts.append(f"data={json.dumps(fields['data'], default=str)[:JSON_RPC_DETAIL_CHARS]}")
+    return " ".join(parts)
+
 def safe_detail(value: str, limit: int = SAFE_DETAIL_CHARS) -> str:
     """Compact a diagnostic to a bounded excerpt, blanking it entirely if anything matches.
 
@@ -792,10 +836,10 @@ def receipt_document(
             "query_latency is judged net of a transport baseline because every query crosses a WireGuard tunnel to the guest; the 150ms net limit is bounded above four observed readings (117.5/82.5/77.8/90.1), which is a thin basis, and the baseline is inferred from the cheapest query classes rather than measured server-side."
         )
         limitations.append(
-            "restore_cold_query_s and rollback_cold_query_s replace the restore_first_query_s and rollback_first_query_s keys of run 30270851093 and are NOT comparable to them: those probed muninn_status, which reads metadata, and returned 0.077s and 0.159s, which is what falsified the premise they were built on. These probe a concept lookup instead, so the 15-minute budget is bounded below the phase gate it feeds rather than fitted to any observation of the new quantity."
+            "restore_cold_query_s and rollback_cold_query_s are now measured, and they REFUTE the premise the cold-query budget was built on: run 30283211992 returned 0.0398s and 0.0387s for a concept lookup against a freshly forked store. A cold fork is not slow on its metadata call (0.077s/0.159s on run 30270851093) or on its data call. COLD_QUERY_LIMIT_S therefore stands at roughly 23,000 times the only observed cost of the thing it bounds. It is retained as a bound below the phase gate it feeds, not as a calibrated figure, and nothing here explains why a 60-second socket budget expired three times on calls now measured in tens of milliseconds."
         )
         limitations.append(
-            "Which call exhausted the 60-second socket budget in runs 30228878183, 30235793478 and 30270851093 was never recorded: it is inferred from rollback_cold_query being recorded while rollback_counts was not, and from query_count issuing the same muninn_status the wait had just answered. Transport failures now name their method, so the next such failure is reported rather than inferred. Why a cold fork's data queries cost what they do remains unestablished - Fly documents nothing about restored-volume I/O, and these figures record duration, not cause."
+            "Which call exhausted the 60-second socket budget in runs 30228878183, 30235793478 and 30270851093 remains unrecorded, and the earlier inference here was withdrawn: rollback_counts is a local written into measurements only after run_query_probes returns, so its absence never excluded query_counts. query_counts walks stage-a-primary AND stage-a-isolation, and the cold-query wait probes only stage-a-primary, so the isolation vault was never eliminated. What IS established for run 30283211992 is that its detail was the bare constant raised by _post, and that every RehearsalFailed raised below the retry loop already carried its method, which places that failure at the JSON-RPC protocol layer rather than in tool semantics. Both classes out of _post now name their method and vault and carry the server's own error code, message and data, so the cause is reported rather than reconstructed."
         )
     return {
         "schema_version": SCHEMA_VERSION,
@@ -832,7 +876,7 @@ class MCPClient:
             with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=self.timeout if timeout_s is None else timeout_s) as response:
                 parsed = json.loads(response.read().decode())
         except (OSError, ValueError, urllib.error.URLError) as exc: raise RehearsalUnknown(f"MCP transport failed: {type(exc).__name__}") from exc
-        if parsed.get("error"): raise RehearsalFailed("MCP JSON-RPC error")
+        if parsed.get("error"): raise RehearsalProtocolFailed(f"MCP JSON-RPC error {json_rpc_detail(parsed['error'])}")
         return parsed
     def initialize(self, timeout_s: float = READINESS_LIMIT_S) -> None:
         deadline = time.monotonic() + timeout_s
@@ -864,8 +908,11 @@ class MCPClient:
         own default, so it can only ever lower the retry count - passing a large `attempts`
         can never win a mutation the replay the default denies it.
 
-        A transport failure on the last attempt is re-raised naming the method, because the
-        receipt detail is the only forensic surface a failed run leaves behind.
+        Both failure classes out of `_post` are re-raised naming the method and vault - a
+        transport failure on the last attempt, and a JSON-RPC protocol error immediately - and
+        the protocol error keeps its concrete type so a caller that distinguishes it still can.
+        The receipt detail is the only forensic surface a failed run leaves behind, and four
+        runs in a row spent an hour each to produce a detail that named nothing.
         """
         default_attempts = MCP_CALL_ATTEMPTS if method in IDEMPOTENT_METHODS else 1
         budget = default_attempts if attempts is None else max(1, min(attempts, default_attempts))
@@ -882,6 +929,20 @@ class MCPClient:
                 # and #72 blamed the first query. Naming the method makes the detail a pointer.
                 if attempt + 1 == budget: raise RehearsalUnknown(f"{method}: {exc}") from exc
                 time.sleep(attempt + 1)
+            except RehearsalFailed as exc:
+                # NOT retried, and deliberately a separate clause rather than a wider first one:
+                # an application error is a real answer and replaying it would be the mutation
+                # hazard IDEMPOTENT_METHODS exists to prevent. RehearsalFailed and
+                # RehearsalUnknown are siblings under RehearsalError, so neither clause shadows
+                # the other.
+                #
+                # _post raises at the JSON-RPC protocol layer, where the method is not in scope,
+                # which is why run 30283211992's receipt read exactly "MCP JSON-RPC error" and
+                # named nothing. Every RehearsalFailed raised BELOW this loop already carries
+                # its method; this was the one path in the class that did not. The vault goes in
+                # too: query_counts walks stage-a-primary AND stage-a-isolation, so on the
+                # rollback path the method alone still would not say which store said no.
+                raise type(exc)(f"{method}({arguments.get('vault', '-')}): {exc}") from exc
         content = response.get("result", {}).get("content", [])
         if not content or not isinstance(content[0], dict) or "text" not in content[0]: raise RehearsalFailed(f"{method} returned no content")
         try: result = json.loads(content[0]["text"])
@@ -2213,6 +2274,12 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
         deleted_entity, _ = hard_delete_client.call("muninn_find_by_entity", {"vault": "stage-a-primary", "entity_name": "Stage A Entity 43", "limit": 50})
         if hard_delete_id in result_ids(deleted_concept) or hard_delete_id in result_ids(deleted_entity): raise RehearsalFailed("hard-deleted record remained indexed")
         try: hard_delete_client.call("muninn_read", {"vault": "stage-a-primary", "id": hard_delete_id})
+        # A read that fails is the PASS condition here, which makes this the one place in the
+        # harness where an error is deliberately treated as evidence. A protocol error is not
+        # evidence of deletion - it means the question was never answered - so it is re-raised
+        # rather than counted as proof. Ordered before the general clause because
+        # RehearsalProtocolFailed IS a RehearsalFailed and would otherwise be swallowed by it.
+        except RehearsalProtocolFailed: raise
         except RehearsalFailed: pass
         else: raise RehearsalFailed("hard-deleted record remained readable")
         hard_delete_counts, _ = query_counts(hard_delete_client); terminate_proxy(proxy); proxy = None

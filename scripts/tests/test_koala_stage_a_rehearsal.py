@@ -2,6 +2,7 @@
 """Contract tests for the Koala Stage A synthetic rehearsal harness."""
 from __future__ import annotations
 import importlib.util
+import inspect
 import json
 import os
 import shlex
@@ -352,8 +353,8 @@ class StageAContractTests(unittest.TestCase):
             "Fly machine-create rejects a digest-pinned config.image, so the candidate launches from the run-owned mirror tag; identity rests on the digest assertion taken before launch, not on the launch reference itself.",
             "The pre-ingestion provisioning probe is mountless, so it proves candidate image and guest provisioning and the machine exec shell transport only; volume attachment, readiness, the resource measurement itself, and every measured gate remain first exercised by the real machines.",
             "query_latency is judged net of a transport baseline because every query crosses a WireGuard tunnel to the guest; the 150ms net limit is bounded above four observed readings (117.5/82.5/77.8/90.1), which is a thin basis, and the baseline is inferred from the cheapest query classes rather than measured server-side.",
-            "restore_cold_query_s and rollback_cold_query_s replace the restore_first_query_s and rollback_first_query_s keys of run 30270851093 and are NOT comparable to them: those probed muninn_status, which reads metadata, and returned 0.077s and 0.159s, which is what falsified the premise they were built on. These probe a concept lookup instead, so the 15-minute budget is bounded below the phase gate it feeds rather than fitted to any observation of the new quantity.",
-            "Which call exhausted the 60-second socket budget in runs 30228878183, 30235793478 and 30270851093 was never recorded: it is inferred from rollback_cold_query being recorded while rollback_counts was not, and from query_count issuing the same muninn_status the wait had just answered. Transport failures now name their method, so the next such failure is reported rather than inferred. Why a cold fork's data queries cost what they do remains unestablished - Fly documents nothing about restored-volume I/O, and these figures record duration, not cause.",
+            "restore_cold_query_s and rollback_cold_query_s are now measured, and they REFUTE the premise the cold-query budget was built on: run 30283211992 returned 0.0398s and 0.0387s for a concept lookup against a freshly forked store. A cold fork is not slow on its metadata call (0.077s/0.159s on run 30270851093) or on its data call. COLD_QUERY_LIMIT_S therefore stands at roughly 23,000 times the only observed cost of the thing it bounds. It is retained as a bound below the phase gate it feeds, not as a calibrated figure, and nothing here explains why a 60-second socket budget expired three times on calls now measured in tens of milliseconds.",
+            "Which call exhausted the 60-second socket budget in runs 30228878183, 30235793478 and 30270851093 remains unrecorded, and the earlier inference here was withdrawn: rollback_counts is a local written into measurements only after run_query_probes returns, so its absence never excluded query_counts. query_counts walks stage-a-primary AND stage-a-isolation, and the cold-query wait probes only stage-a-primary, so the isolation vault was never eliminated. What IS established for run 30283211992 is that its detail was the bare constant raised by _post, and that every RehearsalFailed raised below the retry loop already carried its method, which places that failure at the JSON-RPC protocol layer rather than in tool semantics. Both classes out of _post now name their method and vault and carry the server's own error code, message and data, so the cause is reported rather than reconstructed.",
         ])
 
     def test_volume_command_is_encrypted_twenty_gb_and_unscheduled(self):
@@ -1498,6 +1499,95 @@ class StageAContractTests(unittest.TestCase):
         self.assertIn("MCP transport failed", detail, "the transport cause was dropped")
         self.assertLessEqual(len(stage.safe_detail(detail, stage.RECEIPT_DETAIL_CHARS)),
                              stage.RECEIPT_DETAIL_CHARS, "the named detail cannot reach the receipt")
+
+    def _error_response_client(self, error):
+        """A real-_post client whose HTTP layer returns one JSON-RPC error envelope."""
+        client = stage.MCPClient("http://127.0.0.1:8750/mcp", "token")
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "error": error}).encode()
+        response = mock.MagicMock()
+        response.read.return_value = body
+        response.__enter__ = lambda self_: self_
+        response.__exit__ = lambda *_: False
+        opener = mock.MagicMock()
+        opener.open.return_value = response
+        return client, opener
+
+    def test_a_json_rpc_error_carries_the_servers_own_code_message_and_data(self):
+        """Run 30283211992 spent 66 minutes to produce the detail `MCP JSON-RPC error` and
+        nothing else. The store had returned a JSON-RPC error object, so the server had already
+        said exactly what was wrong, and the raise site discarded the whole object in favour of
+        a constant. The server's own words are the cheapest diagnosis available."""
+        error = {"code": -32602, "message": "unknown vault", "data": {"vault": "stage-a-isolation"}}
+        client, opener = self._error_response_client(error)
+        with mock.patch.object(stage.urllib.request, "build_opener", return_value=opener):
+            with self.assertRaises(stage.RehearsalProtocolFailed) as died:
+                client._post({"jsonrpc": "2.0", "method": "tools/call", "id": 1})
+        detail = str(died.exception)
+        self.assertIn("-32602", detail, "the server's error code was discarded")
+        self.assertIn("unknown vault", detail, "the server's error message was discarded")
+        self.assertIn("stage-a-isolation", detail, "the server's error data was discarded")
+
+        # FAILED, not UNKNOWN: the server responded, and a response saying no is a result.
+        self.assertEqual(died.exception.status, "FAILED")
+
+        # Server-controlled and arbitrarily large, so every field is capped independently and
+        # the composed detail still has to fit the receipt.
+        client, opener = self._error_response_client(
+            {"code": -1, "message": "m" * 5000, "data": "d" * 5000})
+        with mock.patch.object(stage.urllib.request, "build_opener", return_value=opener):
+            with self.assertRaises(stage.RehearsalProtocolFailed) as huge:
+                client._post({"jsonrpc": "2.0", "method": "tools/call", "id": 1})
+        self.assertNotIn("m" * (stage.JSON_RPC_DETAIL_CHARS + 1), str(huge.exception),
+                         "an unbounded server message reached the detail")
+        self.assertNotIn("d" * (stage.JSON_RPC_DETAIL_CHARS + 1), str(huge.exception),
+                         "an unbounded server data blob reached the detail")
+        self.assertLessEqual(len(stage.safe_detail(str(huge.exception), stage.RECEIPT_DETAIL_CHARS)),
+                             stage.RECEIPT_DETAIL_CHARS)
+
+        # A server that violates the JSON-RPC shape is itself the finding, so a non-dict error
+        # is carried rather than dropped - and the helper must not raise inside the error path.
+        self.assertIn("boom", stage.json_rpc_detail("boom"))
+        self.assertIn("code=None", stage.json_rpc_detail("boom"))
+        self.assertIn("data=", stage.json_rpc_detail({"code": 1, "data": object()}),
+                      "an unserializable data payload was dropped instead of degrading to repr")
+
+    def test_a_protocol_error_names_its_method_and_vault_and_is_never_retried(self):
+        """_post raises at the JSON-RPC protocol layer, where the method is not in scope, which
+        is why run 30283211992's detail named neither. query_counts walks stage-a-primary AND
+        stage-a-isolation, so the method alone would still not say which store said no."""
+        client, calls = self._recording_client(
+            [stage.RehearsalProtocolFailed("MCP JSON-RPC error code=-32602 message=unknown vault")])
+        with self.assertRaises(stage.RehearsalProtocolFailed) as died:
+            client.call("muninn_status", {"vault": "stage-a-isolation"})
+        detail = str(died.exception)
+        self.assertIn("muninn_status", detail, "the detail does not name the call that failed")
+        self.assertIn("stage-a-isolation", detail, "the detail does not name the vault that said no")
+        self.assertIn("-32602", detail, "the server's own error was dropped by the re-raise")
+
+        # muninn_status IS idempotent, so a retry WOULD have fired had this been caught by the
+        # transport clause. An application error is a real answer and must never be replayed.
+        self.assertIn("muninn_status", stage.IDEMPOTENT_METHODS)
+        self.assertEqual(len(calls), 1, "an application error was retried")
+        self.assertEqual(client.transport_retries, 0, "an application error counted as transport")
+
+    def test_a_protocol_error_is_never_evidence_that_a_record_was_deleted(self):
+        """The hard-delete check reads a purged record and treats the resulting RehearsalFailed
+        as proof the record is gone - the one place in the harness where an error is deliberately
+        evidence. A protocol error there means the question was never answered, so counting it
+        as proof would pass the gate on a server fault."""
+        self.assertTrue(issubclass(stage.RehearsalProtocolFailed, stage.RehearsalFailed),
+                        "the hazard this ordering guards no longer exists")
+        # Structural, because the swallow sits mid-phase in execute() behind a live Fly runtime.
+        # assertTrue on a precomputed boolean rather than assertIn on the source: a failure here
+        # must print a sentence, not 20KB of execute(), which is the readability this PR exists
+        # to defend.
+        source = inspect.getsource(stage.execute)
+        narrowed, general = "except RehearsalProtocolFailed: raise", "except RehearsalFailed: pass"
+        self.assertTrue(narrowed in source,
+                        "the hard-delete swallow no longer re-raises protocol errors")
+        self.assertTrue(general in source, "the hard-delete swallow itself is gone")
+        self.assertTrue(source.index(narrowed) < source.index(general),
+                        "the general clause precedes the protocol clause, so it swallows it")
 
     def _probe_fixture(self):
         """A receipt plus exactly the scripted responses run_query_probes consumes, in order."""

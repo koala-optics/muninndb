@@ -106,21 +106,34 @@ FUZZY_CONTEXTS = (("Stage A Entity 00",), ("Stage A Entity 01",), ("Stage A Enti
                   ("Stage A Group 1",), ("Stage A Group 2",))
 FUZZY_PASSES = 3
 RESTORE_LIMIT_S, ROLLBACK_LIMIT_S = 45 * 60, 30 * 60
-# A store mounted on a freshly created volume answers its first data query far slower than a
-# warm one, and until now the harness gave that first query a 60-second socket timeout -
-# three attempts after #71, so 180 seconds. Runs 30228878183 and 30235793478 both died there
-# with an identical `MCP transport failed: TimeoutError`, on tunnels whose transport
-# baselines differed by 2x (167.165 vs 85.775 ms p50), which is what a duration problem looks
-# like rather than a flaky one. Run 30235793478 measured restore_to_query_s at 673.277 for
-# the analogous work - bring a store up on a fresh volume and reach a first successful query
-# - so 180 seconds was never a plausible budget. That incidental socket timeout was silently
-# acting as the rollback gate, overriding the deliberate ROLLBACK_LIMIT_S above.
-# This is a WAIT, not a new gate. ROLLBACK_LIMIT_S still judges the phase and is unchanged;
-# the elapsed time is recorded as a measurement so the real figure enters the receipt rather
-# than being tuned away. No run has ever recorded this quantity, so there is nothing to fit a
-# constant to: 15 minutes is set below the phase gate it feeds, and the measurement it
-# produces is the point of the change.
-FIRST_QUERY_LIMIT_S, FIRST_QUERY_POLL_INTERVAL_S = 15 * 60, 5.0
+# A cold store's DATA queries are what exceed a 60-second socket timeout. Its metadata calls
+# do not, and #72 mistook one for the other.
+#
+# #72 reasoned that a store on a freshly created volume answers its FIRST query slowly, and
+# waited on `muninn_status`. Run 30270851093 falsified that outright: restore_first_query_s
+# came back at 0.077s and rollback_first_query_s at 0.159s. `muninn_status` is a metadata
+# call that never faults a data block in, so waiting on it warmed nothing. Worse, it is
+# EXACTLY the call query_count issues (see query_count below), so #72's wait warmed the one
+# call that was already fast and left the expensive surface immediately after it untouched.
+# It re-proved what initialize() and wait_ready already establish - the server is up - and
+# bought no coverage at all.
+#
+# What that run did buy is a pinned failure window. rollback_first_query_s was recorded and
+# rollback_counts was not, and query_counts provably issues the muninn_status that had just
+# answered in 0.159s, so the timeout is inside run_query_probes: find_by_concept,
+# find_by_entity, read, and the 24-sample fuzzy sweep. Those touch indexes and data blocks.
+# The restore path survives them because its helper machine rebuilds the store from the
+# archive and warms every block first; the rollback fork is queried cold and directly.
+#
+# So the budget below now covers a cold DATA query, and it is applied per probe on the cold
+# paths rather than only to a single warm-up call - warming one concept lookup cannot warm
+# the entity index, the read path, or the fuzzy path, and guessing which one faults first is
+# how #72 went wrong. This stays a WAIT, not a gate: RESTORE_LIMIT_S and ROLLBACK_LIMIT_S are
+# unchanged and still judge their phases, so the per-probe budget can never let a phase run
+# past the limit that governs it. 15 minutes is bounded below the phase gate it feeds; the
+# measurement is the point, since time-to-first-data-query after a rollback is the
+# disaster-recovery figure this rehearsal exists to produce.
+COLD_QUERY_LIMIT_S, COLD_QUERY_POLL_INTERVAL_S = 15 * 60, 5.0
 SNAPSHOT_LIMIT_S, SNAPSHOT_POLL_INTERVAL_S = 10 * 60, 5.0
 VOLUME_READY_LIMIT_S, VOLUME_READY_POLL_INTERVAL_S = 15 * 60, 5.0
 VOLUME_READY_STATE, VOLUME_HYDRATING_STATES = "created", {"restoring", "pending", "creating"}
@@ -779,7 +792,10 @@ def receipt_document(
             "query_latency is judged net of a transport baseline because every query crosses a WireGuard tunnel to the guest; the 150ms net limit is bounded above four observed readings (117.5/82.5/77.8/90.1), which is a thin basis, and the baseline is inferred from the cheapest query classes rather than measured server-side."
         )
         limitations.append(
-            "restore_first_query_s and rollback_first_query_s are first measured by this run: no prior run recorded either, so the 15-minute first-query wait is bounded below the phase gate it feeds rather than fitted to an observation, and the cause of a cold store's first-query cost is not established here - the figures record how long it took, not why."
+            "restore_cold_query_s and rollback_cold_query_s replace the restore_first_query_s and rollback_first_query_s keys of run 30270851093 and are NOT comparable to them: those probed muninn_status, which reads metadata, and returned 0.077s and 0.159s, which is what falsified the premise they were built on. These probe a concept lookup instead, so the 15-minute budget is bounded below the phase gate it feeds rather than fitted to any observation of the new quantity."
+        )
+        limitations.append(
+            "Which call exhausted the 60-second socket budget in runs 30228878183, 30235793478 and 30270851093 was never recorded: it is inferred from rollback_cold_query being recorded while rollback_counts was not, and from query_count issuing the same muninn_status the wait had just answered. Transport failures now name their method, so the next such failure is reported rather than inferred. Why a cold fork's data queries cost what they do remains unestablished - Fly documents nothing about restored-volume I/O, and these figures record duration, not cause."
         )
     return {
         "schema_version": SCHEMA_VERSION,
@@ -842,10 +858,14 @@ class MCPClient:
         attempt's latency and cannot inflate the measurement it feeds.
 
         `timeout_s` and `attempts` override the socket budget and the retry count for one
-        call; `wait_first_query` uses them to give a cold store a single long attempt rather
-        than three short ones that abort the same work. The override is clamped to the
-        method's own default, so it can only ever lower the retry count - passing a large
-        `attempts` can never win a mutation the replay the default denies it.
+        call. `wait_cold_query` uses both to give a cold store a single long attempt rather
+        than three short ones that abort the same work; `run_query_probes` uses `timeout_s`
+        alone on the cold paths, keeping its retries. The override is clamped to the method's
+        own default, so it can only ever lower the retry count - passing a large `attempts`
+        can never win a mutation the replay the default denies it.
+
+        A transport failure on the last attempt is re-raised naming the method, because the
+        receipt detail is the only forensic surface a failed run leaves behind.
         """
         default_attempts = MCP_CALL_ATTEMPTS if method in IDEMPOTENT_METHODS else 1
         budget = default_attempts if attempts is None else max(1, min(attempts, default_attempts))
@@ -854,9 +874,13 @@ class MCPClient:
             try:
                 response = self._post({"jsonrpc": "2.0", "method": "tools/call", "params": {"name": method, "arguments": arguments}, "id": self.request_id}, timeout_s)
                 break
-            except RehearsalUnknown:
+            except RehearsalUnknown as exc:
                 self.transport_retries += 1
-                if attempt + 1 == budget: raise
+                # A bare "MCP transport failed: TimeoutError" cost three runs their diagnosis:
+                # 30228878183, 30235793478 and 30270851093 all carried that byte-identical
+                # detail and not one of them said WHICH call died, so #71 blamed a flaky tunnel
+                # and #72 blamed the first query. Naming the method makes the detail a pointer.
+                if attempt + 1 == budget: raise RehearsalUnknown(f"{method}: {exc}") from exc
                 time.sleep(attempt + 1)
         content = response.get("result", {}).get("content", [])
         if not content or not isinstance(content[0], dict) or "text" not in content[0]: raise RehearsalFailed(f"{method} returned no content")
@@ -1648,14 +1672,21 @@ def cleanup_only(
     ))
     return exit_code
 
-def wait_first_query(client: MCPClient, vault: str, timeout_s: float = FIRST_QUERY_LIMIT_S,
-                     interval_s: float = FIRST_QUERY_POLL_INTERVAL_S) -> float:
-    """Hold until a store on a freshly created volume answers its first data query.
+def wait_cold_query(client: MCPClient, vault: str, concept: str = COLLISION_CONCEPTS[0],
+                    timeout_s: float = COLD_QUERY_LIMIT_S,
+                    interval_s: float = COLD_QUERY_POLL_INTERVAL_S) -> float:
+    """Hold until a store on a freshly created volume answers a real DATA query.
 
     Every other readiness surface here is deadline-based: initialize waits 5 minutes,
-    wait_ready 5, wait_volume_hydrated 15, wait_stopped 45. The first data query was the
-    exception - it got one socket timeout - so an incidental 60-second client setting stood
-    in for ROLLBACK_LIMIT_S and decided the phase.
+    wait_ready 5, wait_volume_hydrated 15, wait_stopped 45. The data queries were the
+    exception - they got one 60-second socket timeout - so an incidental client setting stood
+    in for ROLLBACK_LIMIT_S and decided the phase three runs in a row.
+
+    The probe is `muninn_find_by_concept`, NOT `muninn_status`. #72 probed status and measured
+    0.077s and 0.159s on run 30270851093, because status reads metadata and never faults a
+    data block in. Status is also the exact call query_count issues, so that wait warmed the
+    one call that was already fast and left the expensive surface after it untouched. A concept
+    lookup goes through the index, which is the class of work that exceeds 60s on a cold fork.
 
     Each attempt is given the WHOLE remaining budget rather than a fixed slice, because the
     two failure shapes want opposite handling. A store that is merely slow needs one
@@ -1663,27 +1694,32 @@ def wait_first_query(client: MCPClient, vault: str, timeout_s: float = FIRST_QUE
     and never converges, which is what three retries did on run 30235793478. A server that
     is not listening yet fails immediately with a refused connection, costs almost nothing,
     and is retried after interval_s. A server that accepts and never answers consumes the
-    budget once and then fails naming the deadline, instead of the bare TimeoutError that
-    cost runs 30228878183 and 30235793478 their rollback verdict.
+    budget once and then fails naming the deadline.
 
-    RehearsalFailed is deliberately not caught: an application error means the store
-    answered and said no. That is a real result and must surface, never be waited out.
+    RehearsalFailed is deliberately not caught: an application error means the store answered
+    and said no. That is a real result and must surface, never be waited out. The probe's
+    RESULT is deliberately not checked either - run_query_probes validates it a few lines
+    later, and a readiness wait that also asserted correctness would conflate "not ready yet"
+    with "wrong answer".
 
-    The returned figure is a measurement, not a gate. `muninn_status` is the probe because
-    it is what query_counts calls next, so the wait warms exactly the path that follows.
+    The returned figure is a measurement, not a gate. This wait is NOT sufficient on its own:
+    warming one concept lookup cannot warm the entity index, the read path, or the fuzzy path,
+    so the cold paths also pass a per-probe budget to run_query_probes. Guessing which index
+    faults first is the error this docstring exists to not repeat.
     """
-    if timeout_s <= 0 or interval_s <= 0: raise RehearsalUnknown("invalid first-query contract")
+    if timeout_s <= 0 or interval_s <= 0: raise RehearsalUnknown("invalid cold-query contract")
     started, deadline = time.monotonic(), time.monotonic() + timeout_s
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0: break
         try:
-            client.call("muninn_status", {"vault": vault}, timeout_s=remaining, attempts=1)
+            client.call("muninn_find_by_concept", {"vault": vault, "concept": concept, "limit": 50},
+                        timeout_s=remaining, attempts=1)
             return time.monotonic() - started
         except RehearsalUnknown:
             if time.monotonic() + interval_s >= deadline: break
             time.sleep(interval_s)
-    raise RehearsalUnknown(f"first query did not answer within {timeout_s:.0f}s")
+    raise RehearsalUnknown(f"cold data query did not answer within {timeout_s:.0f}s")
 
 def query_count(client: MCPClient, vault: str) -> tuple[int, float]:
     result, latency = client.call("muninn_status", {"vault": vault})
@@ -1720,8 +1756,21 @@ def run_lifecycle_probes(client: MCPClient, receipt: CorpusReceipt) -> None:
     restored, _ = client.call("muninn_restore", {"vault": "stage-a-primary", "id": target})
     if not isinstance(restored, dict) or restored.get("restored") is not True: raise RehearsalFailed("soft-delete restore failed")
 
-def run_query_probes(client: MCPClient, receipt: CorpusReceipt) -> dict[str, list[float]]:
+def run_query_probes(client: MCPClient, receipt: CorpusReceipt, *,
+                     timeout_s: float | None = None) -> dict[str, list[float]]:
     """Time the bounded query surface that the query_latency gate reads.
+
+    `timeout_s` raises the per-call SOCKET budget without touching what is measured or
+    judged. It defaults to None, so the gated candidate path keeps the client's 60 seconds
+    exactly as before; the restore and rollback paths pass COLD_QUERY_LIMIT_S because a fork
+    queried cold must fault in index and data blocks that a warm store already holds. Three
+    runs died in here on the 60-second default (30228878183, 30235793478, 30270851093).
+
+    Raising a socket budget cannot flatter a latency reading: the budget decides when to give
+    up, and the timer records how long the answer actually took. It cannot loosen a gate
+    either - the rollback and restore latencies are recorded but ungated, and the phase gates
+    RESTORE_LIMIT_S and ROLLBACK_LIMIT_S still bound the total elapsed time of the phase, so
+    a store slow enough to matter still fails on the limit that was chosen to judge it.
 
     The fuzzy probe used to take two samples, so its "p95" was arithmetically just the
     slower of two readings. Run 30206002340 failed the gate on it at 263.191 against a
@@ -1742,21 +1791,21 @@ def run_query_probes(client: MCPClient, receipt: CorpusReceipt) -> dict[str, lis
     """
     samples: dict[str, list[float]] = {"exact": [], "entity": [], "read": [], "fuzzy": []}
     for index, concept in enumerate(COLLISION_CONCEPTS):
-        result, latency = client.call("muninn_find_by_concept", {"vault": "stage-a-primary", "concept": concept, "limit": 50})
+        result, latency = client.call("muninn_find_by_concept", {"vault": "stage-a-primary", "concept": concept, "limit": 50}, timeout_s=timeout_s)
         if result_ids(result) != [receipt.retained_ids["collision"][index]]: raise RehearsalFailed("collision hydration failed")
         samples["exact"].append(latency)
     for entity in ("Stage A Entity 00", "Stage A Entity 07", "Stage A Entity 42"):
-        result, latency = client.call("muninn_find_by_entity", {"vault": "stage-a-primary", "entity_name": entity, "limit": 50}); samples["entity"].append(latency)
+        result, latency = client.call("muninn_find_by_entity", {"vault": "stage-a-primary", "entity_name": entity, "limit": 50}, timeout_s=timeout_s); samples["entity"].append(latency)
         if entity == "Stage A Entity 42": verify_entity_ordering(result, list(reversed(receipt.retained_ids["ordering"])))
     for memory_id in receipt.retained_ids["ordering"][:10]:
-        _, latency = client.call("muninn_read", {"vault": "stage-a-primary", "id": memory_id}); samples["read"].append(latency)
+        _, latency = client.call("muninn_read", {"vault": "stage-a-primary", "id": memory_id}, timeout_s=timeout_s); samples["read"].append(latency)
     for _ in range(FUZZY_PASSES):
         for context in FUZZY_CONTEXTS:
-            _, latency = client.call("muninn_recall", {"vault": "stage-a-primary", "context": list(context), "limit": 10}); samples["fuzzy"].append(latency)
+            _, latency = client.call("muninn_recall", {"vault": "stage-a-primary", "context": list(context), "limit": 10}, timeout_s=timeout_s); samples["fuzzy"].append(latency)
     isolated_concept = "stage-a/isolation/0000097"
-    cross, _ = client.call("muninn_find_by_concept", {"vault": "stage-a-primary", "concept": isolated_concept, "limit": 50})
+    cross, _ = client.call("muninn_find_by_concept", {"vault": "stage-a-primary", "concept": isolated_concept, "limit": 50}, timeout_s=timeout_s)
     if result_ids(cross): raise RehearsalFailed("vault isolation failed")
-    isolated, _ = client.call("muninn_find_by_concept", {"vault": "stage-a-isolation", "concept": isolated_concept, "limit": 50})
+    isolated, _ = client.call("muninn_find_by_concept", {"vault": "stage-a-isolation", "concept": isolated_concept, "limit": 50}, timeout_s=timeout_s)
     if len(result_ids(isolated)) != 1: raise RehearsalFailed("isolated vault lookup failed")
     return samples
 
@@ -2189,8 +2238,8 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
         ledger.machine_id = runtime.create_machine(identity, ledger.restore_volume_id, candidate_ref, "restore"); runtime.wait_ready(identity, ledger.machine_id, READINESS_LIMIT_S)
         measurements["backup"] = runtime.backup_measurement(identity, ledger.machine_id)
         proxy = runtime.proxy(identity, ledger.machine_id, local_port); restore_client = client_factory(f"http://127.0.0.1:{local_port}/mcp", auth_value); restore_client.initialize()
-        measurements["restore_first_query_s"] = wait_first_query(restore_client, "stage-a-primary")
-        restored_counts, _ = query_counts(restore_client); restored_samples = run_query_probes(restore_client, corpus_receipt); terminate_proxy(proxy); proxy = None
+        measurements["restore_cold_query_s"] = wait_cold_query(restore_client, "stage-a-primary")
+        restored_counts, _ = query_counts(restore_client); restored_samples = run_query_probes(restore_client, corpus_receipt, timeout_s=COLD_QUERY_LIMIT_S); terminate_proxy(proxy); proxy = None
         if restored_counts != expected_after_delete: raise RehearsalFailed("restored counts differ from backup source")
         measurements["restored_latencies"] = {name: latency_summary(values) for name, values in restored_samples.items()}
         measurements["restore_to_query_s"] = time.monotonic() - restore_started; gates["backup_restore"] = threshold_gate("restore-to-query", measurements["restore_to_query_s"], RESTORE_LIMIT_S)
@@ -2198,8 +2247,8 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
         rollback_started = time.monotonic(); ledger.rollback_volume_id = runtime.create_volume(identity, identity.rollback_volume_name, snapshot_id=ledger.snapshot_id)
         ledger.machine_id = runtime.create_machine(identity, ledger.rollback_volume_id, BASELINE_IMAGE, "rollback"); runtime.wait_ready(identity, ledger.machine_id, READINESS_LIMIT_S)
         proxy = runtime.proxy(identity, ledger.machine_id, local_port); rollback_client = client_factory(f"http://127.0.0.1:{local_port}/mcp", auth_value); rollback_client.initialize()
-        measurements["rollback_first_query_s"] = wait_first_query(rollback_client, "stage-a-primary")
-        rollback_counts, _ = query_counts(rollback_client); rollback_samples = run_query_probes(rollback_client, corpus_receipt); terminate_proxy(proxy); proxy = None
+        measurements["rollback_cold_query_s"] = wait_cold_query(rollback_client, "stage-a-primary")
+        rollback_counts, _ = query_counts(rollback_client); rollback_samples = run_query_probes(rollback_client, corpus_receipt, timeout_s=COLD_QUERY_LIMIT_S); terminate_proxy(proxy); proxy = None
         require_legacy_baseline_counts(rollback_counts, spec)
         measurements["rollback_counts"] = {
             "behavior": "exact-known-legacy-fingerprint",

@@ -352,6 +352,7 @@ class StageAContractTests(unittest.TestCase):
             "Fly machine-create rejects a digest-pinned config.image, so the candidate launches from the run-owned mirror tag; identity rests on the digest assertion taken before launch, not on the launch reference itself.",
             "The pre-ingestion provisioning probe is mountless, so it proves candidate image and guest provisioning and the machine exec shell transport only; volume attachment, readiness, the resource measurement itself, and every measured gate remain first exercised by the real machines.",
             "query_latency is judged net of a transport baseline because every query crosses a WireGuard tunnel to the guest; the 150ms net limit is bounded above four observed readings (117.5/82.5/77.8/90.1), which is a thin basis, and the baseline is inferred from the cheapest query classes rather than measured server-side.",
+            "restore_first_query_s and rollback_first_query_s are first measured by this run: no prior run recorded either, so the 15-minute first-query wait is bounded below the phase gate it feeds rather than fitted to an observation, and the cause of a cold store's first-query cost is not established here - the figures record how long it took, not why.",
         ])
 
     def test_volume_command_is_encrypted_twenty_gb_and_unscheduled(self):
@@ -1342,7 +1343,7 @@ class StageAContractTests(unittest.TestCase):
         ok = {"result": {"content": [{"text": '{"ok": true}'}]}}
         def client_with(outcomes):
             client, seen = stage.MCPClient("http://127.0.0.1:8750/mcp", "token"), []
-            def fake_post(payload):
+            def fake_post(payload, timeout_s=None):
                 seen.append(payload["params"]["name"])
                 outcome = outcomes.pop(0)
                 if isinstance(outcome, Exception): raise outcome
@@ -1373,6 +1374,103 @@ class StageAContractTests(unittest.TestCase):
             self.assertEqual(len(seen), stage.MCP_CALL_ATTEMPTS)      # retries are bounded
         for mutation in ("muninn_remember_batch", "muninn_state", "muninn_restore", "muninn_forget"):
             self.assertNotIn(mutation, stage.IDEMPOTENT_METHODS)
+
+    def _recording_client(self, outcomes):
+        """An MCPClient whose transport is scripted, recording (vault, socket budget) per post."""
+        client, calls = stage.MCPClient("http://127.0.0.1:8750/mcp", "token"), []
+        def fake_post(payload, timeout_s=None):
+            calls.append((payload["params"]["arguments"].get("vault"), timeout_s))
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, Exception): raise outcome
+            return outcome
+        client._post = fake_post
+        return client, calls
+
+    def test_a_cold_store_gets_the_whole_remaining_budget_for_its_first_query(self):
+        """Runs 30228878183 and 30235793478 both lost the rollback verdict to an identical
+        `MCP transport failed: TimeoutError`, on tunnels whose transport baselines differed
+        2x (167.165 vs 85.775 ms p50) - a duration problem, not a flaky one. The rollback
+        path allowed 3 x 60s for work that run 30235793478 measured at 673.277s on the
+        restore path, because an incidental socket timeout stood in for ROLLBACK_LIMIT_S.
+        Each attempt now gets the WHOLE remaining budget: slicing a slow store's work into
+        fixed retries aborts and restarts the same work forever."""
+        ok = {"result": {"content": [{"text": '{"total_memories": 7}'}]}}
+        stalls = lambda n: [stage.RehearsalUnknown("MCP transport failed: TimeoutError")] * n + [ok]
+
+        # Pre-fix behaviour: the bare call is exactly what runs 16 and 17 made, and on this
+        # same store it still loses the run, on the default socket budget.
+        client, calls = self._recording_client(stalls(stage.MCP_CALL_ATTEMPTS))
+        with mock.patch.object(stage.time, "sleep"):
+            with self.assertRaises(stage.RehearsalUnknown) as lost:
+                client.call("muninn_status", {"vault": "stage-a-primary"})
+        self.assertIn("MCP transport failed", str(lost.exception))          # LOST THE RUN
+        self.assertTrue(all(budget is None for _, budget in calls))         # on the 60s default
+
+        # Post-fix: the same store answers, and no attempt was capped at that default.
+        client, calls = self._recording_client(stalls(stage.MCP_CALL_ATTEMPTS))
+        with mock.patch.object(stage.time, "sleep"):
+            elapsed = stage.wait_first_query(client, "stage-a-primary", timeout_s=600.0, interval_s=1.0)
+        self.assertIsInstance(elapsed, float)
+        budgets = [budget for _, budget in calls]
+        self.assertEqual(len(budgets), stage.MCP_CALL_ATTEMPTS + 1)         # one post per try
+        for budget in budgets:
+            self.assertIsNotNone(budget, "an attempt fell back to the client's default socket budget")
+            self.assertGreater(budget, 60.0, "an attempt was capped at the socket default it replaces")
+            self.assertLessEqual(budget, 600.0, "an attempt outran the deadline")
+        self.assertTrue(all(a >= b for a, b in zip(budgets, budgets[1:])), "the remaining budget did not shrink")
+
+        # The wait is only worth making if it warms the query that follows it.
+        client, calls = self._recording_client([ok, ok])
+        stage.query_counts(client)
+        self.assertEqual(calls[0][0], "stage-a-primary",
+                         "wait_first_query probes a vault that query_counts does not hit first")
+        self.assertEqual(stage.FIRST_QUERY_LIMIT_S, 15 * 60)
+        self.assertLess(stage.FIRST_QUERY_LIMIT_S, stage.ROLLBACK_LIMIT_S,
+                        "the wait outlives the gate it feeds, so it would decide the phase again")
+
+    def test_a_store_that_never_answers_fails_naming_the_deadline(self):
+        """The bare TimeoutError said nothing about how long the harness waited or for what,
+        so two runs' receipts carried the same eight-word detail. A store that accepts the
+        connection and never answers must fail with the deadline in the message. An
+        application error must NOT be waited out: the store answered and said no, and that
+        is a result, not a transport problem."""
+        client, _ = self._recording_client([])
+        client._post = lambda payload, timeout_s=None: (_ for _ in ()).throw(
+            stage.RehearsalUnknown("MCP transport failed: TimeoutError"))
+        with self.assertRaises(stage.RehearsalUnknown) as silent:
+            stage.wait_first_query(client, "stage-a-primary", timeout_s=0.2, interval_s=0.05)
+        self.assertIn("first query did not answer within", str(silent.exception))
+
+        client, calls = self._recording_client([stage.RehearsalFailed("store said no")])
+        with self.assertRaises(stage.RehearsalFailed):
+            stage.wait_first_query(client, "stage-a-primary", timeout_s=600.0, interval_s=1.0)
+        self.assertEqual(len(calls), 1, "an application error was waited out instead of surfacing")
+
+        for bad_timeout, bad_interval in ((0.0, 5.0), (600.0, 0.0)):
+            with self.assertRaises(stage.RehearsalUnknown):
+                stage.wait_first_query(client, "stage-a-primary", bad_timeout, bad_interval)
+
+    def test_the_attempts_override_can_only_lower_a_retry_count_never_raise_it(self):
+        """wait_first_query needs a single-attempt call, so `call` gained an attempts knob.
+        A knob able to RAISE the count would hand a mutation the replay IDEMPOTENT_METHODS
+        exists to deny it, so the override is clamped to the method's own default."""
+        def failing_client():
+            client, seen = stage.MCPClient("http://127.0.0.1:8750/mcp", "token"), []
+            def fake_post(payload, timeout_s=None):
+                seen.append(payload["params"]["name"]); raise stage.RehearsalUnknown("t")
+            client._post = fake_post
+            return client, seen
+        with mock.patch.object(stage.time, "sleep"):
+            for method, override, expected, complaint in (
+                ("muninn_forget", 99, 1, "a mutation was granted a replay by the override"),
+                ("muninn_read", 1, 1, "the override did not lower a read's retry count"),
+                ("muninn_read", 99, stage.MCP_CALL_ATTEMPTS, "the override raised a read above its default"),
+                ("muninn_read", None, stage.MCP_CALL_ATTEMPTS, "the default retry count regressed"),
+            ):
+                client, seen = failing_client()
+                with self.assertRaises(stage.RehearsalUnknown):
+                    client.call(method, {"vault": "v", "id": "x"}, attempts=override)
+                self.assertEqual(len(seen), expected, complaint)
 
     def test_safe_detail_keeps_both_ends_and_never_relaxes_the_predicate(self):
         """Run 30212272430's receipt described what the helper was doing without saying what

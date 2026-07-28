@@ -286,6 +286,7 @@ class ResourceLedger:
     backup_volume_id: str | None = None
     restore_volume_id: str | None = None
     rollback_volume_id: str | None = None
+    retained_machine_id: str | None = None
     machine_id: str | None = None
     snapshot_id: str | None = None
 
@@ -923,10 +924,13 @@ def receipt_document(
             "query_latency is judged net of a transport baseline because every query crosses a WireGuard tunnel to the guest; the 150ms net limit is bounded above four observed readings (117.5/82.5/77.8/90.1), which is a thin basis, and the baseline is inferred from the cheapest query classes rather than measured server-side."
         )
         limitations.append(
-            "Operational rollback is tested by remounting the retained original volume with the separately qualified rollback-rescue reader; candidate archive restore separately tests disaster recovery. Neither path authorizes production deployment."
+            "Operational rollback is tested by updating the retained baseline Machine in place to the separately qualified rollback-rescue reader while keeping its original volume attached; candidate archive restore separately tests disaster recovery. Neither path authorizes production deployment."
         )
         limitations.append(
             "Historical correction: runs 30290534176 and 30302595011 stopped at hard-delete verification, not rollback. A -32000 tool-level 'engram not found' response is the hard-delete pass condition; protocol faults still fail closed."
+        )
+        limitations.append(
+            "The retained Machine removes the late new-Machine placement race observed in run 30334224252. Its rescue-image update is still a documented reboot, so a rollback result proves this run's pinned-host path, not an unconditional Fly capacity guarantee."
         )
     return {
         "schema_version": SCHEMA_VERSION,
@@ -1177,9 +1181,15 @@ class FlyRuntime:
         # add a listing call to every provisioning path for a state it already holds.
         if snapshot_id: self.wait_volume_hydrated(identity, volume_id)
         return volume_id
-    def create_machine(self, identity: RunIdentity, volume_id: str, image: str, role: str) -> str:
+    def _machine_config(
+        self,
+        identity: RunIdentity,
+        volume_id: str,
+        image: str,
+        role: str,
+    ) -> dict[str, Any]:
         if volume_id in PRODUCTION_VOLUME_IDS: raise RehearsalUnknown("refusing production volume")
-        if role == "baseline":
+        if role in {"baseline", "retained-baseline"}:
             image_role = "baseline"
         elif role == "rollback":
             image_role = "rollback-rescue"
@@ -1193,14 +1203,58 @@ class FlyRuntime:
             expected_candidate=self.candidate_ref,
             expected_rollback_rescue=self.rollback_rescue_ref,
         )
-        name = f"koala-stage-a-{identity.run_id}-{role}"
         mounts = [{"volume": volume_id, "path": "/data"}]
         require_single_mount(mounts, role)
-        config = json.dumps({"image": image, "init": {"cmd": ["--daemon", "--data", "/data", "--listen-host", "0.0.0.0", "--mcp-addr", f"0.0.0.0:{MCP_PORT}"]}, "restart": {"policy": "no"}, "guest": {"cpu_kind": "performance", "cpus": 16, "memory_mb": 32768}, "mounts": mounts, "metadata": {"koala_stage_a_run": identity.run_id, "role": role}, "services": []}, sort_keys=True)
+        server_args = ["--daemon", "--data", "/data", "--listen-host", "0.0.0.0", "--mcp-addr", f"0.0.0.0:{MCP_PORT}"]
+        if role == "retained-baseline":
+            server_command = " ".join(["muninndb-server", *server_args])
+            init = {"exec": ["/bin/sh", "-c", f"{server_command} & pid=$!; printf %s $pid > /tmp/stage-a-server.pid; wait $pid; exec sleep infinity"]}
+        else:
+            init = {"cmd": server_args}
+        return {
+            "image": image,
+            "init": init,
+            "restart": {"policy": "no"},
+            "guest": {"cpu_kind": "performance", "cpus": 16, "memory_mb": 32768},
+            "mounts": mounts,
+            "metadata": {"koala_stage_a_run": identity.run_id, "role": role},
+            "services": [],
+        }
+
+    def create_machine(self, identity: RunIdentity, volume_id: str, image: str, role: str) -> str:
+        config = json.dumps(self._machine_config(identity, volume_id, image, role), sort_keys=True)
+        name = f"koala-stage-a-{identity.run_id}-{role}"
         proc = self.run(["machine", "run", image, "-a", identity.app_name, "--region", FLY_REGION, "--name", name, "--machine-config", config, "--restart", "no", "--skip-dns-registration", "--detach"])
         matches = re.findall(r"(?m)^\s*Machine ID:\s*([0-9a-f]+)\s*$", proc.stdout)
         if len(matches) != 1 or matches[0] in PRODUCTION_MACHINE_IDS: raise RehearsalUnknown("invalid or preserved machine ID")
         return matches[0]
+
+    def update_machine(
+        self,
+        identity: RunIdentity,
+        machine_id: str,
+        volume_id: str,
+        image: str,
+        role: str,
+    ) -> None:
+        if machine_id in PRODUCTION_MACHINE_IDS: raise RehearsalUnknown("refusing production machine")
+        config = json.dumps(self._machine_config(identity, volume_id, image, role), sort_keys=True)
+        self.run(["machine", "update", machine_id, "-a", identity.app_name, "--machine-config", config,
+                  "--restart", "no", "--skip-dns-registration", "--wait-timeout",
+                  str(math.ceil(READINESS_LIMIT_S)), "--yes"], timeout=math.ceil(READINESS_LIMIT_S) + 60)
+
+    def quiesce_baseline(self, identity: RunIdentity, machine_id: str) -> None:
+        """Gracefully stop only MuninnDB while retaining the allocated Fly Machine."""
+        if machine_id in PRODUCTION_MACHINE_IDS: raise RehearsalUnknown("refusing production machine")
+        command = shell_command(
+            "set -eu; pid=$(cat /tmp/stage-a-server.pid); kill -TERM $pid; "
+            "i=0; while kill -0 $pid 2>/dev/null; do i=$((i+1)); "
+            "test $i -le 300; sleep 1; done; sync; "
+            "test ! -d /proc/$pid"
+        )
+        self.run(["machine", "exec", machine_id, "-a", identity.app_name, "--timeout", "330", command], timeout=360)
+        if self.machine_status(identity, machine_id).get("state") != "started":
+            raise RehearsalUnknown("retained baseline machine no longer holds its allocation")
     def machine_status(self, identity: RunIdentity, machine_id: str) -> dict[str, Any]:
         if machine_id in PRODUCTION_MACHINE_IDS: raise RehearsalUnknown("refusing production machine")
         machines = self.json(["machines", "list", "-a", identity.app_name])
@@ -1469,6 +1523,21 @@ class FlyRuntime:
                 return next(iter(new_created_ids))
             time.sleep(interval_s)
         raise RehearsalUnknown("snapshot creation deadline expired")
+    def owned_machines(self, identity: RunIdentity) -> list[tuple[str, str]]:
+        """List run-owned Machine IDs and roles, whatever the ledger believes."""
+        machines = self.json(["machines", "list", "-a", identity.app_name])
+        if not isinstance(machines, list):
+            raise RehearsalUnknown("machine listing returned invalid resources")
+        found = []
+        for machine in machines:
+            if not isinstance(machine, dict): continue
+            machine_id = str(machine.get("id", ""))
+            metadata = (machine.get("config") or {}).get("metadata") or {}
+            if (machine_id and machine_id not in PRODUCTION_MACHINE_IDS
+                    and metadata.get("koala_stage_a_run") == identity.run_id):
+                found.append((machine_id, str(metadata.get("role", ""))))
+        return found
+
     def owned_machine_ids(self, identity: RunIdentity) -> list[str]:
         """List the machines Fly actually holds for this run, whatever the ledger believes.
 
@@ -1484,18 +1553,7 @@ class FlyRuntime:
         Ownership is still enforced by run metadata and production IDs are still excluded,
         so a permissive read cannot widen what may be destroyed.
         """
-        machines = self.json(["machines", "list", "-a", identity.app_name])
-        if not isinstance(machines, list):
-            raise RehearsalUnknown("machine listing returned invalid resources")
-        found = []
-        for machine in machines:
-            if not isinstance(machine, dict): continue
-            machine_id = str(machine.get("id", ""))
-            metadata = (machine.get("config") or {}).get("metadata") or {}
-            if (machine_id and machine_id not in PRODUCTION_MACHINE_IDS
-                    and metadata.get("koala_stage_a_run") == identity.run_id):
-                found.append(machine_id)
-        return found
+        return [machine_id for machine_id, _role in self.owned_machines(identity)]
     def launch_failure_diagnostics(self, identity: RunIdentity, helper_name: str,
                                    mounts: list[dict[str, str]]) -> str:
         """Say why a helper never reached its start state, while the evidence still exists.
@@ -1708,15 +1766,26 @@ class FlyRuntime:
         volumes = self.json(["volumes", "list", "-a", identity.app_name])
         if not isinstance(machines, list) or not isinstance(volumes, list):
             raise RehearsalUnknown("cleanup discovery returned invalid resources")
-        machine_ids = []
+        machine_ids: dict[str, str] = {}
         for machine in machines:
             if not isinstance(machine, dict): raise RehearsalUnknown("cleanup machine entry invalid")
             machine_id = str(machine.get("id", ""))
-            metadata = machine.get("config", {}).get("metadata", {})
-            if machine_id in PRODUCTION_MACHINE_IDS or metadata.get("koala_stage_a_run") != identity.run_id:
+            metadata = (machine.get("config") or {}).get("metadata") or {}
+            role = str(metadata.get("role", ""))
+            if (not machine_id or machine_id in PRODUCTION_MACHINE_IDS
+                    or metadata.get("koala_stage_a_run") != identity.run_id):
                 raise RehearsalUnknown("cleanup discovered unowned machine")
-            machine_ids.append(machine_id)
-        if len(machine_ids) > 1: raise RehearsalUnknown("cleanup discovered multiple machines")
+            if role in {"retained-baseline", "rollback"}:
+                slot = "retained_machine_id"
+            elif role in {"baseline", "candidate", "clean-restart", "crash-restart",
+                          "hard-delete-check", "restore", "preflight-probe", "backup",
+                          "hard-delete", "restore-copy"}:
+                slot = "machine_id"
+            else:
+                raise RehearsalUnknown("cleanup discovered unknown machine role")
+            if slot in machine_ids:
+                raise RehearsalUnknown("cleanup discovered duplicate machine role")
+            machine_ids[slot] = machine_id
         by_name: dict[str, str] = {}
         allowed_names = {
             identity.volume_name,
@@ -1733,7 +1802,8 @@ class FlyRuntime:
             by_name[name] = volume_id
         return ResourceLedger(
             app=identity.app_name,
-            machine_id=machine_ids[0] if machine_ids else None,
+            retained_machine_id=machine_ids.get("retained_machine_id"),
+            machine_id=machine_ids.get("machine_id"),
             volume_id=by_name.get(identity.volume_name),
             candidate_volume_id=by_name.get(identity.candidate_volume_name),
             backup_volume_id=by_name.get(identity.backup_volume_name),
@@ -1789,30 +1859,53 @@ def cleanup(runtime: FlyRuntime, identity: RunIdentity, ledger: ResourceLedger) 
     responses. It goes through the same redaction predicate as every other diagnostic.
     """
     results, orphans = {}, []
+    if (ledger.machine_id and ledger.retained_machine_id
+            and ledger.machine_id == ledger.retained_machine_id):
+        duplicate_machine_id = ledger.machine_id
+        ledger.machine_id = None
+        results["machine_topology_error"] = "one Machine ID occupied both ledger slots"
+        orphans.append(f"{duplicate_machine_id}:duplicate-machine-ledger-slots")
     # A machine the ledger never learned of still holds its volume, and the volume destroy
     # then fails on a binding to a machine nobody is going to destroy. That is how run
     # 30220383793 reported an orphan. The platform is asked what survived before anything
     # is destroyed, so a machine lost to a failed launch is destroyed in the ordinary order.
-    if ledger.app and not ledger.machine_id:
+    if ledger.app:
         try:
-            surviving = runtime.owned_machine_ids(identity)
+            surviving = runtime.owned_machines(identity)
         except Exception as exc:
             surviving = []
             results["machine_discovery_error"] = safe_detail(f"{type(exc).__name__}: {exc}")
-        if surviving:
-            ledger.machine_id, extra = surviving[0], surviving[1:]
-            results["machine_recovered"] = ledger.machine_id
-            # More than one is not a shape this harness produces, so it is reported rather
-            # than assumed away: an unexplained machine keeps failing the run.
-            orphans.extend(extra)
-    for label in ("machine_id", "restore_volume_id", "backup_volume_id", "rollback_volume_id",
+        known_ids = {item for item in (ledger.retained_machine_id, ledger.machine_id) if item}
+        unexpected_machines: list[str] = []
+        for machine_id, role in surviving:
+            if machine_id in known_ids: continue
+            if role in {"retained-baseline", "rollback"} and not ledger.retained_machine_id:
+                ledger.retained_machine_id = machine_id
+                results["retained_machine_recovered"] = machine_id
+            elif role in {"baseline", "candidate", "clean-restart", "crash-restart",
+                          "hard-delete-check", "restore", "preflight-probe", "backup",
+                          "hard-delete", "restore-copy"} and not ledger.machine_id:
+                ledger.machine_id = machine_id
+                results["machine_recovered"] = machine_id
+            else:
+                unexpected_machines.append(machine_id)
+        for machine_id in unexpected_machines:
+            try:
+                runtime.destroy_machine(identity, machine_id)
+                results[f"unexpected_machine_{machine_id}"] = "destroyed"
+            except Exception as exc:
+                results[f"unexpected_machine_{machine_id}"] = "destroy_failed"
+                results[f"unexpected_machine_{machine_id}_error"] = safe_detail(f"{type(exc).__name__}: {exc}")
+            # Even successful cleanup cannot turn an unexplained topology into a passing run.
+            orphans.append(f"{machine_id}:unexpected-machine-topology")
+    for label in ("machine_id", "retained_machine_id", "restore_volume_id", "backup_volume_id", "rollback_volume_id",
                   "candidate_volume_id", "volume_id"):
         resource = getattr(ledger, label)
         if not resource: results[label] = "not_created"; continue
         failure: Exception | None = None
         for attempt in range(DESTROY_ATTEMPTS):
             try:
-                runtime.destroy_machine(identity, resource) if label == "machine_id" else runtime.destroy_volume(identity, resource)
+                runtime.destroy_machine(identity, resource) if label in {"machine_id", "retained_machine_id"} else runtime.destroy_volume(identity, resource)
                 failure = None; break
             except Exception as exc:
                 failure = exc
@@ -2129,9 +2222,9 @@ def plan(identity: RunIdentity, spec: CorpusSpec, *, mode: str = "execute") -> d
             "candidate_requires_exact_logical_counts": True,
         }
         result["rollback_qualification"] = {
-            "topology": "retained-original-volume",
+            "topology": "retained-running-machine-and-original-volume",
             "candidate_source": "stable clone of the completed pre-migration snapshot",
-            "operational_rollback": "separately qualified rollback-rescue reader remounts the untouched original volume",
+            "operational_rollback": "the allocated baseline Machine stays running after graceful server quiescence, then is updated in place to the separately qualified rollback-rescue reader on the untouched original volume",
             "rollback_rescue_image": ROLLBACK_RESCUE_IMAGE,
             "rollback_rescue_digest": ROLLBACK_RESCUE_DIGEST,
             "rollback_rescue_provenance_sha256": ROLLBACK_RESCUE_PROVENANCE_SHA256,
@@ -2367,12 +2460,13 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
         runtime.exec_canary(identity, ledger.machine_id)
         runtime.destroy_machine(identity, ledger.machine_id); ledger.machine_id = None
         ledger.volume_id = runtime.create_volume(identity, identity.volume_name)
-        ledger.machine_id = runtime.create_machine(identity, ledger.volume_id, BASELINE_IMAGE, "baseline")
-        runtime.wait_ready(identity, ledger.machine_id, READINESS_LIMIT_S)
-        empty = runtime.disk_sample(identity, ledger.machine_id, "baseline-empty")
+        ledger.retained_machine_id = runtime.create_machine(
+            identity, ledger.volume_id, BASELINE_IMAGE, "retained-baseline")
+        runtime.wait_ready(identity, ledger.retained_machine_id, READINESS_LIMIT_S)
+        empty = runtime.disk_sample(identity, ledger.retained_machine_id, "baseline-empty")
         require_disk_safety(empty)
         measurements["disk_samples"].append(asdict(empty) | {"free_percent": empty.free_percent})
-        proxy = runtime.proxy(identity, ledger.machine_id, local_port)
+        proxy = runtime.proxy(identity, ledger.retained_machine_id, local_port)
         client = client_factory(f"http://127.0.0.1:{local_port}/mcp", auth_value); client.initialize()
         # A serving baseline is the only point in the run where a MuninnDB process is known
         # to exist, so it is the only place the resource measurement can be witnessed rather
@@ -2381,11 +2475,13 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
         # the measurement could not read a process at all. Taking one here fails a broken
         # measurement in minutes, against roughly 2.2 hours at the candidate transition, and
         # it distinguishes a broken measurement from a candidate that never starts.
-        measurements["baseline_resource_sample"] = asdict(runtime.resource_sample(identity, ledger.machine_id, "baseline-serving"))
+        measurements["baseline_resource_sample"] = asdict(runtime.resource_sample(
+            identity, ledger.retained_machine_id, "baseline-serving"))
         def checkpoint(progress: IngestProgress) -> None:
             nonlocal corpus_receipt
             corpus_receipt = progress
-            sample = runtime.disk_sample(identity, ledger.machine_id or "", "baseline-ingestion")
+            sample = runtime.disk_sample(
+                identity, ledger.retained_machine_id or "", "baseline-ingestion")
             require_disk_safety(sample)
             measurements["latest_disk_sample"] = asdict(sample) | {"free_percent": sample.free_percent}
             write_receipt(receipt_path, receipt_document(
@@ -2403,10 +2499,12 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
             minimum_count=TAIL_PROBE_SAMPLE_COUNT if probe else MIN_RECORD_COUNT,
             progress=checkpoint,
         )
-        immediate = runtime.disk_sample(identity, ledger.machine_id, "baseline-immediate")
+        immediate = runtime.disk_sample(
+            identity, ledger.retained_machine_id, "baseline-immediate")
         require_disk_safety(immediate)
         measurements["disk_samples"].append(asdict(immediate) | {"free_percent": immediate.free_percent})
-        quiet = wait_for_storage_quiet(runtime, identity, ledger.machine_id, "baseline-storage")
+        quiet = wait_for_storage_quiet(
+            runtime, identity, ledger.retained_machine_id, "baseline-storage")
         settled = quiet["settled"]
         measurements["disk_samples"].extend(
             asdict(sample) | {"free_percent": sample.free_percent}
@@ -2425,7 +2523,8 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
             spec.count + spec.batch_size + 1,
         )
         gates["baseline_read_witness"] = baseline_read_witness(client, corpus_receipt)
-        terminate_proxy(proxy); proxy = None; runtime.stop_machine(identity, ledger.machine_id); runtime.destroy_machine(identity, ledger.machine_id); ledger.machine_id = None
+        terminate_proxy(proxy); proxy = None
+        runtime.quiesce_baseline(identity, ledger.retained_machine_id)
         ledger.snapshot_id = runtime.snapshot(identity, ledger.volume_id)
         clone_started = time.monotonic()
         ledger.candidate_volume_id = runtime.create_volume(
@@ -2439,7 +2538,8 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
             "pre_migration_snapshot_id": ledger.snapshot_id,
             "original_volume_id": ledger.volume_id,
             "candidate_volume_id": ledger.candidate_volume_id,
-            "operational_rollback": "retained-original-volume",
+            "operational_rollback": "retained-running-machine-updated-in-place",
+            "retained_machine_id": ledger.retained_machine_id,
             "legacy_rollback_volume": "not_created",
         }
         migration_started = time.monotonic(); ledger.machine_id = runtime.create_machine(
@@ -2545,10 +2645,10 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
         measurements["restore_to_query_s"] = time.monotonic() - restore_started; gates["backup_restore"] = threshold_gate("restore-to-query", measurements["restore_to_query_s"], RESTORE_LIMIT_S)
         runtime.stop_machine(identity, ledger.machine_id); runtime.destroy_machine(identity, ledger.machine_id); ledger.machine_id = None
         rollback_started = time.monotonic()
-        ledger.machine_id = runtime.create_machine(
-            identity, ledger.volume_id, rollback_rescue_ref, "rollback")
-        runtime.wait_ready(identity, ledger.machine_id, READINESS_LIMIT_S)
-        proxy = runtime.proxy(identity, ledger.machine_id, local_port); rollback_client = client_factory(f"http://127.0.0.1:{local_port}/mcp", auth_value); rollback_client.initialize()
+        runtime.update_machine(
+            identity, ledger.retained_machine_id, ledger.volume_id, rollback_rescue_ref, "rollback")
+        runtime.wait_ready(identity, ledger.retained_machine_id, READINESS_LIMIT_S)
+        proxy = runtime.proxy(identity, ledger.retained_machine_id, local_port); rollback_client = client_factory(f"http://127.0.0.1:{local_port}/mcp", auth_value); rollback_client.initialize()
         measurements["rollback_cold_query_s"] = wait_cold_query(rollback_client, "stage-a-primary")
         rollback_counts, _ = query_counts(rollback_client); rollback_samples = run_query_probes(rollback_client, corpus_receipt, timeout_s=COLD_QUERY_LIMIT_S); terminate_proxy(proxy); proxy = None
         require_legacy_baseline_counts(rollback_counts, spec)

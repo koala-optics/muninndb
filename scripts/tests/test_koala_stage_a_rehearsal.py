@@ -32,16 +32,29 @@ class StageAContractTests(unittest.TestCase):
     def small_spec(self, count=53):
         return stage.CorpusSpec(count=count, batch_size=50, payload_bytes=1000, seed="test-seed", payload_shape="opaque")
 
-    def test_qualified_identities_are_immutable(self):
+    def test_qualified_identities_are_immutable_and_role_separated(self):
         self.assertEqual(stage.validate_image(stage.BASELINE_IMAGE, "baseline"), stage.BASELINE_IMAGE)
         self.assertEqual(stage.validate_image(stage.CANDIDATE_IMAGE, "candidate"), stage.CANDIDATE_IMAGE)
+        self.assertEqual(
+            stage.validate_image(stage.ROLLBACK_RESCUE_IMAGE, "rollback-rescue"),
+            stage.ROLLBACK_RESCUE_IMAGE,
+        )
         self.assertRegex(stage.BASELINE_DIGEST, r"^sha256:[0-9a-f]{64}$")
+        self.assertRegex(stage.ROLLBACK_RESCUE_DIGEST, r"^sha256:[0-9a-f]{64}$")
         for role, bad in (
             ("baseline", stage.CANDIDATE_IMAGE),
+            ("baseline", stage.ROLLBACK_RESCUE_IMAGE),
             ("baseline", f"registry.fly.io/koala-muninndb@{stage.BASELINE_DIGEST}"),
+            ("candidate", stage.BASELINE_IMAGE),
+            ("candidate", stage.ROLLBACK_RESCUE_IMAGE),
             ("candidate", "ghcr.io/koala-optics/muninndb:latest"),
+            ("rollback-rescue", stage.BASELINE_IMAGE),
+            ("rollback-rescue", stage.CANDIDATE_IMAGE),
+            ("rollback-rescue", "ghcr.io/koala-optics/muninndb:latest"),
         ):
             with self.assertRaises(stage.RehearsalUnknown): stage.validate_image(bad, role)
+        with self.assertRaises(stage.RehearsalUnknown):
+            stage.validate_image(stage.BASELINE_IMAGE, "unrecognized")
 
     def test_identity_is_run_owned_and_production_name_is_refused(self):
         identity = stage.build_identity("contract-123")
@@ -356,9 +369,10 @@ class StageAContractTests(unittest.TestCase):
             "The bounded df quiet-window witnesses disk settlement; it does not prove asynchronous FTS or provenance queues are empty.",
             "The candidate mirror is written to the run-owned Fly app repository; registry-repository retention is not covered by the machine and volume orphan scan.",
             "Fly machine-create rejects a digest-pinned config.image, so the candidate launches from the run-owned mirror tag; identity rests on the digest assertion taken before launch, not on the launch reference itself.",
+            "The rollback-rescue reader launches from its own run-owned mirror tag; identity rests on its separate digest assertion before measured work, not on the launch reference itself.",
             "The pre-ingestion provisioning probe is mountless, so it proves candidate image and guest provisioning and the machine exec shell transport only; volume attachment, readiness, the resource measurement itself, and every measured gate remain first exercised by the real machines.",
             "query_latency is judged net of a transport baseline because every query crosses a WireGuard tunnel to the guest; the 150ms net limit is bounded above four observed readings (117.5/82.5/77.8/90.1), which is a thin basis, and the baseline is inferred from the cheapest query classes rather than measured server-side.",
-            "Operational rollback is tested by remounting the retained original volume with the legacy image; candidate archive restore separately tests disaster recovery. Neither path authorizes production deployment.",
+            "Operational rollback is tested by remounting the retained original volume with the separately qualified rollback-rescue reader; candidate archive restore separately tests disaster recovery. Neither path authorizes production deployment.",
             "Historical correction: runs 30290534176 and 30302595011 stopped at hard-delete verification, not rollback. A -32000 tool-level 'engram not found' response is the hard-delete pass condition; protocol faults still fail closed.",
         ])
 
@@ -602,6 +616,7 @@ class StageAContractTests(unittest.TestCase):
         runtime = mock.Mock()
         runtime.create_app.return_value = identity.app_name
         runtime.mirror_candidate.return_value = f"{stage.FLY_REGISTRY}/{identity.app_name}:{stage.CANDIDATE_MIRROR_TAG}"
+        runtime.mirror_rollback_rescue.return_value = f"{stage.FLY_REGISTRY}/{identity.app_name}:{stage.ROLLBACK_RESCUE_MIRROR_TAG}"
         runtime.create_volume.return_value = "vol_owned"
         runtime.create_machine.return_value = "machine_owned"
         runtime.provisioning_probe.return_value = "machine_probe"
@@ -922,11 +937,24 @@ class StageAContractTests(unittest.TestCase):
         runtime.create_volume.assert_not_called()
         runtime.create_machine.assert_not_called()
 
-    def test_old_image_is_only_allowed_for_baseline_and_rollback_roles(self):
+    def test_machine_roles_fail_closed_on_image_substitution(self):
         identity = stage.build_identity("role-test")
         runtime = stage.FlyRuntime(runner=lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, "Machine ID: abcdef12345678\n", ""))
-        with self.assertRaises(stage.RehearsalUnknown): runtime.create_machine(identity, "vol_test", stage.BASELINE_IMAGE, "candidate")
-        runtime.create_machine(identity, "vol_test", stage.BASELINE_IMAGE, "rollback")
+        runtime.create_machine(identity, "vol_test", stage.BASELINE_IMAGE, "baseline")
+        runtime.create_machine(identity, "vol_test", stage.CANDIDATE_IMAGE, "candidate")
+        runtime.create_machine(identity, "vol_test", stage.ROLLBACK_RESCUE_IMAGE, "rollback")
+        with self.assertRaises(stage.RehearsalUnknown):
+            runtime.create_machine(identity, "vol_test", stage.CANDIDATE_IMAGE, "unrecognized")
+        for role, substituted in (
+            ("baseline", stage.CANDIDATE_IMAGE),
+            ("baseline", stage.ROLLBACK_RESCUE_IMAGE),
+            ("candidate", stage.BASELINE_IMAGE),
+            ("candidate", stage.ROLLBACK_RESCUE_IMAGE),
+            ("rollback", stage.BASELINE_IMAGE),
+            ("rollback", stage.CANDIDATE_IMAGE),
+        ):
+            with self.assertRaises(stage.RehearsalUnknown):
+                runtime.create_machine(identity, "vol_test", substituted, role)
 
     def mirror_runner(self, reported_digest, *, copy_code=0):
         calls = []
@@ -957,6 +985,30 @@ class StageAContractTests(unittest.TestCase):
         )
         for substituted in substitutions:
             with self.assertRaises(stage.RehearsalUnknown): runtime.create_machine(identity, "vol_test", substituted, "candidate")
+
+    def test_rollback_rescue_mirror_preserves_digest_and_is_role_isolated(self):
+        identity = stage.build_identity("rescue-mirror")
+        runner, calls = self.mirror_runner(stage.ROLLBACK_RESCUE_DIGEST)
+        runtime = stage.FlyRuntime(runner=runner)
+        mirrored = runtime.mirror_rollback_rescue(identity)
+        self.assertEqual(
+            mirrored,
+            f"{stage.FLY_REGISTRY}/{identity.app_name}:{stage.ROLLBACK_RESCUE_MIRROR_TAG}",
+        )
+        self.assertEqual(calls[0], ["crane", "copy", stage.ROLLBACK_RESCUE_IMAGE, mirrored])
+        self.assertEqual(calls[1], ["crane", "digest", mirrored])
+        runtime.create_machine(identity, "vol_test", mirrored, "rollback")
+        for role in ("baseline", "candidate"):
+            with self.assertRaises(stage.RehearsalUnknown):
+                runtime.create_machine(identity, "vol_test", mirrored, role)
+
+    def test_rollback_rescue_mirror_refuses_digest_drift(self):
+        identity = stage.build_identity("rescue-drift")
+        runner, _ = self.mirror_runner("sha256:" + "0" * 64)
+        runtime = stage.FlyRuntime(runner=runner)
+        with self.assertRaises(stage.RehearsalUnknown):
+            runtime.mirror_rollback_rescue(identity)
+        self.assertEqual(runtime.rollback_rescue_ref, stage.ROLLBACK_RESCUE_IMAGE)
 
     def test_launch_reference_is_a_tag_because_fly_rejects_digest_pinned_config_image(self):
         """Run 30165273639 observed: Fly resolves a digest-pinned config.image, then refuses
@@ -1743,7 +1795,7 @@ class StageAContractTests(unittest.TestCase):
         snapshot = "ledger.snapshot_id = runtime.snapshot(identity, ledger.volume_id)"
         clone = "ledger.candidate_volume_id = runtime.create_volume("
         candidate = "ledger.candidate_volume_id, candidate_ref, \"candidate\""
-        rollback = "ledger.volume_id, BASELINE_IMAGE, \"rollback\""
+        rollback = "ledger.volume_id, rollback_rescue_ref, \"rollback\""
         self.assertIn(snapshot, source)
         self.assertIn(clone, source)
         self.assertIn("identity.candidate_volume_name", source)
@@ -1768,7 +1820,7 @@ class StageAContractTests(unittest.TestCase):
         for call in required:
             self.assertIn(call, source)
         original_snapshot = source.index("ledger.snapshot_id = runtime.snapshot(identity, ledger.volume_id)")
-        rollback = source.index('ledger.volume_id, BASELINE_IMAGE, "rollback"')
+        rollback = source.index('ledger.volume_id, rollback_rescue_ref, "rollback"')
         between = source[original_snapshot:rollback]
         self.assertEqual(
             between.count("ledger.volume_id"),
@@ -1780,6 +1832,16 @@ class StageAContractTests(unittest.TestCase):
         identity = stage.build_identity("topology-plan")
         rendered = stage.plan(identity, stage.CorpusSpec(payload_shape="lexical"))
         self.assertEqual(rendered["rollback_qualification"]["topology"], "retained-original-volume")
+        self.assertEqual(rendered["rollback_qualification"]["rollback_rescue_image"], stage.ROLLBACK_RESCUE_IMAGE)
+        self.assertEqual(rendered["rollback_qualification"]["rollback_rescue_digest"], stage.ROLLBACK_RESCUE_DIGEST)
+        self.assertEqual(
+            rendered["rollback_qualification"]["rollback_rescue_provenance_sha256"],
+            stage.ROLLBACK_RESCUE_PROVENANCE_SHA256,
+        )
+        access = rendered["rollback_rescue_image_access"]
+        self.assertEqual(access["source"], stage.ROLLBACK_RESCUE_IMAGE)
+        self.assertEqual(access["required_digest"], stage.ROLLBACK_RESCUE_DIGEST)
+        self.assertEqual(access["provenance_sha256"], stage.ROLLBACK_RESCUE_PROVENANCE_SHA256)
         self.assertEqual(rendered["generated_resources"]["candidate_volume"], identity.candidate_volume_name)
         self.assertEqual(rendered["generated_resources"]["rollback_volume"], "cleanup-compatibility-only")
         document = stage.receipt_document(
@@ -1795,6 +1857,16 @@ class StageAContractTests(unittest.TestCase):
             orphans=[],
             corpus=None,
             mode="execute",
+        )
+        self.assertEqual(document["images"]["rollback_rescue"], stage.ROLLBACK_RESCUE_IMAGE)
+        self.assertEqual(document["images"]["rollback_rescue_digest"], stage.ROLLBACK_RESCUE_DIGEST)
+        self.assertEqual(
+            document["images"]["rollback_rescue_provenance_sha256"],
+            stage.ROLLBACK_RESCUE_PROVENANCE_SHA256,
+        )
+        self.assertEqual(
+            document["images"]["rollback_rescue_role"],
+            "retained-original rollback rescue reader",
         )
         self.assertTrue(any("retained original" in item for item in document["limitations"]))
         self.assertFalse(any("rollback failure IS remains open" in item for item in document["limitations"]))
@@ -2590,6 +2662,7 @@ class StageAContractTests(unittest.TestCase):
         runtime = mock.Mock()
         runtime.create_app.return_value = identity.app_name
         runtime.mirror_candidate.return_value = "registry.fly.io/probe:mirror"
+        runtime.mirror_rollback_rescue.return_value = "registry.fly.io/probe:rollback-rescue"
         runtime.create_volume.return_value = "vol_probe"
         runtime.create_machine.return_value = "machine_probe"
         runtime.disk_sample.return_value = stage.DiskSample("baseline-empty", 100 * 1024**2, 19 * gib, 20 * gib)

@@ -140,7 +140,7 @@ RESTORE_LIMIT_S, ROLLBACK_LIMIT_S = 45 * 60, 30 * 60
 # run_query_probes: find_by_concept, find_by_entity, read, or the 24-sample fuzzy sweep.
 # Those touch indexes and data blocks. The corrected topology no longer uses that fork for
 # operational rollback: archive restore rebuilds candidate data on a clone, while rollback
-# remounts the untouched original volume with the legacy image.
+# remounts the untouched original volume with the qualified rollback-rescue reader.
 #
 # The budget below covers a DATA query after each fresh machine launch and is applied per
 # probe rather than only to a single warm-up call - warming one concept lookup cannot warm
@@ -160,7 +160,14 @@ BASELINE_IMAGE = "registry.fly.io/koala-muninndb:deployment-01KSWRX9GKW5M94MQQCB
 BASELINE_DIGEST = "sha256:c06842e1452f2aab4c1f01207adf9406bfe757b4984da516568006f1f5c8ad86"
 CANDIDATE_IMAGE = "ghcr.io/koala-optics/muninndb@sha256:5cc1546b854e6b173181ceed139ade783751c1e58bea504bc57cb0a7fa4019df"
 CANDIDATE_DIGEST = CANDIDATE_IMAGE.split("@", 1)[1]
-FLY_REGISTRY, CANDIDATE_MIRROR_TAG = "registry.fly.io", "stage-a-candidate"
+ROLLBACK_RESCUE_IMAGE = "ghcr.io/koala-optics/muninndb@sha256:52cad8cce1a0dca7b6e64f5bffafe1a0c677667c49112513cc3ad463a953594b"
+ROLLBACK_RESCUE_DIGEST = ROLLBACK_RESCUE_IMAGE.split("@", 1)[1]
+ROLLBACK_RESCUE_SOURCE_COMMIT = "be975fb1215e75208adf4b340ba95e21415f04cb"
+ROLLBACK_RESCUE_PATCH_COMMIT = "e486c731dfb9c20c3429022729fede7de2e052e7"
+ROLLBACK_RESCUE_PROVENANCE_SHA256 = "7285d32b1082091547ce74397df63e3048b41d06a2607346927e7dec7012e251"
+ROLLBACK_RESCUE_BUILD_RUN_ID = 30329362902
+FLY_REGISTRY = "registry.fly.io"
+CANDIDATE_MIRROR_TAG, ROLLBACK_RESCUE_MIRROR_TAG = "stage-a-candidate", "stage-a-rollback-rescue"
 SOURCE_COMMIT, SOURCE_TAG = "acef6bedbbd839f9616415e6a7559ad149dc8bc8", "koala-v0.9.0-rc.2"
 PRODUCTION_APP = "koala-muninndb"
 PRODUCTION_MACHINE_IDS = frozenset({"6e8262d6c6d298"})
@@ -168,6 +175,7 @@ PRODUCTION_VOLUME_IDS = frozenset({"vol_vgn3o017zm3gkgz4"})
 COLLISION_CONCEPTS = ("stage-a/collision/1162789", "stage-a/collision/1379192")
 DIGEST_REF = re.compile(r"[a-z0-9./-]+@sha256:[0-9a-f]{64}")
 MIRROR_REF = re.compile(rf"{re.escape(FLY_REGISTRY)}/koala-stage-a-[a-z0-9-]{{4,32}}:{re.escape(CANDIDATE_MIRROR_TAG)}")
+ROLLBACK_RESCUE_MIRROR_REF = re.compile(rf"{re.escape(FLY_REGISTRY)}/koala-stage-a-[a-z0-9-]{{4,32}}:{re.escape(ROLLBACK_RESCUE_MIRROR_TAG)}")
 RUN_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{3,31}")
 FLY_VOLUME_NAME_RE = re.compile(r"[a-z0-9_]{1,30}")
 SENSITIVE_TEXT = re.compile(r"https?://|(?i:authorization|bearer|password|secret|token|x-amz-|fly_api)")
@@ -327,18 +335,31 @@ def assert_owned(value: str, identity: RunIdentity, kind: str) -> None:
     if kind in names and value not in names[kind]:
         raise RehearsalUnknown(f"refusing unowned {kind}")
 
-def validate_image(ref: str, role: str, *, expected_candidate: str = CANDIDATE_IMAGE) -> str:
+def validate_image(
+    ref: str,
+    role: str,
+    *,
+    expected_candidate: str = CANDIDATE_IMAGE,
+    expected_rollback_rescue: str = ROLLBACK_RESCUE_IMAGE,
+) -> str:
     """Refuse any image reference that is not the exact expected identity for its role.
 
-    Exact string equality against the expected reference is the binding check. The shape
-    backstop accepts two candidate forms: a digest-pinned reference (the qualified source
-    identity) and a run-owned Fly mirror tag. Fly's machine-create API rejects a
-    digest-pinned config.image with "invalid image identifier", so the launch reference is
-    necessarily a tag; digest equality is asserted separately in mirror_candidate against
-    the immutable qualified digest, which is what actually binds image identity.
+    Exact string equality against the expected reference is the binding check. The candidate
+    and rollback-rescue roles each accept their digest-pinned source identity or only their
+    own run-owned Fly mirror tag. Fly's machine-create API rejects a digest-pinned
+    config.image with "invalid image identifier", so launch references are tags; each tag's
+    digest is asserted separately before any machine launch.
     """
-    expected = BASELINE_IMAGE if role == "baseline" else expected_candidate
-    accepted_shape = role == "baseline" or bool(DIGEST_REF.fullmatch(ref) or MIRROR_REF.fullmatch(ref))
+    if role == "baseline":
+        expected, accepted_shape = BASELINE_IMAGE, ref == BASELINE_IMAGE
+    elif role == "candidate":
+        expected = expected_candidate
+        accepted_shape = bool(DIGEST_REF.fullmatch(ref) or MIRROR_REF.fullmatch(ref))
+    elif role == "rollback-rescue":
+        expected = expected_rollback_rescue
+        accepted_shape = bool(DIGEST_REF.fullmatch(ref) or ROLLBACK_RESCUE_MIRROR_REF.fullmatch(ref))
+    else:
+        raise RehearsalUnknown(f"unknown image role: {role}")
     if ref != expected or not accepted_shape:
         raise RehearsalUnknown(f"{role} image differs from qualified immutable identity")
     return ref
@@ -873,6 +894,7 @@ def receipt_document(
     corpus: CorpusReceipt | IngestProgress | None,
     mode: str = "execute",
     candidate_ref: str = CANDIDATE_IMAGE,
+    rollback_rescue_ref: str = ROLLBACK_RESCUE_IMAGE,
 ) -> dict[str, Any]:
     bounded_measurements = json.loads(json.dumps(measurements))
     bounded_measurements["mode"] = mode
@@ -892,13 +914,16 @@ def receipt_document(
             "Fly machine-create rejects a digest-pinned config.image, so the candidate launches from the run-owned mirror tag; identity rests on the digest assertion taken before launch, not on the launch reference itself."
         )
         limitations.append(
+            "The rollback-rescue reader launches from its own run-owned mirror tag; identity rests on its separate digest assertion before measured work, not on the launch reference itself."
+        )
+        limitations.append(
             "The pre-ingestion provisioning probe is mountless, so it proves candidate image and guest provisioning and the machine exec shell transport only; volume attachment, readiness, the resource measurement itself, and every measured gate remain first exercised by the real machines."
         )
         limitations.append(
             "query_latency is judged net of a transport baseline because every query crosses a WireGuard tunnel to the guest; the 150ms net limit is bounded above four observed readings (117.5/82.5/77.8/90.1), which is a thin basis, and the baseline is inferred from the cheapest query classes rather than measured server-side."
         )
         limitations.append(
-            "Operational rollback is tested by remounting the retained original volume with the legacy image; candidate archive restore separately tests disaster recovery. Neither path authorizes production deployment."
+            "Operational rollback is tested by remounting the retained original volume with the separately qualified rollback-rescue reader; candidate archive restore separately tests disaster recovery. Neither path authorizes production deployment."
         )
         limitations.append(
             "Historical correction: runs 30290534176 and 30302595011 stopped at hard-delete verification, not rollback. A -32000 tool-level 'engram not found' response is the hard-delete pass condition; protocol faults still fail closed."
@@ -909,8 +934,21 @@ def receipt_document(
         "exit_code": exit_code,
         "run_id": identity.run_id,
         "source": {"commit": SOURCE_COMMIT, "tag": SOURCE_TAG},
-        "images": {"baseline": BASELINE_IMAGE, "baseline_digest": BASELINE_DIGEST, "candidate": CANDIDATE_IMAGE,
-                   "candidate_digest": CANDIDATE_DIGEST, "candidate_ref_executed": candidate_ref},
+        "images": {
+            "baseline": BASELINE_IMAGE,
+            "baseline_digest": BASELINE_DIGEST,
+            "candidate": CANDIDATE_IMAGE,
+            "candidate_digest": CANDIDATE_DIGEST,
+            "candidate_ref_executed": candidate_ref,
+            "rollback_rescue": ROLLBACK_RESCUE_IMAGE,
+            "rollback_rescue_digest": ROLLBACK_RESCUE_DIGEST,
+            "rollback_rescue_ref_executed": rollback_rescue_ref,
+            "rollback_rescue_role": "retained-original rollback rescue reader",
+            "rollback_rescue_source_commit": ROLLBACK_RESCUE_SOURCE_COMMIT,
+            "rollback_rescue_patch_commit": ROLLBACK_RESCUE_PATCH_COMMIT,
+            "rollback_rescue_provenance_sha256": ROLLBACK_RESCUE_PROVENANCE_SHA256,
+            "rollback_rescue_build_run_id": ROLLBACK_RESCUE_BUILD_RUN_ID,
+        },
         "corpus": corpus_evidence(spec, corpus),
         "resources": {key: value for key, value in asdict(ledger).items() if value},
         "measurements": bounded_measurements,
@@ -1023,6 +1061,7 @@ class FlyRuntime:
     def __init__(self, runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run, popen: Callable[..., subprocess.Popen[str]] = subprocess.Popen):
         self.runner, self.popen = runner, popen
         self.candidate_ref = CANDIDATE_IMAGE
+        self.rollback_rescue_ref = ROLLBACK_RESCUE_IMAGE
     def run(self, args: list[str], *, stdin: str | None = None, timeout: int = 600) -> subprocess.CompletedProcess[str]:
         proc = self.runner(["flyctl", *args], input=stdin, text=True, capture_output=True, timeout=timeout)
         if proc.returncode: raise RehearsalUnknown(f"flyctl {args[0]} failed: {_safe_process_error(proc)}")
@@ -1073,6 +1112,20 @@ class FlyRuntime:
         if not MIRROR_REF.fullmatch(mirrored_ref): raise RehearsalUnknown("mirrored candidate reference is not a run-owned mirror tag")
         self.candidate_ref = mirrored_ref
         return self.candidate_ref
+
+    def mirror_rollback_rescue(self, identity: RunIdentity) -> str:
+        """Bind the qualified rollback-rescue digest to its own run-owned Fly tag."""
+        assert_not_production(identity)
+        target = f"{FLY_REGISTRY}/{identity.app_name}"
+        mirrored_ref = f"{target}:{ROLLBACK_RESCUE_MIRROR_TAG}"
+        self.crane(["copy", ROLLBACK_RESCUE_IMAGE, mirrored_ref])
+        mirrored_digest = self.crane(["digest", mirrored_ref]).stdout.strip()
+        if mirrored_digest != ROLLBACK_RESCUE_DIGEST:
+            raise RehearsalUnknown("mirrored rollback-rescue digest differs from qualified immutable identity")
+        if not ROLLBACK_RESCUE_MIRROR_REF.fullmatch(mirrored_ref):
+            raise RehearsalUnknown("mirrored rollback-rescue reference is not a run-owned mirror tag")
+        self.rollback_rescue_ref = mirrored_ref
+        return self.rollback_rescue_ref
 
     def install_auth(self, identity: RunIdentity, auth_value: str) -> None:
         env_name = "MUNINN" + "_MCP_TOKEN"
@@ -1126,7 +1179,20 @@ class FlyRuntime:
         return volume_id
     def create_machine(self, identity: RunIdentity, volume_id: str, image: str, role: str) -> str:
         if volume_id in PRODUCTION_VOLUME_IDS: raise RehearsalUnknown("refusing production volume")
-        validate_image(image, "baseline" if role in {"baseline", "rollback"} else "candidate", expected_candidate=self.candidate_ref)
+        if role == "baseline":
+            image_role = "baseline"
+        elif role == "rollback":
+            image_role = "rollback-rescue"
+        elif role in {"candidate", "clean-restart", "crash-restart", "hard-delete-check", "restore"}:
+            image_role = "candidate"
+        else:
+            raise RehearsalUnknown(f"unknown machine role: {role}")
+        validate_image(
+            image,
+            image_role,
+            expected_candidate=self.candidate_ref,
+            expected_rollback_rescue=self.rollback_rescue_ref,
+        )
         name = f"koala-stage-a-{identity.run_id}-{role}"
         mounts = [{"volume": volume_id, "path": "/data"}]
         require_single_mount(mounts, role)
@@ -1984,9 +2050,13 @@ def plan(identity: RunIdentity, spec: CorpusSpec, *, mode: str = "execute") -> d
     elif mode in {"calibrate", "ablate"}: validate_calibration_spec(spec)
     else: validate_execute_spec(spec)
     validate_image(BASELINE_IMAGE, "baseline"); validate_image(CANDIDATE_IMAGE, "candidate")
+    validate_image(ROLLBACK_RESCUE_IMAGE, "rollback-rescue")
     result = {"mode": f"{mode}-plan", "run_id": identity.run_id, "confirmation_required_for_execute": identity.confirmation,
               "source_commit": SOURCE_COMMIT, "source_tag": SOURCE_TAG, "baseline_image": BASELINE_IMAGE,
               "baseline_digest": BASELINE_DIGEST, "candidate_image": CANDIDATE_IMAGE,
+              "rollback_rescue_image": ROLLBACK_RESCUE_IMAGE,
+              "rollback_rescue_digest": ROLLBACK_RESCUE_DIGEST,
+              "rollback_rescue_provenance_sha256": ROLLBACK_RESCUE_PROVENANCE_SHA256,
               "record_count": spec.count, "batch_size": spec.batch_size,
               "payload_bytes": spec.payload_bytes, "payload_shape": spec.payload_shape, "volume_gb": VOLUME_SIZE_GB,
               "generated_resources": {"app": identity.app_name, "source_volume": identity.volume_name,
@@ -2022,6 +2092,22 @@ def plan(identity: RunIdentity, spec: CorpusSpec, *, mode: str = "execute") -> d
             "ordering": "immediately after app creation, before any corpus ingestion",
             "scope": "run-owned app repository only; no shared or production repository is written",
         }
+        result["rollback_rescue_image_access"] = {
+            "method": "digest-pinned-copy-into-separate-run-owned-fly-registry-tag",
+            "reason": "retained-original rollback requires the separately qualified rescue reader, while Fly launches tags",
+            "source": ROLLBACK_RESCUE_IMAGE,
+            "target": f"{FLY_REGISTRY}/{identity.app_name}:{ROLLBACK_RESCUE_MIRROR_TAG}",
+            "executed_reference": f"{FLY_REGISTRY}/{identity.app_name}:{ROLLBACK_RESCUE_MIRROR_TAG}",
+            "required_digest": ROLLBACK_RESCUE_DIGEST,
+            "digest_mismatch_policy": "UNKNOWN",
+            "identity_binding": "crane digest of the rollback-rescue mirror tag must equal the qualified digest before any measured work",
+            "role": "retained-original rollback rescue reader",
+            "source_commit": ROLLBACK_RESCUE_SOURCE_COMMIT,
+            "patch_commit": ROLLBACK_RESCUE_PATCH_COMMIT,
+            "provenance_sha256": ROLLBACK_RESCUE_PROVENANCE_SHA256,
+            "build_run_id": ROLLBACK_RESCUE_BUILD_RUN_ID,
+            "scope": "separate tag in the run-owned app repository only; never candidate or baseline identity",
+        }
         result["provisioning_probe"] = {
             "purpose": "surface candidate image and guest provisioning faults before the corpus ingest, not after it",
             "ordering": "immediately after the mirror digest assertion, before any volume or measured machine exists",
@@ -2045,7 +2131,10 @@ def plan(identity: RunIdentity, spec: CorpusSpec, *, mode: str = "execute") -> d
         result["rollback_qualification"] = {
             "topology": "retained-original-volume",
             "candidate_source": "stable clone of the completed pre-migration snapshot",
-            "operational_rollback": "legacy image remounts the untouched original volume",
+            "operational_rollback": "separately qualified rollback-rescue reader remounts the untouched original volume",
+            "rollback_rescue_image": ROLLBACK_RESCUE_IMAGE,
+            "rollback_rescue_digest": ROLLBACK_RESCUE_DIGEST,
+            "rollback_rescue_provenance_sha256": ROLLBACK_RESCUE_PROVENANCE_SHA256,
             "disaster_recovery": "candidate archive restore is qualified separately",
             "legacy_rollback_volume": "cleanup compatibility only; never created by execute",
         }
@@ -2262,13 +2351,17 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
     ledger, proxy = ResourceLedger(), None
     gates: dict[str, Gate] = {}; measurements: dict[str, Any] = {"disk_samples": [], "latencies": {}}
     corpus_receipt: CorpusReceipt | None = None; cleanup_result: dict[str, str] = {}; orphans: list[str] = []
-    candidate_ref = CANDIDATE_IMAGE
+    candidate_ref, rollback_rescue_ref = CANDIDATE_IMAGE, ROLLBACK_RESCUE_IMAGE
     detail, status, exit_code = "rehearsal did not complete", "UNKNOWN", 2
     auth_value = secrets.token_urlsafe(32)
     try:
         validate_tail_probe_spec(spec) if probe else validate_execute_spec(spec)
-        validate_image(BASELINE_IMAGE, "baseline"); validate_image(CANDIDATE_IMAGE, "candidate"); runtime.preflight(identity)
-        ledger.app = runtime.create_app(identity); candidate_ref = runtime.mirror_candidate(identity); runtime.install_auth(identity, auth_value)
+        validate_image(BASELINE_IMAGE, "baseline"); validate_image(CANDIDATE_IMAGE, "candidate")
+        validate_image(ROLLBACK_RESCUE_IMAGE, "rollback-rescue"); runtime.preflight(identity)
+        ledger.app = runtime.create_app(identity)
+        candidate_ref = runtime.mirror_candidate(identity)
+        rollback_rescue_ref = runtime.mirror_rollback_rescue(identity)
+        runtime.install_auth(identity, auth_value)
         ledger.machine_id = runtime.provisioning_probe(identity, candidate_ref)
         runtime.wait_ready(identity, ledger.machine_id, READINESS_LIMIT_S)
         runtime.exec_canary(identity, ledger.machine_id)
@@ -2298,7 +2391,7 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
             write_receipt(receipt_path, receipt_document(
                 identity, spec, status="UNKNOWN", exit_code=2, detail="baseline ingestion in progress",
                 ledger=ledger, measurements=measurements, gates=gates, cleanup_result={}, orphans=[],
-                corpus=progress, candidate_ref=candidate_ref,
+                corpus=progress, candidate_ref=candidate_ref, rollback_rescue_ref=rollback_rescue_ref,
             ))
         # `ingest_corpus` re-validates the corpus through `iter_records`, whose own floor
         # defaults to the FULL qualification count. Passing the entry contract at the top
@@ -2453,7 +2546,7 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
         runtime.stop_machine(identity, ledger.machine_id); runtime.destroy_machine(identity, ledger.machine_id); ledger.machine_id = None
         rollback_started = time.monotonic()
         ledger.machine_id = runtime.create_machine(
-            identity, ledger.volume_id, BASELINE_IMAGE, "rollback")
+            identity, ledger.volume_id, rollback_rescue_ref, "rollback")
         runtime.wait_ready(identity, ledger.machine_id, READINESS_LIMIT_S)
         proxy = runtime.proxy(identity, ledger.machine_id, local_port); rollback_client = client_factory(f"http://127.0.0.1:{local_port}/mcp", auth_value); rollback_client.initialize()
         measurements["rollback_cold_query_s"] = wait_cold_query(rollback_client, "stage-a-primary")
@@ -2488,6 +2581,7 @@ def execute(identity: RunIdentity, spec: CorpusSpec, receipt_path: Path, *, runt
             identity, spec, status=status, exit_code=exit_code, detail=detail, ledger=ledger,
             measurements=measurements, gates=gates, cleanup_result=cleanup_result,
             orphans=orphans, corpus=corpus_receipt, candidate_ref=candidate_ref,
+            rollback_rescue_ref=rollback_rescue_ref,
             mode="tail_probe" if probe else "execute",
         ))
     return exit_code

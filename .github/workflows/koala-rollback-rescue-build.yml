@@ -1,0 +1,213 @@
+name: Koala Rollback Rescue Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      harness_commit:
+        description: Exact 40-character Koala commit containing the rescue patch and witness
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: koala-rollback-rescue-build
+  cancel-in-progress: false
+
+env:
+  LEGACY_SOURCE_COMMIT: be975fb1215e75208adf4b340ba95e21415f04cb
+  LEGACY_BASELINE_IMAGE: registry.fly.io/koala-muninndb@sha256:c06842e1452f2aab4c1f01207adf9406bfe757b4984da516568006f1f5c8ad86
+  LEGACY_BASELINE_DIGEST: sha256:c06842e1452f2aab4c1f01207adf9406bfe757b4984da516568006f1f5c8ad86
+  RESCUE_IMAGE: ghcr.io/koala-optics/muninndb:rollback-v0.4.15-alpha-fts-bounded-amd64
+  PATCH_PATH: scripts/patches/legacy-be975fb-bounded-fts.patch
+  EXPECTED_PATCH_SHA256: b5c480af5896ceda6739c055326b13f0ec40c42cab2e29dbbc1de3a9a913e74d
+  RESCUE_DOCKERFILE_PATH: scripts/patches/legacy-be975fb-rescue.Dockerfile
+  EXPECTED_RESCUE_DOCKERFILE_SHA256: e551c38a10a5e4b942e93e7489a84b64492f69e526d0bdcda78078a65e66602a
+  RECEIPT_DIR: /tmp/koala-rollback-rescue
+
+jobs:
+  build:
+    name: Build exact-source rollback rescue image
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Validate repository and immutable inputs
+        shell: bash
+        env:
+          REPOSITORY: ${{ github.repository }}
+          HARNESS_COMMIT: ${{ inputs.harness_commit }}
+        run: |
+          set -euo pipefail
+          test "$REPOSITORY" = "koala-optics/muninndb"
+          [[ "$HARNESS_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$LEGACY_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$LEGACY_BASELINE_IMAGE" = "registry.fly.io/koala-muninndb@$LEGACY_BASELINE_DIGEST" ]]
+          [[ "$LEGACY_BASELINE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$RESCUE_IMAGE" = ghcr.io/koala-optics/muninndb:rollback-* ]]
+
+      - name: Check out exact workflow ref
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify harness commit and exact legacy source
+        shell: bash
+        env:
+          HARNESS_COMMIT: ${{ inputs.harness_commit }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$HARNESS_COMMIT"
+          git cat-file -e "$LEGACY_SOURCE_COMMIT^{commit}"
+          test -f "$PATCH_PATH"
+          test -f "$RESCUE_DOCKERFILE_PATH"
+          patch_sha256="$(sha256sum "$PATCH_PATH" | awk '{print $1}')"
+          rescue_dockerfile_sha256="$(sha256sum "$RESCUE_DOCKERFILE_PATH" | awk '{print $1}')"
+          test "$patch_sha256" = "$EXPECTED_PATCH_SHA256"
+          test "$rescue_dockerfile_sha256" = "$EXPECTED_RESCUE_DOCKERFILE_SHA256"
+          mkdir -p "$RECEIPT_DIR"
+          printf '%s\n' "$patch_sha256" > "$RECEIPT_DIR/patch.sha256"
+          printf '%s\n' "$rescue_dockerfile_sha256" > "$RECEIPT_DIR/rescue-dockerfile.sha256"
+          printf 'PATCH_SHA256=%s\n' "$patch_sha256" >> "$GITHUB_ENV"
+          printf 'RESCUE_DOCKERFILE_SHA256=%s\n' "$rescue_dockerfile_sha256" >> "$GITHUB_ENV"
+
+      - name: Check out and patch exact legacy source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RECEIPT_DIR"
+          git worktree add --detach "$RECEIPT_DIR/source" "$LEGACY_SOURCE_COMMIT"
+          test "$(git -C "$RECEIPT_DIR/source" rev-parse HEAD)" = "$LEGACY_SOURCE_COMMIT"
+          git -C "$RECEIPT_DIR/source" apply --check "$GITHUB_WORKSPACE/$PATCH_PATH"
+          git -C "$RECEIPT_DIR/source" apply "$GITHUB_WORKSPACE/$PATCH_PATH"
+          git -C "$RECEIPT_DIR/source" apply --reverse --check "$GITHUB_WORKSPACE/$PATCH_PATH"
+          test "$(git -C "$RECEIPT_DIR/source" diff --name-only)" = "internal/index/fts/fts.go"
+          test -n "$(git -C "$RECEIPT_DIR/source" diff -- internal/index/fts/fts.go)"
+
+      - name: Set up legacy Go toolchain
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version-file: /tmp/koala-rollback-rescue/source/go.mod
+          cache: false
+
+      - name: Run source and witness checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          go -C "$RECEIPT_DIR/source" test ./internal/index/fts
+          python3 scripts/tests/test_koala_legacy_fts_witness.py
+          python3 scripts/koala_legacy_fts_witness.py \
+            --repo "$GITHUB_WORKSPACE" \
+            --patch "$GITHUB_WORKSPACE/$PATCH_PATH" \
+            --output "$RECEIPT_DIR/green-witness.json"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          receipt = json.loads(Path("/tmp/koala-rollback-rescue/green-witness.json").read_text())
+          phases = receipt["phases"]
+          if receipt["source"]["revision"] != os.environ["LEGACY_SOURCE_COMMIT"]:
+              raise SystemExit("witness used the wrong legacy revision")
+          if receipt["source"]["patch_sha256"] != os.environ["EXPECTED_PATCH_SHA256"]:
+              raise SystemExit("witness used the wrong patch")
+          if phases["build"]["status"] != "completed" or phases["build"].get("posting_count") != 502375:
+              raise SystemExit("patched witness did not use the full focused fixture")
+          if phases["whole_first"]["status"] != "completed" or phases["whole_warm"]["status"] != "completed":
+              raise SystemExit("patched whole search did not complete")
+          if phases["pre-cancel"]["status"] != "completed" or phases["mid-cancel"]["status"] != "completed":
+              raise SystemExit("patched cancellation did not complete")
+          if phases["whole_first"].get("result_count") != 30 or phases["whole_warm"].get("result_count") != 30:
+              raise SystemExit("patched witness did not preserve topK=30")
+          verdict = receipt["verdict"]
+          if verdict["posting_scan_exceeds_server_context"] or verdict["ranking_exceeds_server_context"] or verdict["whole_search_exceeds_server_context"]:
+              raise SystemExit("patched witness exceeded the fixed server context")
+          if not verdict["pre_cancel_returned_within_2s"] or not verdict["mid_scan_cancel_returned_within_2s"]:
+              raise SystemExit("patched cancellation exceeded two seconds")
+          PY
+          sha256sum "$RECEIPT_DIR/green-witness.json" | awk '{print $1}' > "$RECEIPT_DIR/green-witness.sha256"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+
+      - name: Log in to Koala GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish separately named rescue image
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: /tmp/koala-rollback-rescue/source
+          file: ${{ github.workspace }}/${{ env.RESCUE_DOCKERFILE_PATH }}
+          push: true
+          platforms: linux/amd64
+          tags: ${{ env.RESCUE_IMAGE }}
+          provenance: mode=max
+          sbom: true
+          no-cache: true
+          labels: |
+            org.opencontainers.image.revision=${{ env.LEGACY_SOURCE_COMMIT }}
+            org.opencontainers.image.version=rollback-v0.4.15-alpha-fts-bounded
+            org.opencontainers.image.source=https://github.com/koala-optics/muninndb
+            io.koala.rollback.baseline.digest=${{ env.LEGACY_BASELINE_DIGEST }}
+            io.koala.rollback.patch.sha256=${{ env.PATCH_SHA256 }}
+            io.koala.rollback.patch.commit=${{ inputs.harness_commit }}
+            io.koala.rollback.dockerfile.sha256=${{ env.RESCUE_DOCKERFILE_SHA256 }}
+
+      - name: Write immutable provenance receipt
+        shell: bash
+        env:
+          BUILD_DIGEST: ${{ steps.build.outputs.digest }}
+          HARNESS_COMMIT: ${{ inputs.harness_commit }}
+        run: |
+          set -euo pipefail
+          [[ "$BUILD_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          test "$(docker buildx imagetools inspect "$RESCUE_IMAGE" --format '{{json .Manifest.Digest}}' | tr -d '"')" = "$BUILD_DIGEST"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          directory = Path("/tmp/koala-rollback-rescue")
+          patch_sha = (directory / "patch.sha256").read_text().strip()
+          rescue_dockerfile_sha = (directory / "rescue-dockerfile.sha256").read_text().strip()
+          digest = os.environ["BUILD_DIGEST"]
+          receipt = {
+              "schema_version": 1,
+              "artifact_role": "retained-original rollback rescue reader",
+              "artifact_identity": f"ghcr.io/koala-optics/muninndb@{digest}",
+              "artifact_digest": digest,
+              "artifact_tag": os.environ["RESCUE_IMAGE"],
+              "legacy_source_commit": os.environ["LEGACY_SOURCE_COMMIT"],
+              "legacy_baseline_image": os.environ["LEGACY_BASELINE_IMAGE"],
+              "legacy_baseline_digest": os.environ["LEGACY_BASELINE_DIGEST"],
+              "patch_commit": os.environ["HARNESS_COMMIT"],
+              "patch_path": os.environ["PATCH_PATH"],
+              "patch_sha256": patch_sha,
+              "rescue_dockerfile_path": os.environ["RESCUE_DOCKERFILE_PATH"],
+              "rescue_dockerfile_sha256": rescue_dockerfile_sha,
+              "identity_statement": "This is a patched rollback-rescue artifact, not the untouched deployed baseline and not RC2.",
+          }
+          path = directory / "provenance.json"
+          path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+          PY
+          sha256sum "$RECEIPT_DIR/provenance.json" | awk '{print $1}' > "$RECEIPT_DIR/provenance.sha256"
+
+      - name: Upload rescue receipts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: koala-rollback-v0.4.15-alpha-fts-bounded-amd64
+          path: |
+            /tmp/koala-rollback-rescue/patch.sha256
+            /tmp/koala-rollback-rescue/rescue-dockerfile.sha256
+            /tmp/koala-rollback-rescue/green-witness.json
+            /tmp/koala-rollback-rescue/green-witness.sha256
+            /tmp/koala-rollback-rescue/provenance.json
+            /tmp/koala-rollback-rescue/provenance.sha256
+          if-no-files-found: warn
+          retention-days: 30

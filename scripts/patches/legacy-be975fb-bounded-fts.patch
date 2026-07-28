@@ -1,0 +1,184 @@
+diff --git a/internal/index/fts/fts.go b/internal/index/fts/fts.go
+index db3da5d..c3a88fd 100644
+--- a/internal/index/fts/fts.go
++++ b/internal/index/fts/fts.go
+@@ -1,9 +1,12 @@
+ package fts
+ 
+ import (
++	"bytes"
++	"container/heap"
+ 	"context"
+ 	"encoding/binary"
+ 	"math"
++	"sort"
+ 	"strings"
+ 	"sync"
+ 	"time"
+@@ -19,10 +22,10 @@ const (
+ 	k1 = 1.2
+ 	b  = 0.75
+ 
+-	FieldConcept    = uint8(0x01)
+-	FieldTags       = uint8(0x02)
+-	FieldContent    = uint8(0x03)
+-	FieldCreatedBy  = uint8(0x04)
++	FieldConcept   = uint8(0x01)
++	FieldTags      = uint8(0x02)
++	FieldContent   = uint8(0x03)
++	FieldCreatedBy = uint8(0x04)
+ 
+ 	fieldWeightConcept   = 3.0
+ 	fieldWeightTags      = 2.0
+@@ -59,8 +62,8 @@ type PostingValue struct {
+ 
+ // Index is the FTS inverted index backed by Pebble.
+ type Index struct {
+-	db       *pebble.DB
+-	mu       sync.RWMutex
++	db *pebble.DB
++	mu sync.RWMutex
+ 	// In-memory IDF cache: term → idf
+ 	idfCache map[string]float64
+ 	// versionCache caches the FTS schema version per vault (0=legacy dual-path, 1=stemmed-only).
+@@ -312,6 +315,9 @@ func (idx *Index) DeleteEngram(ws [8]byte, id [16]byte, concept, createdBy, cont
+ func (idx *Index) Search(ctx context.Context, ws [8]byte, query string, topK int) ([]ScoredID, error) {
+ 	start := time.Now()
+ 	defer func() { metrics.FTSSearchDuration.Observe(time.Since(start).Seconds()) }()
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
+ 
+ 	// Dual-path: search both stemmed tokens (new index) and unstemmed tokens (legacy index).
+ 	// This ensures backward compatibility for vaults not yet re-indexed with stemming.
+@@ -377,24 +383,19 @@ func (idx *Index) Search(ctx context.Context, ws [8]byte, query string, topK int
+ 	scores := make(map[[16]byte]float64, len(tokens)*20)
+ 
+ 	for _, term := range tokens {
++		if err := ctx.Err(); err != nil {
++			return nil, err
++		}
+ 		idf := idx.getIDF(ws, term, N)
+ 		if idf <= 0 {
+ 			continue
+ 		}
+-		_ = idx.searchToken(ws, term, scores, idf, avgdl)
+-	}
+-
+-	// Sort by score descending
+-	results := make([]ScoredID, 0, len(scores))
+-	for id, score := range scores {
+-		results = append(results, ScoredID{ID: id, Score: score})
++		if err := idx.searchToken(ctx, ws, term, scores, idf, avgdl); err != nil {
++			return nil, err
++		}
+ 	}
+-	sortScoredIDs(results)
+ 
+-	if topK > 0 && len(results) > topK {
+-		results = results[:topK]
+-	}
+-	return results, nil
++	return topScoredIDs(ctx, scores, topK)
+ }
+ 
+ // searchToken performs a prefix scan for a single token and accumulates BM25
+@@ -402,7 +403,7 @@ func (idx *Index) Search(ctx context.Context, ws [8]byte, query string, topK int
+ // ensures that defer iter.Close() is scoped to the function lifetime rather
+ // than the Search() loop body, which would otherwise defer all closes until
+ // Search() returns (and risk double-close on the last iterator).
+-func (idx *Index) searchToken(ws [8]byte, term string, scores map[[16]byte]float64, idf, avgdl float64) error {
++func (idx *Index) searchToken(ctx context.Context, ws [8]byte, term string, scores map[[16]byte]float64, idf, avgdl float64) error {
+ 	// Prefix scan for this term
+ 	lowerBound := keys.FTSPostingKey(ws, term, [16]byte{})
+ 	// Upper bound: increment the separator byte after the term prefix.
+@@ -424,6 +425,9 @@ func (idx *Index) searchToken(ws [8]byte, term string, scores map[[16]byte]float
+ 	defer iter.Close()
+ 
+ 	for iter.First(); iter.Valid(); iter.Next() {
++		if err := ctx.Err(); err != nil {
++			return err
++		}
+ 		key := iter.Key()
+ 		if len(key) < 1+8+len(term)+1+16 {
+ 			continue
+@@ -451,16 +455,73 @@ func (idx *Index) searchToken(ws [8]byte, term string, scores map[[16]byte]float
+ 
+ 		scores[engramID] += bm25
+ 	}
+-	return nil
++	if err := iter.Error(); err != nil {
++		return err
++	}
++	return ctx.Err()
+ }
+ 
+-// sortScoredIDs sorts in descending order by score.
+-func sortScoredIDs(s []ScoredID) {
+-	for i := 1; i < len(s); i++ {
+-		for j := i; j > 0 && s[j].Score > s[j-1].Score; j-- {
+-			s[j], s[j-1] = s[j-1], s[j]
++func scoredIDBefore(a, b ScoredID) bool {
++	if a.Score != b.Score {
++		return a.Score > b.Score
++	}
++	return bytes.Compare(a.ID[:], b.ID[:]) < 0
++}
++
++// scoredIDHeap keeps the worst retained result at its root.
++type scoredIDHeap []ScoredID
++
++func (h scoredIDHeap) Len() int { return len(h) }
++func (h scoredIDHeap) Less(i, j int) bool {
++	return scoredIDBefore(h[j], h[i])
++}
++func (h scoredIDHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
++func (h *scoredIDHeap) Push(value any) {
++	*h = append(*h, value.(ScoredID))
++}
++func (h *scoredIDHeap) Pop() any {
++	old := *h
++	last := len(old) - 1
++	value := old[last]
++	*h = old[:last]
++	return value
++}
++
++func topScoredIDs(ctx context.Context, scores map[[16]byte]float64, topK int) ([]ScoredID, error) {
++	if topK <= 0 || len(scores) <= topK {
++		results := make([]ScoredID, 0, len(scores))
++		for id, score := range scores {
++			if err := ctx.Err(); err != nil {
++				return nil, err
++			}
++			results = append(results, ScoredID{ID: id, Score: score})
++		}
++		sortScoredIDs(results)
++		return results, ctx.Err()
++	}
++
++	results := make(scoredIDHeap, 0, topK)
++	for id, score := range scores {
++		if err := ctx.Err(); err != nil {
++			return nil, err
++		}
++		candidate := ScoredID{ID: id, Score: score}
++		if len(results) < topK {
++			heap.Push(&results, candidate)
++			continue
++		}
++		if scoredIDBefore(candidate, results[0]) {
++			results[0] = candidate
++			heap.Fix(&results, 0)
+ 		}
+ 	}
++	sortScoredIDs(results)
++	return results, ctx.Err()
++}
++
++// sortScoredIDs sorts by score descending and ID ascending.
++func sortScoredIDs(s []ScoredID) {
++	sort.Slice(s, func(i, j int) bool { return scoredIDBefore(s[i], s[j]) })
+ }
+ 
+ // FTSStats holds global FTS statistics.

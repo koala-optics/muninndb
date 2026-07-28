@@ -1,0 +1,2 @@
+# Unified-diff context prefixes are part of this hash-pinned fixture.
+scripts/patches/legacy-be975fb-bounded-fts.patch -whitespace

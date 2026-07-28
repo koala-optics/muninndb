@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib.util
 import inspect
 import json
+import math
 import os
 import shlex
 import shutil
@@ -372,8 +373,9 @@ class StageAContractTests(unittest.TestCase):
             "The rollback-rescue reader launches from its own run-owned mirror tag; identity rests on its separate digest assertion before measured work, not on the launch reference itself.",
             "The pre-ingestion provisioning probe is mountless, so it proves candidate image and guest provisioning and the machine exec shell transport only; volume attachment, readiness, the resource measurement itself, and every measured gate remain first exercised by the real machines.",
             "query_latency is judged net of a transport baseline because every query crosses a WireGuard tunnel to the guest; the 150ms net limit is bounded above four observed readings (117.5/82.5/77.8/90.1), which is a thin basis, and the baseline is inferred from the cheapest query classes rather than measured server-side.",
-            "Operational rollback is tested by remounting the retained original volume with the separately qualified rollback-rescue reader; candidate archive restore separately tests disaster recovery. Neither path authorizes production deployment.",
+            "Operational rollback is tested by updating the retained baseline Machine in place to the separately qualified rollback-rescue reader while keeping its original volume attached; candidate archive restore separately tests disaster recovery. Neither path authorizes production deployment.",
             "Historical correction: runs 30290534176 and 30302595011 stopped at hard-delete verification, not rollback. A -32000 tool-level 'engram not found' response is the hard-delete pass condition; protocol faults still fail closed.",
+            "The retained Machine removes the late new-Machine placement race observed in run 30334224252. Its rescue-image update is still a documented reboot, so a rollback result proves this run's pinned-host path, not an unconditional Fly capacity guarantee.",
         ])
 
     def test_volume_command_is_encrypted_twenty_gb_and_unscheduled(self):
@@ -394,6 +396,52 @@ class StageAContractTests(unittest.TestCase):
         command = calls[0]; config = json.loads(command[command.index("--machine-config") + 1])
         self.assertEqual(config["services"], []); self.assertEqual(config["guest"], {"cpu_kind": "performance", "cpus": 16, "memory_mb": 32768})
         self.assertIn("--skip-dns-registration", command)
+
+    def test_retained_baseline_supervises_server_and_rescue_updates_same_machine(self):
+        identity = stage.build_identity("retained-machine")
+        calls = []
+        def runner(cmd, **kwargs):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, "Machine ID: abcdef12345678\n", "")
+        runtime = stage.FlyRuntime(runner=runner)
+        machine_id = runtime.create_machine(
+            identity, "vol_test", stage.BASELINE_IMAGE, "retained-baseline")
+        create_config = json.loads(calls[-1][calls[-1].index("--machine-config") + 1])
+        self.assertEqual(machine_id, "abcdef12345678")
+        self.assertEqual(create_config["metadata"]["role"], "retained-baseline")
+        self.assertEqual(create_config["init"]["exec"][:2], ["/bin/sh", "-c"])
+        self.assertIn("wait $pid; exec sleep infinity", create_config["init"]["exec"][2])
+        runtime.rollback_rescue_ref = stage.ROLLBACK_RESCUE_IMAGE
+        runtime.update_machine(
+            identity, machine_id, "vol_test", stage.ROLLBACK_RESCUE_IMAGE, "rollback")
+        update = calls[-1]
+        self.assertEqual(update[:4], ["flyctl", "machine", "update", machine_id])
+        self.assertNotIn("--detach", update)
+        self.assertEqual(
+            update[update.index("--wait-timeout") + 1],
+            str(math.ceil(stage.READINESS_LIMIT_S)),
+        )
+        update_config = json.loads(update[update.index("--machine-config") + 1])
+        self.assertEqual(update_config["image"], stage.ROLLBACK_RESCUE_IMAGE)
+        self.assertEqual(update_config["metadata"]["role"], "rollback")
+        self.assertEqual(update_config["mounts"], create_config["mounts"])
+        self.assertEqual(update_config["guest"], create_config["guest"])
+
+    def test_quiesce_baseline_stops_only_server_and_requires_running_machine(self):
+        identity = stage.build_identity("quiesce-baseline")
+        calls = []
+        responses = iter(["", json.dumps([{"id": "m1", "state": "started"}])])
+        def runner(cmd, **kwargs):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, next(responses), "")
+        stage.FlyRuntime(runner=runner).quiesce_baseline(identity, "m1")
+        quiesce = calls[0]
+        self.assertEqual(quiesce[:4], ["flyctl", "machine", "exec", "m1"])
+        self.assertIn("kill -TERM $pid", quiesce[-1])
+        self.assertIn("sync", quiesce[-1])
+        self.assertIn("test ! -d /proc/$pid", quiesce[-1])
+        self.assertNotIn("pidof", quiesce[-1])
+        self.assertFalse(any(call[1:3] == ["machine", "stop"] for call in calls))
 
     def test_migration_sampler_captures_disk_and_process_resources(self):
         identity = stage.build_identity("sample-test"); runtime = mock.Mock()
@@ -622,6 +670,7 @@ class StageAContractTests(unittest.TestCase):
         runtime.provisioning_probe.return_value = "machine_probe"
         runtime.proxy.return_value = mock.Mock(poll=mock.Mock(return_value=0))
         runtime.disk_sample.return_value = stage.DiskSample("empty", 100, 900, 1000)
+        runtime.owned_machines.return_value = []
         runtime.list_owned_resources.return_value = []
         runtime.resource_sample.side_effect = stage.RehearsalUnknown("missing MuninnDB process measurement; processes present: init,hallpass")
         client = mock.Mock()
@@ -635,6 +684,13 @@ class StageAContractTests(unittest.TestCase):
         client.call.assert_not_called()
         runtime.migration_samples.assert_not_called()
         self.assertEqual(runtime.resource_sample.call_args.args[2], "baseline-serving")
+        self.assertEqual(
+            runtime.destroy_machine.call_args_list.count(
+                mock.call(identity, "machine_owned")
+            ),
+            1,
+            "a baseline-phase exception destroyed the retained Machine more than once",
+        )
         self.assertEqual(document["orphans"], [])
 
     def test_process_inventory_probe_filters_kernel_threads_by_parentage(self):
@@ -920,6 +976,7 @@ class StageAContractTests(unittest.TestCase):
     def test_execute_refuses_opaque_spec_before_fly_mutation(self):
         identity = stage.build_identity("opaque-refusal")
         runtime = mock.Mock()
+        runtime.owned_machines.return_value = []
         runtime.list_owned_resources.return_value = []
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / "refusal.json"
@@ -943,6 +1000,7 @@ class StageAContractTests(unittest.TestCase):
         runtime.create_machine(identity, "vol_test", stage.BASELINE_IMAGE, "baseline")
         runtime.create_machine(identity, "vol_test", stage.CANDIDATE_IMAGE, "candidate")
         runtime.create_machine(identity, "vol_test", stage.ROLLBACK_RESCUE_IMAGE, "rollback")
+        runtime.create_machine(identity, "vol_test", stage.BASELINE_IMAGE, "retained-baseline")
         with self.assertRaises(stage.RehearsalUnknown):
             runtime.create_machine(identity, "vol_test", stage.CANDIDATE_IMAGE, "unrecognized")
         for role, substituted in (
@@ -1076,6 +1134,7 @@ class StageAContractTests(unittest.TestCase):
     def test_execute_mirrors_candidate_before_provisioning_or_ingestion(self):
         identity = stage.build_identity("mirror-order")
         runtime = mock.Mock()
+        runtime.owned_machines.return_value = []
         runtime.list_owned_resources.return_value = []
         runtime.owned_machine_ids.return_value = []
         runtime.create_app.return_value = identity.app_name
@@ -1795,7 +1854,7 @@ class StageAContractTests(unittest.TestCase):
         snapshot = "ledger.snapshot_id = runtime.snapshot(identity, ledger.volume_id)"
         clone = "ledger.candidate_volume_id = runtime.create_volume("
         candidate = "ledger.candidate_volume_id, candidate_ref, \"candidate\""
-        rollback = "ledger.volume_id, rollback_rescue_ref, \"rollback\""
+        rollback = "ledger.retained_machine_id, ledger.volume_id, rollback_rescue_ref, \"rollback\""
         self.assertIn(snapshot, source)
         self.assertIn(clone, source)
         self.assertIn("identity.candidate_volume_name", source)
@@ -1806,6 +1865,8 @@ class StageAContractTests(unittest.TestCase):
         self.assertLess(source.index(clone), source.index(candidate))
         self.assertLess(source.index(candidate), source.index(rollback))
         self.assertNotIn("ledger.rollback_volume_id = runtime.create_volume", source)
+        self.assertNotIn('runtime.create_machine(\n            identity, ledger.volume_id, rollback_rescue_ref, "rollback")', source)
+        self.assertIn("runtime.quiesce_baseline(identity, ledger.retained_machine_id)", source)
 
     def test_all_candidate_mutations_use_the_candidate_clone(self):
         source = inspect.getsource(stage.execute)
@@ -1820,7 +1881,7 @@ class StageAContractTests(unittest.TestCase):
         for call in required:
             self.assertIn(call, source)
         original_snapshot = source.index("ledger.snapshot_id = runtime.snapshot(identity, ledger.volume_id)")
-        rollback = source.index('ledger.volume_id, rollback_rescue_ref, "rollback"')
+        rollback = source.index('ledger.retained_machine_id, ledger.volume_id, rollback_rescue_ref, "rollback"')
         between = source[original_snapshot:rollback]
         self.assertEqual(
             between.count("ledger.volume_id"),
@@ -1831,7 +1892,10 @@ class StageAContractTests(unittest.TestCase):
     def test_plan_and_receipt_disclose_retained_original_rollback(self):
         identity = stage.build_identity("topology-plan")
         rendered = stage.plan(identity, stage.CorpusSpec(payload_shape="lexical"))
-        self.assertEqual(rendered["rollback_qualification"]["topology"], "retained-original-volume")
+        self.assertEqual(
+            rendered["rollback_qualification"]["topology"],
+            "retained-running-machine-and-original-volume",
+        )
         self.assertEqual(rendered["rollback_qualification"]["rollback_rescue_image"], stage.ROLLBACK_RESCUE_IMAGE)
         self.assertEqual(rendered["rollback_qualification"]["rollback_rescue_digest"], stage.ROLLBACK_RESCUE_DIGEST)
         self.assertEqual(
@@ -1868,12 +1932,16 @@ class StageAContractTests(unittest.TestCase):
             document["images"]["rollback_rescue_role"],
             "retained-original rollback rescue reader",
         )
-        self.assertTrue(any("retained original" in item for item in document["limitations"]))
+        self.assertTrue(any(
+            "retained baseline Machine" in item and "original volume attached" in item
+            for item in document["limitations"]
+        ))
         self.assertFalse(any("rollback failure IS remains open" in item for item in document["limitations"]))
 
     def test_candidate_volume_is_discovered_and_cleaned_independently(self):
         identity = stage.build_identity("candidate-cleanup")
         runtime = mock.Mock()
+        runtime.owned_machines.return_value = []
         runtime.list_owned_resources.return_value = []
         ledger = stage.ResourceLedger(
             candidate_volume_id="vol_candidate",
@@ -1990,7 +2058,8 @@ class StageAContractTests(unittest.TestCase):
 
     def test_cleanup_uncertainty_forces_orphan(self):
         identity = stage.build_identity("cleanup-test"); runtime = mock.Mock()
-        runtime.destroy_machine.side_effect = RuntimeError("fail"); runtime.list_owned_resources.return_value = []
+        runtime.destroy_machine.side_effect = RuntimeError("fail"); runtime.owned_machines.return_value = []
+        runtime.list_owned_resources.return_value = []
         with mock.patch.object(stage, "DESTROY_RETRY_DELAY_S", 0):
             results, orphans = stage.cleanup(runtime, identity, stage.ResourceLedger(machine_id="owned-machine"))
         self.assertEqual(orphans, ["owned-machine"])
@@ -2000,6 +2069,7 @@ class StageAContractTests(unittest.TestCase):
     def test_a_transient_destroy_failure_is_retried_instead_of_leaking(self):
         identity = stage.build_identity("cleanup-retry"); runtime = mock.Mock()
         runtime.destroy_volume.side_effect = [RuntimeError("volume still attached"), None]
+        runtime.owned_machines.return_value = []
         runtime.list_owned_resources.return_value = []
         with mock.patch.object(stage, "DESTROY_RETRY_DELAY_S", 0):
             results, orphans = stage.cleanup(
@@ -2011,7 +2081,7 @@ class StageAContractTests(unittest.TestCase):
 
     def test_cleanup_destroys_a_machine_the_ledger_never_learned_of(self):
         identity = stage.build_identity("cleanup-recover"); runtime = mock.Mock()
-        runtime.owned_machine_ids.return_value = ["6835102a46d3e8"]
+        runtime.owned_machines.return_value = [("6835102a46d3e8", "restore-copy")]
         runtime.list_owned_resources.return_value = []
         results, orphans = stage.cleanup(
             runtime, identity,
@@ -2027,9 +2097,9 @@ class StageAContractTests(unittest.TestCase):
         production = next(iter(stage.PRODUCTION_MACHINE_IDS))
         def runner(cmd, **kwargs):
             return subprocess.CompletedProcess(cmd, 0, json.dumps([
-                {"id": "mine", "config": {"metadata": {"koala_stage_a_run": identity.run_id}}},
-                {"id": "theirs", "config": {"metadata": {"koala_stage_a_run": "other-run"}}},
-                {"id": production, "config": {"metadata": {"koala_stage_a_run": identity.run_id}}},
+                {"id": "mine", "config": {"metadata": {"koala_stage_a_run": identity.run_id, "role": "candidate"}}},
+                {"id": "theirs", "config": {"metadata": {"koala_stage_a_run": "other-run", "role": "candidate"}}},
+                {"id": production, "config": {"metadata": {"koala_stage_a_run": identity.run_id, "role": "candidate"}}},
                 {"id": "nometa", "config": None},
             ]), "")
         self.assertEqual(stage.FlyRuntime(runner=runner).owned_machine_ids(identity), ["mine"])
@@ -2073,7 +2143,10 @@ class StageAContractTests(unittest.TestCase):
             if cmd[1] == "status": return subprocess.CompletedProcess(cmd, 0, "ok", "")
             if "machines" in cmd:
                 return subprocess.CompletedProcess(cmd, 0, json.dumps([{
-                    "id": "ownedmachine", "config": {"metadata": {"koala_stage_a_run": identity.run_id}},
+                    "id": "ownedmachine", "config": {"metadata": {
+                        "koala_stage_a_run": identity.run_id,
+                        "role": "candidate",
+                    }},
                 }]), "")
             if "volumes" in cmd:
                 return subprocess.CompletedProcess(cmd, 0, json.dumps([{
@@ -2084,6 +2157,108 @@ class StageAContractTests(unittest.TestCase):
         self.assertEqual(discovered.machine_id, "ownedmachine")
         self.assertEqual(discovered.volume_id, "vol_owned")
         self.assertEqual(discovered.app, identity.app_name)
+
+    def test_cleanup_discovery_maps_retained_and_active_machine_roles(self):
+        identity = stage.build_identity("discover-two-machines")
+        def runner(cmd, **kwargs):
+            if cmd[1] == "status": return subprocess.CompletedProcess(cmd, 0, "ok", "")
+            if "machines" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, json.dumps([
+                    {"id": "retained", "config": {"metadata": {
+                        "koala_stage_a_run": identity.run_id, "role": "retained-baseline"}}},
+                    {"id": "active", "config": {"metadata": {
+                        "koala_stage_a_run": identity.run_id, "role": "candidate"}}},
+                ]), "")
+            if "volumes" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, json.dumps([
+                    {"id": "original", "name": identity.volume_name},
+                    {"id": "candidate", "name": identity.candidate_volume_name},
+                ]), "")
+            raise AssertionError(cmd)
+        discovered = stage.FlyRuntime(runner=runner).discover_owned_resources(identity)
+        self.assertEqual(discovered.retained_machine_id, "retained")
+        self.assertEqual(discovered.machine_id, "active")
+        self.assertEqual(discovered.volume_id, "original")
+        self.assertEqual(discovered.candidate_volume_id, "candidate")
+
+    def test_cleanup_discovery_rejects_unknown_or_duplicate_machine_roles(self):
+        identity = stage.build_identity("discover-invalid-two")
+        for roles in (("mystery",), ("candidate", "restore"),
+                      ("retained-baseline", "rollback")):
+            def runner(cmd, **kwargs):
+                if cmd[1] == "status": return subprocess.CompletedProcess(cmd, 0, "ok", "")
+                if "machines" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, json.dumps([
+                        {"id": f"m{index}", "config": {"metadata": {
+                            "koala_stage_a_run": identity.run_id, "role": role}}}
+                        for index, role in enumerate(roles)
+                    ]), "")
+                return subprocess.CompletedProcess(cmd, 0, "[]", "")
+            with self.assertRaises(stage.RehearsalUnknown):
+                stage.FlyRuntime(runner=runner).discover_owned_resources(identity)
+
+    def test_cleanup_duplicate_machine_slots_destroy_once_and_fail_closed(self):
+        identity = stage.build_identity("cleanup-duplicate-slots")
+        runtime = mock.Mock()
+        runtime.owned_machines.return_value = [
+            ("same-machine", "retained-baseline")]
+        runtime.list_owned_resources.return_value = []
+        results, orphans = stage.cleanup(runtime, identity, stage.ResourceLedger(
+            app=identity.app_name,
+            retained_machine_id="same-machine",
+            machine_id="same-machine",
+        ))
+        self.assertEqual(
+            runtime.destroy_machine.call_args_list,
+            [mock.call(identity, "same-machine")],
+        )
+        self.assertEqual(results["machine_id"], "not_created")
+        self.assertEqual(results["retained_machine_id"], "destroyed")
+        self.assertIn("same-machine:duplicate-machine-ledger-slots", orphans)
+
+    def test_cleanup_destroys_retained_and_active_machines_before_volumes(self):
+        identity = stage.build_identity("cleanup-two-machines")
+        runtime = mock.Mock()
+        runtime.owned_machines.return_value = [
+            ("retained", "retained-baseline"), ("active", "candidate")]
+        runtime.list_owned_resources.return_value = []
+        results, orphans = stage.cleanup(runtime, identity, stage.ResourceLedger(
+            app=identity.app_name,
+            retained_machine_id="retained",
+            machine_id="active",
+            volume_id="original",
+            candidate_volume_id="candidate",
+        ))
+        self.assertEqual(orphans, [])
+        self.assertEqual(results["retained_machine_id"], "destroyed")
+        self.assertEqual(results["machine_id"], "destroyed")
+        expected = [
+            mock.call(identity, "active"),
+            mock.call(identity, "retained"),
+        ]
+        self.assertEqual(runtime.destroy_machine.call_args_list, expected)
+        runtime.destroy_volume.assert_has_calls([
+            mock.call(identity, "candidate"),
+            mock.call(identity, "original"),
+        ])
+
+    def test_cleanup_unknown_third_machine_is_destroyed_but_fails_closed(self):
+        identity = stage.build_identity("cleanup-third-machine")
+        runtime = mock.Mock()
+        runtime.owned_machines.return_value = [
+            ("retained", "retained-baseline"),
+            ("active", "candidate"),
+            ("third", "backup"),
+        ]
+        runtime.list_owned_resources.return_value = []
+        results, orphans = stage.cleanup(runtime, identity, stage.ResourceLedger(
+            app=identity.app_name,
+            retained_machine_id="retained",
+            machine_id="active",
+        ))
+        self.assertIn("third:unexpected-machine-topology", orphans)
+        self.assertEqual(results["unexpected_machine_third"], "destroyed")
+        self.assertIn(mock.call(identity, "third"), runtime.destroy_machine.call_args_list)
 
     def test_cleanup_discovery_refuses_wrong_metadata_or_volume_name(self):
         identity = stage.build_identity("discover-bad")
@@ -2108,6 +2283,7 @@ class StageAContractTests(unittest.TestCase):
         identity = stage.build_identity("cleanup-only")
         runtime = mock.Mock()
         runtime.discover_owned_resources.return_value = stage.ResourceLedger()
+        runtime.owned_machines.return_value = []
         runtime.list_owned_resources.return_value = []
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / "cleanup.json"
@@ -2180,6 +2356,7 @@ class StageAContractTests(unittest.TestCase):
         runtime.create_machine.return_value = "machine_owned"
         runtime.proxy.return_value = mock.Mock(poll=mock.Mock(return_value=0))
         runtime.disk_sample.return_value = stage.DiskSample("empty", 100, 900, 1000)
+        runtime.owned_machines.return_value = []
         runtime.list_owned_resources.return_value = []
         client = mock.Mock()
         client.initialize.side_effect = stage.RehearsalUnknown("rehearsal terminated by signal 15")
@@ -2212,6 +2389,7 @@ class StageAContractTests(unittest.TestCase):
             kill=mock.Mock(side_effect=OSError("kill failed")),
         )
         runtime.disk_sample.return_value = stage.DiskSample("empty", 100, 900, 1000)
+        runtime.owned_machines.return_value = []
         runtime.list_owned_resources.return_value = []
         client = mock.Mock()
         client.initialize.side_effect = stage.RehearsalUnknown("interrupted")
@@ -2239,6 +2417,7 @@ class StageAContractTests(unittest.TestCase):
         runtime.create_volume.return_value = "vol_owned"
         runtime.create_machine.return_value = "machine_owned"
         runtime.disk_sample.return_value = stage.DiskSample("empty", 100, 900, 1000)
+        runtime.owned_machines.return_value = []
         runtime.list_owned_resources.return_value = []
         runtime.destroy_volume.side_effect = RuntimeError("volume still attached")
         client = mock.Mock()
@@ -2280,6 +2459,7 @@ class StageAContractTests(unittest.TestCase):
             stage.DiskSample("high-empty", 110 * 1024**2, 19 * gib, 20 * gib),
             stage.DiskSample("high", 385 * 1024**2, 17 * gib, 20 * gib),
         ]
+        runtime.owned_machines.return_value = []
         runtime.list_owned_resources.return_value = []
         client = mock.Mock()
         receipts = [
@@ -2434,6 +2614,7 @@ class StageAContractTests(unittest.TestCase):
                 stage.DiskSample("immediate", 150, 850, 1000),
             )
         ]
+        runtime.owned_machines.return_value = []
         runtime.list_owned_resources.return_value = []
         runtime.owned_machine_ids.return_value = []
         receipt = stage.CorpusReceipt(submitted=25000, accepted=25000, batches=500, manifest_sha256="a" * 64)
@@ -2476,6 +2657,7 @@ class StageAContractTests(unittest.TestCase):
             stage.DiskSample("immediate", 150, 850, 1000),
             stage.DiskSample("empty", 100, 900, 1000),
         ]
+        runtime.owned_machines.return_value = []
         runtime.list_owned_resources.return_value = []
         complete = stage.CorpusReceipt(25000, 25000, 500, "a" * 64)
         progress = stage.IngestProgress(100, 100, 2, 1.0, {"count": 2})
@@ -2602,6 +2784,7 @@ class StageAContractTests(unittest.TestCase):
         """The probe is a mode, not a smaller run of the same mode, and it proves that early."""
         identity = stage.build_identity("probe-corpus")
         runtime = mock.Mock()
+        runtime.owned_machines.return_value = []
         runtime.list_owned_resources.return_value = []
         runtime.owned_machine_ids.return_value = []
         with tempfile.TemporaryDirectory() as root:
@@ -2667,6 +2850,7 @@ class StageAContractTests(unittest.TestCase):
         runtime.create_machine.return_value = "machine_probe"
         runtime.disk_sample.return_value = stage.DiskSample("baseline-empty", 100 * 1024**2, 19 * gib, 20 * gib)
         runtime.resource_sample.return_value = stage.ResourceSample("baseline-serving", 5.0, 1024)
+        runtime.owned_machines.return_value = []
         runtime.list_owned_resources.return_value = []
         seen: dict[str, object] = {}
         def fake_ingest(_client, _cohort, **kwargs):

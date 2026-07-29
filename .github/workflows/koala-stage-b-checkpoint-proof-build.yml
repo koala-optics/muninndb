@@ -1,0 +1,262 @@
+name: Koala Stage B Checkpoint Proof Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      helper_commit:
+        description: Exact 40-character Koala commit containing the helper
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: koala-stage-b-checkpoint-proof-build
+  cancel-in-progress: false
+
+env:
+  BASELINE_SOURCE_COMMIT: be975fb1215e75208adf4b340ba95e21415f04cb
+  BASELINE_IMAGE: registry.fly.io/koala-muninndb@sha256:c06842e1452f2aab4c1f01207adf9406bfe757b4984da516568006f1f5c8ad86
+  BASELINE_DIGEST: sha256:c06842e1452f2aab4c1f01207adf9406bfe757b4984da516568006f1f5c8ad86
+  HELPER_IMAGE: ghcr.io/koala-optics/muninndb:stage-b-checkpoint-proof-v1-amd64
+  HELPER_DOCKERFILE_PATH: scripts/patches/koala-stage-b-checkpoint-proof.Dockerfile
+  EXPECTED_HELPER_DOCKERFILE_SHA256: 5d05e25d5be292ad6572c75ee427bba5041eec4904f499753bdba81c8c6e548d
+  RECEIPT_DIR: /tmp/koala-stage-b-checkpoint-proof
+
+jobs:
+  build:
+    name: Build pinned checkpoint verifier helper
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Validate repository and immutable inputs
+        shell: bash
+        env:
+          REPOSITORY: ${{ github.repository }}
+          HELPER_COMMIT: ${{ inputs.helper_commit }}
+        run: |
+          set -euo pipefail
+          test "$REPOSITORY" = "koala-optics/muninndb"
+          [[ "$HELPER_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$BASELINE_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$BASELINE_IMAGE" = "registry.fly.io/koala-muninndb@$BASELINE_DIGEST" ]]
+          [[ "$BASELINE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$HELPER_IMAGE" = ghcr.io/koala-optics/muninndb:stage-b-checkpoint-proof-* ]]
+
+      - name: Check out exact helper ref
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.helper_commit }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify helper source and Dockerfile
+        shell: bash
+        env:
+          HELPER_COMMIT: ${{ inputs.helper_commit }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$HELPER_COMMIT"
+          test -f "$HELPER_DOCKERFILE_PATH"
+          test -f cmd/koala-stage-b-checkpoint-proof/main.go
+          test -f cmd/koala-stage-b-checkpoint-proof/main_test.go
+          dockerfile_sha256="$(sha256sum "$HELPER_DOCKERFILE_PATH" | awk '{print $1}')"
+          test "$dockerfile_sha256" = "$EXPECTED_HELPER_DOCKERFILE_SHA256"
+          mkdir -p "$RECEIPT_DIR"
+          printf '%s\n' "$dockerfile_sha256" > "$RECEIPT_DIR/helper-dockerfile.sha256"
+          printf 'HELPER_DOCKERFILE_SHA256=%s\n' "$dockerfile_sha256" >> "$GITHUB_ENV"
+
+      - name: Set up exact Go toolchain
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Run standalone verifier tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./cmd/koala-stage-b-checkpoint-proof
+          go vet ./cmd/koala-stage-b-checkpoint-proof
+          git diff --check
+
+      - name: Install pinned crane
+        shell: bash
+        env:
+          CRANE_VERSION: v0.21.7
+          CRANE_SHA256: 1a57bc98207fa1c0d04bf760699099e26f8383499bfd55b99c1b919a928a7230
+        run: |
+          set -euo pipefail
+          archive="go-containerregistry_Linux_x86_64.tar.gz"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/${archive}" \
+            --output "/tmp/${archive}"
+          printf '%s  %s\n' "$CRANE_SHA256" "/tmp/${archive}" | sha256sum --check --strict
+          tar -xzf "/tmp/${archive}" -C /usr/local/bin crane
+          crane version
+
+      - name: Authenticate exact baseline and helper registries
+        shell: bash
+        env:
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GHCR_TOKEN" | crane auth login ghcr.io --username "$GHCR_USERNAME" --password-stdin
+          printf '%s' "$FLY_API_TOKEN" | crane auth login registry.fly.io --username x --password-stdin
+
+      - name: Pull and fingerprint exact baseline binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(crane digest "$BASELINE_IMAGE")" = "$BASELINE_DIGEST"
+          crane export "$BASELINE_IMAGE" "$RECEIPT_DIR/baseline-rootfs.tar"
+          baseline_member="$(tar -tf "$RECEIPT_DIR/baseline-rootfs.tar" | grep -E '^\.?/?usr/local/bin/muninndb-server$')"
+          test "$(printf '%s\n' "$baseline_member" | wc -l)" -eq 1
+          tar -xOf "$RECEIPT_DIR/baseline-rootfs.tar" "$baseline_member" > "$RECEIPT_DIR/muninndb-server"
+          test -s "$RECEIPT_DIR/muninndb-server"
+          baseline_binary_sha256="$(sha256sum "$RECEIPT_DIR/muninndb-server" | awk '{print $1}')"
+          [[ "$baseline_binary_sha256" =~ ^[0-9a-f]{64}$ ]]
+          printf '%s\n' "$baseline_binary_sha256" > "$RECEIPT_DIR/baseline-binary.sha256"
+          printf 'BASELINE_BINARY_SHA256=%s\n' "$baseline_binary_sha256" >> "$GITHUB_ENV"
+          rm "$RECEIPT_DIR/baseline-rootfs.tar" "$RECEIPT_DIR/muninndb-server"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+
+      - name: Log in to Koala GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish separately named helper image
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: .
+          file: ${{ env.HELPER_DOCKERFILE_PATH }}
+          push: true
+          platforms: linux/amd64
+          tags: ${{ env.HELPER_IMAGE }}
+          provenance: mode=max
+          sbom: true
+          no-cache: true
+          build-args: |
+            BASELINE_BINARY_SHA256=${{ env.BASELINE_BINARY_SHA256 }}
+            HELPER_SOURCE_COMMIT=${{ inputs.helper_commit }}
+          labels: |
+            org.opencontainers.image.revision=${{ inputs.helper_commit }}
+            org.opencontainers.image.version=stage-b-checkpoint-proof-v1
+            org.opencontainers.image.source=https://github.com/koala-optics/muninndb
+            io.koala.stage-b.artifact-role=checkpoint-proof-helper-not-serving-image
+            io.koala.stage-b.baseline.source=${{ env.BASELINE_SOURCE_COMMIT }}
+            io.koala.stage-b.baseline.digest=${{ env.BASELINE_DIGEST }}
+            io.koala.stage-b.baseline.binary.sha256=${{ env.BASELINE_BINARY_SHA256 }}
+            io.koala.stage-b.dockerfile.sha256=${{ env.HELPER_DOCKERFILE_SHA256 }}
+
+      - name: Run non-production full-corpus witness
+        shell: bash
+        env:
+          BUILD_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$BUILD_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          witness_image="ghcr.io/koala-optics/muninndb@$BUILD_DIGEST"
+          witness_root="$RECEIPT_DIR/witness"
+          mkdir -p "$witness_root"
+          chmod 0700 "$witness_root"
+          KOALA_CHECKPOINT_WITNESS_FIXTURE="$witness_root/source" \
+            go test ./cmd/koala-stage-b-checkpoint-proof -run '^TestWriteNonProductionWitnessFixture$' -count=1
+          docker run --rm --network none \
+            --user "$(id -u):$(id -g)" \
+            -v "$witness_root:/witness" "$witness_image" \
+            --source-root /witness/source \
+            --checkpoint-root /witness/source/stage-b-checkpoint \
+            --receipt /witness/private-proof.json \
+            > "$witness_root/public-summary.json"
+          test "$(stat -c '%a' "$witness_root/private-proof.json")" = 600
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          root = Path("/tmp/koala-stage-b-checkpoint-proof/witness")
+          summary = json.loads((root / "public-summary.json").read_text())
+          if summary != {
+              "valid": True,
+              "source_stable": True,
+              "database_equal": True,
+              "auxiliary_equal": True,
+              "receipt_sha256": summary.get("receipt_sha256"),
+          }:
+              raise SystemExit("non-production witness summary failed closed")
+          if not isinstance(summary["receipt_sha256"], str) or len(summary["receipt_sha256"]) != 64:
+              raise SystemExit("non-production witness receipt hash is malformed")
+          private = json.loads((root / "private-proof.json").read_text())
+          if private["source_before"]["pebble"]["key_count"] != 502385:
+              raise SystemExit("witness did not scan the full qualified record count")
+          if not private["equality"]["all"]:
+              raise SystemExit("witness private receipt did not prove equality")
+          PY
+          sha256sum "$witness_root/public-summary.json" | awk '{print $1}' > "$RECEIPT_DIR/witness-public-summary.sha256"
+          sha256sum "$witness_root/private-proof.json" | awk '{print $1}' > "$RECEIPT_DIR/witness-private-receipt.sha256"
+
+      - name: Write immutable provenance receipt
+        shell: bash
+        env:
+          BUILD_DIGEST: ${{ steps.build.outputs.digest }}
+          HELPER_COMMIT: ${{ inputs.helper_commit }}
+        run: |
+          set -euo pipefail
+          [[ "$BUILD_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          test "$(docker buildx imagetools inspect "$HELPER_IMAGE" --format '{{json .Manifest.Digest}}' | tr -d '"')" = "$BUILD_DIGEST"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          directory = Path("/tmp/koala-stage-b-checkpoint-proof")
+          digest = os.environ["BUILD_DIGEST"]
+          receipt = {
+              "schema_version": "koala-muninn-stage-b-checkpoint-proof-provenance-v1",
+              "artifact_role": "offline checkpoint proof helper; never a production serving image",
+              "artifact_identity": f"ghcr.io/koala-optics/muninndb@{digest}",
+              "artifact_digest": digest,
+              "artifact_tag": os.environ["HELPER_IMAGE"],
+              "helper_source_commit": os.environ["HELPER_COMMIT"],
+              "helper_dockerfile_path": os.environ["HELPER_DOCKERFILE_PATH"],
+              "helper_dockerfile_sha256": (directory / "helper-dockerfile.sha256").read_text().strip(),
+              "baseline_source_commit": os.environ["BASELINE_SOURCE_COMMIT"],
+              "baseline_image": os.environ["BASELINE_IMAGE"],
+              "baseline_digest": os.environ["BASELINE_DIGEST"],
+              "baseline_binary_sha256": (directory / "baseline-binary.sha256").read_text().strip(),
+              "witness_public_summary_sha256": (directory / "witness-public-summary.sha256").read_text().strip(),
+              "witness_private_receipt_sha256": (directory / "witness-private-receipt.sha256").read_text().strip(),
+          }
+          path = directory / "provenance.json"
+          path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+          PY
+          sha256sum "$RECEIPT_DIR/provenance.json" | awk '{print $1}' > "$RECEIPT_DIR/provenance.sha256"
+
+      - name: Remove private witness bodies
+        if: always()
+        shell: bash
+        run: |
+          rm -rf "$RECEIPT_DIR/witness"
+
+      - name: Upload safe helper receipts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: koala-stage-b-checkpoint-proof-v1-amd64
+          path: |
+            /tmp/koala-stage-b-checkpoint-proof/helper-dockerfile.sha256
+            /tmp/koala-stage-b-checkpoint-proof/baseline-binary.sha256
+            /tmp/koala-stage-b-checkpoint-proof/witness-public-summary.sha256
+            /tmp/koala-stage-b-checkpoint-proof/witness-private-receipt.sha256
+            /tmp/koala-stage-b-checkpoint-proof/provenance.json
+            /tmp/koala-stage-b-checkpoint-proof/provenance.sha256
+          if-no-files-found: warn
+          retention-days: 30

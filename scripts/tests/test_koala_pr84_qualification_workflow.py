@@ -92,6 +92,7 @@ class PR84QualificationWorkflowTests(unittest.TestCase):
             "go vet -tags localassets ./...",
             "go test -tags localassets ./... -timeout 300s -race",
             "go test -tags localassets,integration -v -timeout 120s ./cmd/muninn/...",
+            "go test -tags localassets,integration -v -timeout 120s ./internal/plugin/embed/...",
         ):
             self.assertIn(command, job)
         self.assertIn("permissions:\n      contents: read", job)

@@ -2,10 +2,15 @@ package keys
 
 import (
 	"bytes"
+	"context"
+	"os"
+	"os/exec"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/text/unicode/norm"
 
 	"github.com/scrypster/muninndb/internal/prefix"
 )
@@ -264,6 +269,30 @@ func TestEntityNameHash_Normalizes(t *testing.T) {
 	hA := EntityNameHash("Alice")
 	hB := EntityNameHash("Bob")
 	require.NotEqual(t, hA, hB)
+}
+
+func TestNormalizeEntityName_InvalidUTF8(t *testing.T) {
+	if os.Getenv("MUNINN_INVALID_UTF8_WITNESS") == "1" {
+		// GO-2026-5970: this malformed sequence hung norm.Iter before x/text v0.39.0.
+		input := "\xf3\xcc\x80"
+		var iter norm.Iter
+		iter.InitString(norm.NFKC, input)
+		for !iter.Done() {
+			iter.Next()
+		}
+		require.Equal(t, "�̀", NormalizeEntityName(input))
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestNormalizeEntityName_InvalidUTF8$")
+	cmd.Env = append(os.Environ(), "MUNINN_INVALID_UTF8_WITNESS=1")
+	err := cmd.Run()
+	if ctx.Err() == context.DeadlineExceeded {
+		t.Fatal("normalization did not terminate for malformed UTF-8")
+	}
+	require.NoError(t, err)
 }
 
 func TestEntityKeyLayout(t *testing.T) {

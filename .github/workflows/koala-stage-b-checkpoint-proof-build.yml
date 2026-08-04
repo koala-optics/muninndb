@@ -311,11 +311,35 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Fetch local embed assets
+      - name: Fetch immutable hash-checked local embed assets
         shell: bash
+        env:
+          MODEL_URL: https://huggingface.co/Xenova/bge-small-en-v1.5/resolve/ea104dacec62c0de699686887e3f920caeb4f3e3/onnx/model_int8.onnx
+          MODEL_SHA256: bf64d05457cb391fa88d045faf5927a15ea36d96228ddf23ea970087afdc1197
+          TOKENIZER_URL: https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/5c38ec7c405ec4b44b94cc5a9bb96e735b38267a/tokenizer.json
+          TOKENIZER_SHA256: d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66
+          ORT_URL: https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-linux-x64-1.24.2.tgz
+          ORT_SHA256: 43725474ba5663642e17684717946693850e2005efbd724ac72da278fead25e6
         run: |
           set -euo pipefail
-          make fetch-model _ort-linux-amd64
+          asset_dir=internal/plugin/embed/assets
+          mkdir -p "$asset_dir"
+          curl --fail --location --silent --show-error \
+            "$MODEL_URL" --output "$asset_dir/model_int8.onnx"
+          printf '%s  %s\n' "$MODEL_SHA256" "$asset_dir/model_int8.onnx" | \
+            sha256sum --check --strict
+          curl --fail --location --silent --show-error \
+            "$TOKENIZER_URL" --output "$asset_dir/tokenizer.json"
+          printf '%s  %s\n' "$TOKENIZER_SHA256" "$asset_dir/tokenizer.json" | \
+            sha256sum --check --strict
+          curl --fail --location --silent --show-error \
+            "$ORT_URL" --output /tmp/onnxruntime-linux-x64.tgz
+          printf '%s  %s\n' "$ORT_SHA256" /tmp/onnxruntime-linux-x64.tgz | \
+            sha256sum --check --strict
+          tar -xzf /tmp/onnxruntime-linux-x64.tgz -C /tmp \
+            onnxruntime-linux-x64-1.24.2/lib/libonnxruntime.so.1.24.2
+          cp /tmp/onnxruntime-linux-x64-1.24.2/lib/libonnxruntime.so.1.24.2 \
+            "$asset_dir/libonnxruntime_linux_amd64.so"
 
       - name: Build web assets
         shell: bash

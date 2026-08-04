@@ -51,6 +51,26 @@ class PR84QualificationWorkflowTests(unittest.TestCase):
         self.assertIn("persist-credentials: false", job)
         self.assertNotRegex(job, r"uses: [^\n]+@v[0-9]")
 
+    def test_qualification_assets_are_immutable_and_hash_checked(self):
+        job = self.qualification_job()
+        self.assertIn(
+            "resolve/ea104dacec62c0de699686887e3f920caeb4f3e3/onnx/model_int8.onnx",
+            job,
+        )
+        self.assertIn(
+            "resolve/5c38ec7c405ec4b44b94cc5a9bb96e735b38267a/tokenizer.json",
+            job,
+        )
+        for digest in (
+            "bf64d05457cb391fa88d045faf5927a15ea36d96228ddf23ea970087afdc1197",
+            "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66",
+            "43725474ba5663642e17684717946693850e2005efbd724ac72da278fead25e6",
+        ):
+            self.assertIn(digest, job)
+        self.assertEqual(job.count("sha256sum --check --strict"), 3)
+        self.assertNotIn("make fetch-model _ort-linux-amd64", job)
+        self.assertNotIn("resolve/main", job)
+
     def test_qualification_runs_only_the_authorized_gates(self):
         job = self.qualification_job()
         for command in (

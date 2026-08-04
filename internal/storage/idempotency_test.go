@@ -12,6 +12,30 @@ import (
 
 // TestPurgeExpiredIdempotency verifies that PurgeExpiredIdempotency deletes
 // stale receipts and leaves fresh ones intact, returning the correct count.
+func TestPurgeExpiredIdempotency_PreservesPayloadReceipts(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	ws := store.VaultPrefix("payload-retention")
+
+	if err := store.WritePayloadReceipt(ctx, ws, "stage-b:retained", "memory-retained", payloadDigestA); err != nil {
+		t.Fatalf("WritePayloadReceipt: %v", err)
+	}
+	deleted, err := store.PurgeExpiredIdempotency(ctx, -time.Hour)
+	if err != nil {
+		t.Fatalf("PurgeExpiredIdempotency: %v", err)
+	}
+	if deleted != 0 {
+		t.Fatalf("legacy sweep deleted %d payload receipts", deleted)
+	}
+	receipt, err := store.CheckPayloadReceipt(ctx, ws, "stage-b:retained")
+	if err != nil {
+		t.Fatalf("CheckPayloadReceipt: %v", err)
+	}
+	if receipt == nil || receipt.EngramID != "memory-retained" {
+		t.Fatalf("payload receipt lost during legacy sweep: %+v", receipt)
+	}
+}
+
 func TestPurgeExpiredIdempotency(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()

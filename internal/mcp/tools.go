@@ -71,7 +71,7 @@ func allToolDefinitions() []ToolDefinition {
 					},
 					"op_id": map[string]any{
 						"type":        "string",
-						"description": "Optional idempotency key. If set and a receipt exists for this key, the cached engram ID is returned without re-creating.",
+						"description": "Optional vault-scoped payload identity. The server binds this key to the SHA-256 of the complete canonical arguments object: an identical retry returns the original memory ID, while any changed argument is rejected.",
 					},
 					"embedding": map[string]any{
 						"type":        "array",
@@ -80,6 +80,21 @@ func allToolDefinitions() []ToolDefinition {
 					},
 				},
 				"required": []string{"content"},
+			},
+		},
+		{
+			Name:        "muninn_payload_receipt",
+			Description: "Read server-owned payload identity proof for one vault-scoped op_id. Returns only memory_id and observed_payload_sha256; it never returns the original arguments or memory content.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"vault": vaultProp,
+					"op_id": map[string]any{
+						"type":        "string",
+						"description": "The operation ID supplied to muninn_remember.",
+					},
+				},
+				"required": []string{"op_id"},
 			},
 		},
 		{

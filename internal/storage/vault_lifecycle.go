@@ -1,7 +1,9 @@
 package storage
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -107,6 +109,9 @@ func (ps *PebbleStore) ClearVault(ctx context.Context, ws [8]byte) (int64, error
 	if err := ps.deleteVaultEntityReverseIndex(batch, ws); err != nil {
 		return 0, fmt.Errorf("clear vault: delete entity reverse index: %w", err)
 	}
+	if err := ps.deleteVaultPayloadReceipts(batch, ws); err != nil {
+		return 0, fmt.Errorf("clear vault: delete payload receipts: %w", err)
+	}
 	if err := batch.Commit(pebble.Sync); err != nil {
 		return 0, fmt.Errorf("clear vault: commit: %w", err)
 	}
@@ -141,6 +146,37 @@ func (ps *PebbleStore) ClearVault(ctx context.Context, ws [8]byte) (int64, error
 	ps.recentActiveCache.Delete(ws)
 
 	return vaultCount, nil
+}
+
+func (ps *PebbleStore) deleteVaultPayloadReceipts(batch *pebble.Batch, ws [8]byte) error {
+	lo := make([]byte, 9)
+	lo[0] = prefix.Idempotency
+	copy(lo[1:], ws[:])
+	iter, err := ps.db.NewIter(&pebble.IterOptions{
+		LowerBound: lo,
+		UpperBound: keys.PrefixUpperBound(lo),
+	})
+	if err != nil {
+		return err
+	}
+	defer iter.Close()
+	for valid := iter.First(); valid; valid = iter.Next() {
+		key := iter.Key()
+		if len(key) != 17 {
+			continue
+		}
+		var receipt PayloadReceipt
+		if err := json.Unmarshal(iter.Value(), &receipt); err != nil || validatePayloadReceipt(receipt.OpID, receipt.EngramID, receipt.PayloadSHA256) != nil {
+			continue
+		}
+		if !bytes.Equal(key, keys.PayloadReceiptKey(ws, receipt.OpID)) {
+			continue
+		}
+		if err := batch.Delete(append([]byte(nil), key...), nil); err != nil {
+			return err
+		}
+	}
+	return iter.Error()
 }
 
 func (ps *PebbleStore) collectVaultEntityMentions(ws [8]byte) (map[string]int, error) {

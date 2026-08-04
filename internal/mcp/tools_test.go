@@ -7,8 +7,8 @@ import (
 
 func TestAllToolDefinitionsCount(t *testing.T) {
 	tools := allToolDefinitions()
-	if len(tools) != 44 {
-		t.Errorf("expected 44 tools, got %d", len(tools))
+	if len(tools) != 45 {
+		t.Errorf("expected 45 tools, got %d", len(tools))
 	}
 }
 
@@ -74,7 +74,7 @@ func TestExpectedToolNames(t *testing.T) {
 		names[tool.Name] = true
 	}
 	expected := []string{
-		"muninn_remember", "muninn_remember_batch", "muninn_recall", "muninn_read", "muninn_forget",
+		"muninn_remember", "muninn_payload_receipt", "muninn_remember_batch", "muninn_recall", "muninn_read", "muninn_forget",
 		"muninn_link", "muninn_contradictions", "muninn_status",
 		"muninn_evolve", "muninn_consolidate", "muninn_session", "muninn_decide",
 		// Epic 18

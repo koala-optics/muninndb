@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/cockroachdb/pebble"
@@ -67,6 +68,76 @@ func TestClearVault_AllPrefixesGone(t *testing.T) {
 	}
 	if !found {
 		t.Error("ClearVault should preserve vault name registration")
+	}
+}
+
+func TestClearVault_ClearsOnlyScopedPayloadReceipts(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	wsA := store.VaultPrefix("receipt-vault-a")
+	wsB := store.VaultPrefix("receipt-vault-b")
+
+	if err := store.WritePayloadReceipt(ctx, wsA, "shared-op", "memory-a", payloadDigestA); err != nil {
+		t.Fatalf("WritePayloadReceipt vault-a: %v", err)
+	}
+	if err := store.WritePayloadReceipt(ctx, wsB, "shared-op", "memory-b", payloadDigestB); err != nil {
+		t.Fatalf("WritePayloadReceipt vault-b: %v", err)
+	}
+	// Exercise the final byte range: an exclusive upper bound of prefix|0xff
+	// misses valid longer keys whose SipHash suffix starts with 0xff.
+	var highSuffixOp string
+	for i := 0; i < 10_000; i++ {
+		candidate := fmt.Sprintf("high-suffix-%d", i)
+		if keys.PayloadReceiptKey(wsA, candidate)[9] == 0xff {
+			highSuffixOp = candidate
+			break
+		}
+	}
+	if highSuffixOp == "" {
+		t.Fatal("could not find deterministic payload key with 0xff-leading suffix")
+	}
+	if err := store.WritePayloadReceipt(ctx, wsA, highSuffixOp, "memory-high", payloadDigestA); err != nil {
+		t.Fatalf("WritePayloadReceipt high suffix: %v", err)
+	}
+	// The 0x19 namespace is shared with global idempotency and replication data.
+	// ClearVault must remove only validated 17-byte payload receipts, not every
+	// key whose first eight payload bytes happen to match the vault prefix.
+	overloadedShort := append([]byte{prefix.Idempotency}, wsA[:]...)
+	if err := store.db.Set(overloadedShort, []byte("replication-like"), pebble.Sync); err != nil {
+		t.Fatalf("set overloaded short key: %v", err)
+	}
+	overloadedLong := append(append([]byte(nil), overloadedShort...), 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff)
+	if err := store.db.Set(overloadedLong, []byte("not-a-payload-receipt"), pebble.Sync); err != nil {
+		t.Fatalf("set overloaded long key: %v", err)
+	}
+
+	if _, err := store.ClearVault(ctx, wsA); err != nil {
+		t.Fatalf("ClearVault: %v", err)
+	}
+	if receipt, err := store.CheckPayloadReceipt(ctx, wsA, "shared-op"); err != nil {
+		t.Fatalf("CheckPayloadReceipt vault-a: %v", err)
+	} else if receipt != nil {
+		t.Fatalf("cleared vault retained payload receipt: %+v", receipt)
+	}
+	if receipt, err := store.CheckPayloadReceipt(ctx, wsA, highSuffixOp); err != nil {
+		t.Fatalf("CheckPayloadReceipt high suffix: %v", err)
+	} else if receipt != nil {
+		t.Fatalf("cleared vault retained high-suffix payload receipt: %+v", receipt)
+	}
+	if receipt, err := store.CheckPayloadReceipt(ctx, wsB, "shared-op"); err != nil {
+		t.Fatalf("CheckPayloadReceipt vault-b: %v", err)
+	} else if receipt == nil || receipt.EngramID != "memory-b" {
+		t.Fatalf("other vault payload receipt changed: %+v", receipt)
+	}
+	for _, key := range [][]byte{overloadedShort, overloadedLong} {
+		value, closer, err := store.db.Get(key)
+		if err != nil {
+			t.Fatalf("overloaded 0x19 key was deleted: %x: %v", key, err)
+		}
+		if len(value) == 0 {
+			t.Fatalf("overloaded 0x19 key was emptied: %x", key)
+		}
+		closer.Close()
 	}
 }
 

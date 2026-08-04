@@ -678,6 +678,19 @@ func IdempotencyKey(opID string) []byte {
 	return key
 }
 
+// PayloadReceiptKey constructs a vault-scoped payload receipt key.
+// Its 17-byte shape is distinct from the 9-byte legacy IdempotencyKey, so a
+// legacy receipt can never be interpreted as proof of a request payload.
+// Key: 0x19 | wsPrefix(8) | siphash(op_id)(8) = 17 bytes
+func PayloadReceiptKey(ws [8]byte, opID string) []byte {
+	hashVal := siphash.Hash(sipKey0, sipKey1, []byte(opID))
+	key := make([]byte, 1+8+8)
+	key[0] = prefix.Idempotency
+	copy(key[1:9], ws[:])
+	binary.BigEndian.PutUint64(key[9:], hashVal)
+	return key
+}
+
 // RelEntityIndexKey constructs the relationship entity index key (0x26 prefix).
 // Written for BOTH fromEntity and toEntity on every UpsertRelationshipRecord call.
 // Enables O(engrams-referencing-entity) relationship lookup instead of a full vault scan.

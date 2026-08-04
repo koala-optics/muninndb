@@ -33,6 +33,15 @@ func NewEngineAdapter(eng *engine.Engine, enricher plugin.EnrichPlugin, pStore p
 func (a *mcpEngineAdapter) Write(ctx context.Context, req *mbp.WriteRequest) (*mbp.WriteResponse, error) {
 	return a.eng.Write(ctx, req)
 }
+
+func (a *mcpEngineAdapter) WriteWithPayloadReceipt(ctx context.Context, req *mbp.WriteRequest, opID, payloadSHA256 string) (*mbp.WriteResponse, error) {
+	return a.eng.WriteWithPayloadReceipt(ctx, req, opID, payloadSHA256)
+}
+
+func (a *mcpEngineAdapter) ReadPayloadReceipt(ctx context.Context, vault, opID string) (*storage.PayloadReceipt, error) {
+	return a.eng.ReadPayloadReceipt(ctx, vault, opID)
+}
+
 func (a *mcpEngineAdapter) WriteBatch(ctx context.Context, reqs []*mbp.WriteRequest) ([]*mbp.WriteResponse, []error) {
 	return a.eng.WriteBatch(ctx, reqs)
 }

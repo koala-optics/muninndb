@@ -1,7 +1,9 @@
 package storage
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -79,6 +81,9 @@ func (ps *PebbleStore) ClearVault(ctx context.Context, ws [8]byte) (int64, error
 			return 0, fmt.Errorf("clear vault: delete range 0x%02X: %w", p, err)
 		}
 	}
+	if err := ps.deleteVaultPayloadReceipts(batch, ws); err != nil {
+		return 0, fmt.Errorf("clear vault: delete payload receipts: %w", err)
+	}
 	if err := batch.Commit(pebble.Sync); err != nil {
 		return 0, fmt.Errorf("clear vault: commit: %w", err)
 	}
@@ -106,6 +111,97 @@ func (ps *PebbleStore) ClearVault(ctx context.Context, ws [8]byte) (int64, error
 	ps.recentActiveCache.Delete(ws)
 
 	return vaultCount, nil
+}
+
+func (ps *PebbleStore) deleteVaultPayloadReceipts(batch *pebble.Batch, ws [8]byte) error {
+	lo := make([]byte, 9)
+	lo[0] = prefix.Idempotency
+	copy(lo[1:], ws[:])
+	iter, err := ps.db.NewIter(&pebble.IterOptions{
+		LowerBound: lo,
+		UpperBound: keys.PrefixUpperBound(lo),
+	})
+	if err != nil {
+		return err
+	}
+	defer iter.Close()
+	for valid := iter.First(); valid; valid = iter.Next() {
+		key := iter.Key()
+		if len(key) != 17 {
+			continue
+		}
+		var receipt PayloadReceipt
+		if err := json.Unmarshal(iter.Value(), &receipt); err != nil || validatePayloadReceipt(receipt.OpID, receipt.EngramID, receipt.PayloadSHA256) != nil {
+			continue
+		}
+		if !bytes.Equal(key, keys.PayloadReceiptKey(ws, receipt.OpID)) {
+			continue
+		}
+		if err := batch.Delete(append([]byte(nil), key...), nil); err != nil {
+			return err
+		}
+	}
+	return iter.Error()
+}
+
+func (ps *PebbleStore) collectVaultEntityMentions(ws [8]byte) (map[string]int, error) {
+	prefixPre := make([]byte, 9)
+	prefixPre[0] = prefix.EntityEngramLink
+	copy(prefixPre[1:], ws[:])
+	wsPlus, err := incrementWS(ws)
+	if err != nil {
+		return nil, err
+	}
+	upperBound := make([]byte, 9)
+	upperBound[0] = prefix.EntityEngramLink
+	copy(upperBound[1:], wsPlus[:])
+
+	iter, err := ps.db.NewIter(&pebble.IterOptions{LowerBound: prefixPre, UpperBound: upperBound})
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+
+	mentions := make(map[string]int)
+	for valid := iter.First(); valid; valid = iter.Next() {
+		name := string(iter.Value())
+		if name != "" {
+			mentions[name]++
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return nil, err
+	}
+	return mentions, nil
+}
+
+func (ps *PebbleStore) deleteVaultEntityReverseIndex(batch *pebble.Batch, ws [8]byte) error {
+	iter, err := ps.db.NewIter(&pebble.IterOptions{
+		LowerBound: []byte{prefix.EntityReverseIndex},
+		UpperBound: []byte{prefix.CoOccurrence},
+	})
+	if err != nil {
+		return err
+	}
+	defer iter.Close()
+
+	for valid := iter.First(); valid; valid = iter.Next() {
+		k := iter.Key()
+		if len(k) != 33 {
+			continue
+		}
+		var gotWS [8]byte
+		copy(gotWS[:], k[9:17])
+		if gotWS != ws {
+			continue
+		}
+		keyCopy := make([]byte, len(k))
+		copy(keyCopy, k)
+		if err := batch.Delete(keyCopy, nil); err != nil {
+			return err
+		}
+	}
+	return iter.Error()
 }
 
 // DeleteVaultNameOnly removes the vault name registration keys (0x0E and 0x0F)

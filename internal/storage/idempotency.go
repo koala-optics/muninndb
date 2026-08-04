@@ -75,10 +75,16 @@ func (ps *PebbleStore) PurgeExpiredIdempotency(ctx context.Context, maxAge time.
 		if len(k) == 0 || k[0] != 0x19 {
 			break
 		}
+		// Legacy idempotency receipts are exactly 0x19 | siphash(op_id). Newer
+		// vault-scoped payload receipts share the prefix but have a 17-byte key
+		// and a separate retention contract.
+		if len(k) != 9 {
+			continue
+		}
 		val := iter.Value()
 		var receipt IdempotencyReceipt
 		if err := json.Unmarshal(val, &receipt); err != nil {
-			// Skip malformed receipts — don't delete, don't abort.
+			// Skip malformed receipts - don't delete, don't abort.
 			continue
 		}
 		if receipt.CreatedAt < cutoff {

@@ -3,9 +3,21 @@ name: Koala Stage B Checkpoint Proof Build
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: Operation to run
+        required: true
+        default: checkpoint-proof-helper
+        type: choice
+        options:
+          - checkpoint-proof-helper
+          - pr84-payload-receipt-qualification
       helper_commit:
         description: Exact 40-character Koala commit containing the helper
-        required: true
+        required: false
+        type: string
+      qualification_commit:
+        description: Exact authorized PR 84 commit
+        required: false
         type: string
 
 permissions:
@@ -27,6 +39,7 @@ env:
 
 jobs:
   build:
+    if: inputs.mode == 'checkpoint-proof-helper'
     name: Build pinned checkpoint verifier helper
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -260,3 +273,64 @@ jobs:
             /tmp/koala-stage-b-checkpoint-proof/provenance.sha256
           if-no-files-found: warn
           retention-days: 30
+
+  qualify-pr84:
+    if: inputs.mode == 'pr84-payload-receipt-qualification'
+    name: Qualify exact PR 84 payload-receipt commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      AUTHORIZED_COMMIT: a9c1f785b86195975cbc1c8f8611ac78d5871d87
+    steps:
+      - name: Validate exact authorized qualification input
+        shell: bash
+        env:
+          QUALIFICATION_COMMIT: ${{ inputs.qualification_commit }}
+        run: |
+          set -euo pipefail
+          test "$QUALIFICATION_COMMIT" = "$AUTHORIZED_COMMIT"
+
+      - name: Check out exact authorized PR commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.AUTHORIZED_COMMIT }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify exact authorized checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$AUTHORIZED_COMMIT"
+
+      - name: Set up exact Go toolchain
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Fetch local embed assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          make fetch-model _ort-linux-amd64
+
+      - name: Build web assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd web
+          npm ci --ignore-scripts
+          npm run build
+
+      - name: Run exact PR 84 qualification gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          go build -tags localassets -o muninndb-server ./cmd/muninn/...
+          go vet -tags localassets ./...
+          go test -tags localassets ./... -timeout 300s -race
+          go test -tags localassets,integration -v -timeout 120s ./cmd/muninn/...
+          git diff --check

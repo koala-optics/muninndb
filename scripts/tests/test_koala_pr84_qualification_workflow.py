@@ -71,6 +71,20 @@ class PR84QualificationWorkflowTests(unittest.TestCase):
         self.assertNotIn("make fetch-model _ort-linux-amd64", job)
         self.assertNotIn("resolve/main", job)
 
+    def test_qualification_runs_its_exact_dispatch_contract(self):
+        job = self.qualification_job()
+        for path in (
+            ".github/workflows/ci.yml",
+            ".github/workflows/koala-stage-b-checkpoint-proof-build.yml",
+            "scripts/tests/test_koala_pr84_qualification_workflow.py",
+        ):
+            self.assertIn(f'git show "$GITHUB_SHA:{path}" >', job)
+        self.assertIn(
+            'python3 "$contract_root/scripts/tests/'
+            'test_koala_pr84_qualification_workflow.py"',
+            job,
+        )
+
     def test_qualification_runs_only_the_authorized_gates(self):
         job = self.qualification_job()
         for command in (

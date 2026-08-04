@@ -305,6 +305,22 @@ jobs:
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$AUTHORIZED_COMMIT"
 
+      - name: Run exact dispatch workflow contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          contract_root="$(mktemp -d)"
+          mkdir -p \
+            "$contract_root/.github/workflows" \
+            "$contract_root/scripts/tests"
+          git show "$GITHUB_SHA:.github/workflows/ci.yml" > \
+            "$contract_root/.github/workflows/ci.yml"
+          git show "$GITHUB_SHA:.github/workflows/koala-stage-b-checkpoint-proof-build.yml" > \
+            "$contract_root/.github/workflows/koala-stage-b-checkpoint-proof-build.yml"
+          git show "$GITHUB_SHA:scripts/tests/test_koala_pr84_qualification_workflow.py" > \
+            "$contract_root/scripts/tests/test_koala_pr84_qualification_workflow.py"
+          python3 "$contract_root/scripts/tests/test_koala_pr84_qualification_workflow.py"
+
       - name: Set up exact Go toolchain
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
         with:

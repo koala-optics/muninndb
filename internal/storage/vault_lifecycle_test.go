@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/pebble"
 )
@@ -138,6 +139,56 @@ func TestClearVault_ClearsOnlyScopedPayloadReceipts(t *testing.T) {
 			t.Fatalf("overloaded 0x19 key was emptied: %x", key)
 		}
 		closer.Close()
+	}
+}
+
+func TestClearVault_SerializesPayloadReceiptWrites(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	ws := store.VaultPrefix("receipt-clear-race")
+
+	mu := payloadReceiptVaultLocks.For(ws[:])
+	mu.Lock()
+	clearDone := make(chan error, 1)
+	go func() {
+		_, err := store.ClearVault(ctx, ws)
+		clearDone <- err
+	}()
+	select {
+	case err := <-clearDone:
+		mu.Unlock()
+		t.Fatalf("ClearVault bypassed payload receipt lifecycle lock: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	mu.Unlock()
+	select {
+	case err := <-clearDone:
+		if err != nil {
+			t.Fatalf("ClearVault: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ClearVault did not resume after payload receipt lifecycle lock release")
+	}
+
+	mu.Lock()
+	writeDone := make(chan error, 1)
+	go func() {
+		writeDone <- store.WritePayloadReceipt(ctx, ws, "stage-b:after-clear", "memory-after-clear", payloadDigestA)
+	}()
+	select {
+	case err := <-writeDone:
+		mu.Unlock()
+		t.Fatalf("payload receipt write bypassed lifecycle lock: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	mu.Unlock()
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			t.Fatalf("WritePayloadReceipt: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("payload receipt write did not resume after lifecycle lock release")
 	}
 }
 

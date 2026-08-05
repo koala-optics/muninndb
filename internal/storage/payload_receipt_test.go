@@ -245,6 +245,30 @@ func TestPayloadReceipt_IsVaultScoped(t *testing.T) {
 	}
 }
 
+func TestDeletePayloadReceipt_RefusesUnrecognizedSharedPrefixRecord(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	ws := store.VaultPrefix("payload-delete-safety")
+	const opID = "stage-b:delete-safety"
+	key := keys.PayloadReceiptKey(ws, opID)
+	want := []byte(`{"not":"a-payload-receipt"}`)
+	if err := store.db.Set(key, want, pebble.Sync); err != nil {
+		t.Fatalf("set unrecognized record: %v", err)
+	}
+
+	if err := store.DeletePayloadReceipt(ctx, ws, opID, "memory-delete-safety", payloadDigestA); err == nil {
+		t.Fatal("expected unrecognized 0x19 record deletion to fail closed")
+	}
+	value, closer, err := store.db.Get(key)
+	if err != nil {
+		t.Fatalf("unrecognized 0x19 record was deleted: %v", err)
+	}
+	defer closer.Close()
+	if string(value) != string(want) {
+		t.Fatalf("unrecognized 0x19 record changed: got %q want %q", value, want)
+	}
+}
+
 func TestPayloadReceipt_DoesNotPromoteLegacyReceipt(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)

@@ -5,7 +5,9 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/scrypster/muninndb/internal/storage"
 	"github.com/scrypster/muninndb/internal/transport/mbp"
 )
 
@@ -146,6 +148,105 @@ func TestWriteWithPayloadReceipt_ConcurrentDifferentCannotBothSucceed(t *testing
 	}
 	if count != 1 {
 		t.Fatalf("concurrent payload drift created %d engrams", count)
+	}
+}
+
+func TestWriteWithPayloadReceipt_RetryAfterHardDeleteDoesNotReturnDanglingID(t *testing.T) {
+	eng, store, cleanup := testEnvWithStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	req := &mbp.WriteRequest{Vault: "default", Content: "delete and retry"}
+
+	first, err := eng.WriteWithPayloadReceipt(ctx, req, "stage-b:deleted-retry", enginePayloadDigestA)
+	if err != nil {
+		t.Fatalf("first WriteWithPayloadReceipt: %v", err)
+	}
+	id, err := storage.ParseULID(first.ID)
+	if err != nil {
+		t.Fatalf("ParseULID: %v", err)
+	}
+	if err := store.DeleteEngram(ctx, store.VaultPrefix("default"), id); err != nil {
+		t.Fatalf("DeleteEngram: %v", err)
+	}
+
+	second, err := eng.WriteWithPayloadReceipt(ctx, req, "stage-b:deleted-retry", enginePayloadDigestA)
+	if err != nil {
+		t.Fatalf("retry WriteWithPayloadReceipt: %v", err)
+	}
+	if second.ID == first.ID || second.Hint == "idempotent" {
+		t.Fatalf("retry returned dangling receipt: first=%+v retry=%+v", first, second)
+	}
+	secondID, err := storage.ParseULID(second.ID)
+	if err != nil {
+		t.Fatalf("ParseULID retry: %v", err)
+	}
+	if _, err := store.GetEngram(ctx, store.VaultPrefix("default"), secondID); err != nil {
+		t.Fatalf("retry response references missing engram: %v", err)
+	}
+}
+
+func TestWriteWithPayloadReceipt_RetryAfterSoftDeleteDoesNotReturnDeletedID(t *testing.T) {
+	eng, store, cleanup := testEnvWithStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	req := &mbp.WriteRequest{Vault: "default", Content: "soft delete and retry"}
+
+	first, err := eng.WriteWithPayloadReceipt(ctx, req, "stage-b:soft-deleted-retry", enginePayloadDigestA)
+	if err != nil {
+		t.Fatalf("first WriteWithPayloadReceipt: %v", err)
+	}
+	id, err := storage.ParseULID(first.ID)
+	if err != nil {
+		t.Fatalf("ParseULID: %v", err)
+	}
+	if err := store.SoftDelete(ctx, store.VaultPrefix("default"), id); err != nil {
+		t.Fatalf("SoftDelete: %v", err)
+	}
+
+	second, err := eng.WriteWithPayloadReceipt(ctx, req, "stage-b:soft-deleted-retry", enginePayloadDigestA)
+	if err != nil {
+		t.Fatalf("retry WriteWithPayloadReceipt: %v", err)
+	}
+	if second.ID == first.ID || second.Hint == "idempotent" {
+		t.Fatalf("retry returned soft-deleted receipt: first=%+v retry=%+v", first, second)
+	}
+	secondID, err := storage.ParseULID(second.ID)
+	if err != nil {
+		t.Fatalf("ParseULID retry: %v", err)
+	}
+	got, err := store.GetEngram(ctx, store.VaultPrefix("default"), secondID)
+	if err != nil {
+		t.Fatalf("retry response references missing engram: %v", err)
+	}
+	if got.State == storage.StateSoftDeleted {
+		t.Fatalf("retry response references soft-deleted engram: %+v", got)
+	}
+}
+
+func TestWriteWithPayloadReceipt_SharesLegacyOperationLock(t *testing.T) {
+	eng, _, cleanup := testEnvWithStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	const opID = "stage-b:mixed-lock"
+
+	mu := eng.getIdempotencyLock(opID)
+	mu.Lock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = eng.WriteWithPayloadReceipt(ctx, &mbp.WriteRequest{Vault: "default", Content: "payload"}, opID, enginePayloadDigestA)
+	}()
+	select {
+	case <-done:
+		mu.Unlock()
+		t.Fatal("payload write bypassed the legacy operation-ID lock")
+	case <-time.After(100 * time.Millisecond):
+	}
+	mu.Unlock()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("payload write did not resume after legacy operation-ID lock release")
 	}
 }
 

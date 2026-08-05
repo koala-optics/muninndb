@@ -1,9 +1,12 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
 	"time"
 
 	"github.com/cockroachdb/pebble"
@@ -55,7 +58,25 @@ func (ps *PebbleStore) WriteIdempotency(ctx context.Context, opID, engramID stri
 // (now - maxAge), and batches deletes in groups of 1000. The ctx is checked
 // between batches so the caller can cancel a long-running sweep.
 // Returns the number of entries deleted.
+func decodeIdempotencyReceipt(value []byte) (*IdempotencyReceipt, error) {
+	dec := json.NewDecoder(bytes.NewReader(value))
+	dec.DisallowUnknownFields()
+	var receipt IdempotencyReceipt
+	if err := dec.Decode(&receipt); err != nil {
+		return nil, err
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		return nil, fmt.Errorf("idempotency receipt has trailing JSON")
+	}
+	if receipt.EngramID == "" || receipt.CreatedAt <= 0 {
+		return nil, fmt.Errorf("idempotency receipt is incomplete")
+	}
+	return &receipt, nil
+}
+
 func (ps *PebbleStore) PurgeExpiredIdempotency(ctx context.Context, maxAge time.Duration) (int, error) {
+	unlock := lockAllPayloadReceiptVaults()
+	defer unlock()
 	cutoff := time.Now().Add(-maxAge).UnixNano()
 
 	lower := []byte{prefix.Idempotency}
@@ -76,22 +97,31 @@ func (ps *PebbleStore) PurgeExpiredIdempotency(ctx context.Context, maxAge time.
 		if len(k) == 0 || k[0] != prefix.Idempotency {
 			break
 		}
-		// Legacy idempotency receipts are exactly 0x19 | siphash(op_id). Newer
-		// vault-scoped payload receipts share the prefix but have a 17-byte key
-		// and a separate retention contract.
-		if len(k) != 9 {
-			continue
-		}
 		val := iter.Value()
-		var receipt IdempotencyReceipt
-		if err := json.Unmarshal(val, &receipt); err != nil {
-			// Skip malformed receipts - don't delete, don't abort.
-			continue
-		}
-		if receipt.CreatedAt < cutoff {
-			keyCopy := make([]byte, len(k))
-			copy(keyCopy, k)
-			toDelete = append(toDelete, keyCopy)
+		switch len(k) {
+		case 9:
+			// Legacy receipts and replication records share this shape. Require the
+			// exact receipt schema so JSON-shaped replication data cannot be expired.
+			receipt, err := decodeIdempotencyReceipt(val)
+			if err != nil {
+				continue
+			}
+			if receipt.CreatedAt < cutoff {
+				keyCopy := append([]byte(nil), k...)
+				toDelete = append(toDelete, keyCopy)
+			}
+		case 17:
+			// A 17-byte 0x19 key is deletable only when the value is an exact,
+			// complete PayloadReceipt and its stored op_id reproduces this key.
+			receipt, err := decodePayloadReceipt(val)
+			if err != nil || !bytes.Equal(k, keys.PayloadReceiptKey([8]byte(k[1:9]), receipt.OpID)) {
+				slog.Warn("idempotency sweep: preserved unrecognized 17-byte 0x19 record", "key", fmt.Sprintf("%x", k))
+				continue
+			}
+			if receipt.CreatedAt < cutoff {
+				keyCopy := append([]byte(nil), k...)
+				toDelete = append(toDelete, keyCopy)
+			}
 		}
 	}
 	if err := iter.Error(); err != nil {

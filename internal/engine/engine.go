@@ -1375,7 +1375,7 @@ func (e *Engine) WriteWithPayloadReceipt(ctx context.Context, req *mbp.WriteRequ
 		vaultName = "default"
 	}
 	wsPrefix := e.store.ResolveVaultPrefix(vaultName)
-	mu := e.getIdempotencyLock(vaultName + "\x00" + opID)
+	mu := e.getIdempotencyLock(opID)
 	mu.Lock()
 	defer mu.Unlock()
 
@@ -1387,7 +1387,22 @@ func (e *Engine) WriteWithPayloadReceipt(ctx context.Context, req *mbp.WriteRequ
 		if receipt.PayloadSHA256 != payloadSHA256 {
 			return nil, ErrPayloadReceiptConflict
 		}
-		return &mbp.WriteResponse{ID: receipt.EngramID, Hint: "idempotent"}, nil
+		receiptID, parseErr := storage.ParseULID(receipt.EngramID)
+		if parseErr != nil {
+			return nil, fmt.Errorf("invalid stored payload receipt engram_id: %w", parseErr)
+		}
+		existing, readErr := e.store.GetEngram(ctx, wsPrefix, receiptID)
+		if readErr == nil && existing.State != storage.StateSoftDeleted {
+			return &mbp.WriteResponse{ID: receipt.EngramID, Hint: "idempotent"}, nil
+		}
+		if readErr != nil && !errors.Is(readErr, storage.ErrNotFound) {
+			return nil, fmt.Errorf("verify payload receipt engram: %w", readErr)
+		}
+		// A hard- or soft-deleted engram cannot be acknowledged by an old receipt.
+		// Delete only this already-validated exact receipt, then execute the write again.
+		if err := e.store.DeletePayloadReceipt(ctx, wsPrefix, opID, receipt.EngramID, receipt.PayloadSHA256); err != nil {
+			return nil, fmt.Errorf("delete dangling payload receipt: %w", err)
+		}
 	}
 	if legacy, err := e.store.CheckIdempotency(ctx, opID); err != nil {
 		return nil, err

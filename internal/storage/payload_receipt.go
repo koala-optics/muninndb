@@ -1,10 +1,12 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/cockroachdb/pebble"
@@ -12,6 +14,10 @@ import (
 )
 
 const payloadSHA256Bytes = 32
+
+// minimal: one fixed striped lock pool serializes payload receipt lifecycle per
+// vault; move it onto a smaller receipt store type only if store decomposition lands.
+var payloadReceiptVaultLocks stripedMutex
 
 // PayloadReceipt is server-owned proof that one vault-scoped operation ID was
 // bound to the complete canonical request payload when its engram was created.
@@ -43,6 +49,25 @@ func validatePayloadReceipt(opID, engramID, payloadSHA256 string) error {
 		return fmt.Errorf("payload receipt engram_id is required")
 	}
 	return nil
+}
+
+func decodePayloadReceipt(value []byte) (*PayloadReceipt, error) {
+	dec := json.NewDecoder(bytes.NewReader(value))
+	dec.DisallowUnknownFields()
+	var receipt PayloadReceipt
+	if err := dec.Decode(&receipt); err != nil {
+		return nil, err
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		return nil, fmt.Errorf("payload receipt has trailing JSON")
+	}
+	if err := validatePayloadReceipt(receipt.OpID, receipt.EngramID, receipt.PayloadSHA256); err != nil {
+		return nil, err
+	}
+	if receipt.CreatedAt <= 0 {
+		return nil, fmt.Errorf("payload receipt created_at is required")
+	}
+	return &receipt, nil
 }
 
 func newPayloadReceipt(opID, engramID, payloadSHA256 string) (*PayloadReceipt, []byte, error) {
@@ -79,23 +104,78 @@ func (ps *PebbleStore) CheckPayloadReceipt(ctx context.Context, ws [8]byte, opID
 	if value == nil {
 		return nil, nil
 	}
-	var receipt PayloadReceipt
-	if err := json.Unmarshal(value, &receipt); err != nil {
+	receipt, err := decodePayloadReceipt(value)
+	if err != nil {
 		return nil, fmt.Errorf("decode payload receipt: %w", err)
-	}
-	if err := validatePayloadReceipt(receipt.OpID, receipt.EngramID, receipt.PayloadSHA256); err != nil {
-		return nil, fmt.Errorf("invalid stored payload receipt: %w", err)
 	}
 	if receipt.OpID != opID {
 		return nil, fmt.Errorf("payload receipt op_id collision")
 	}
-	return &receipt, nil
+	return receipt, nil
+}
+
+// DeletePayloadReceipt deletes one exact, validated vault-scoped receipt only
+// when every stored identity field still matches the caller's observed receipt.
+// Unknown or concurrently replaced 0x19 records are preserved.
+func (ps *PebbleStore) DeletePayloadReceipt(ctx context.Context, ws [8]byte, opID, engramID, payloadSHA256 string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := validatePayloadReceipt(opID, engramID, payloadSHA256); err != nil {
+		return err
+	}
+	mu := payloadReceiptVaultLocks.For(ws[:])
+	mu.Lock()
+	defer mu.Unlock()
+	key := keys.PayloadReceiptKey(ws, opID)
+	value, err := Get(ps.db, key)
+	if err != nil {
+		return fmt.Errorf("read payload receipt for delete: %w", err)
+	}
+	if value == nil {
+		return nil
+	}
+	receipt, err := decodePayloadReceipt(value)
+	if err != nil ||
+		receipt.OpID != opID ||
+		receipt.EngramID != engramID ||
+		receipt.PayloadSHA256 != payloadSHA256 {
+		return fmt.Errorf("refuse to delete unrecognized or replaced 17-byte 0x19 record")
+	}
+	batch := ps.db.NewBatch()
+	defer batch.Close()
+	if err := batch.Delete(key, nil); err != nil {
+		return fmt.Errorf("queue payload receipt delete: %w", err)
+	}
+	if err := batch.Commit(pebble.Sync); err != nil {
+		return fmt.Errorf("commit payload receipt delete: %w", err)
+	}
+	ps.replicateBatch(batch)
+	return nil
+}
+
+func lockAllPayloadReceiptVaults() func() {
+	for i := range payloadReceiptVaultLocks.mu {
+		payloadReceiptVaultLocks.mu[i].Lock()
+	}
+	return func() {
+		for i := len(payloadReceiptVaultLocks.mu) - 1; i >= 0; i-- {
+			payloadReceiptVaultLocks.mu[i].Unlock()
+		}
+	}
 }
 
 // WritePayloadReceipt writes a vault-scoped payload receipt without creating an
 // engram. Production payload-bound writes use WriteEngramWithPayloadReceipt so
 // the engram and receipt share one atomic batch.
 func (ps *PebbleStore) WritePayloadReceipt(ctx context.Context, ws [8]byte, opID, engramID, payloadSHA256 string) error {
+	mu := payloadReceiptVaultLocks.For(ws[:])
+	mu.Lock()
+	defer mu.Unlock()
+	return ps.writePayloadReceipt(ctx, ws, opID, engramID, payloadSHA256)
+}
+
+func (ps *PebbleStore) writePayloadReceipt(ctx context.Context, ws [8]byte, opID, engramID, payloadSHA256 string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -118,6 +198,13 @@ func (ps *PebbleStore) WritePayloadReceipt(ctx context.Context, ws [8]byte, opID
 // WriteEngramWithPayloadReceipt atomically persists an engram and its
 // vault-scoped payload receipt in one Pebble batch.
 func (ps *PebbleStore) WriteEngramWithPayloadReceipt(ctx context.Context, ws [8]byte, eng *Engram, opID, payloadSHA256 string) (ULID, error) {
+	mu := payloadReceiptVaultLocks.For(ws[:])
+	mu.Lock()
+	defer mu.Unlock()
+	return ps.writeEngramWithPayloadReceipt(ctx, ws, eng, opID, payloadSHA256)
+}
+
+func (ps *PebbleStore) writeEngramWithPayloadReceipt(ctx context.Context, ws [8]byte, eng *Engram, opID, payloadSHA256 string) (ULID, error) {
 	if eng == nil {
 		return ULID{}, fmt.Errorf("engram is required")
 	}

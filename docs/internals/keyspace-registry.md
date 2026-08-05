@@ -107,9 +107,11 @@ keyspace; coincidental, safe, but confusing. Prefer `0x2C+` for new storage pref
 2. **0x19 is shared idempotency+payload-receipt+replication territory.** Legacy
    idempotency receipts have exact 9-byte keys (`0x19|siphash(opID)`); vault-scoped payload
    receipts have exact 17-byte keys (`0x19|ws|siphash(opID)`). Replication log and metadata
-   keys also share this prefix. `PurgeExpiredIdempotency` may delete only exact 9-byte
-   legacy keys. Vault cleanup may delete only exact 17-byte keys whose value validates as
-   a `PayloadReceipt` and whose full stored `op_id` recomputes the same key. Any other
+   keys also share this prefix. `PurgeExpiredIdempotency` may delete only decoded legacy
+   receipts with exact 9-byte keys, or exact-schema payload receipts with exact 17-byte
+   keys whose full stored `op_id` recomputes the same key. Vault cleanup applies the same
+   strict 17-byte validation. Malformed or mismatched records are alarmed and preserved.
+   Any other
    special-cased key must be **exact-match, never prefix-skip** (as `snapshot.go` already
    does for `cluster_epoch`). Never change replication or receipt encodings without
    revisiting every 0x19 scanner.

@@ -3,9 +3,9 @@ package storage
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/scrypster/muninndb/internal/prefix"
@@ -56,6 +56,13 @@ var clearVaultDataPrefixes = []byte{
 //   - 0x1F entity records (global by entity hash; orphan records are pruned
 //     after vault-scoped links are removed)
 func (ps *PebbleStore) ClearVault(ctx context.Context, ws [8]byte) (int64, error) {
+	mu := payloadReceiptVaultLocks.For(ws[:])
+	mu.Lock()
+	defer mu.Unlock()
+	return ps.clearVault(ctx, ws)
+}
+
+func (ps *PebbleStore) clearVault(ctx context.Context, ws [8]byte) (int64, error) {
 	// Capture count before anything is deleted.
 	vaultCount := ps.GetVaultCount(ctx, ws)
 	entityMentions, err := ps.collectVaultEntityMentions(ws)
@@ -165,11 +172,13 @@ func (ps *PebbleStore) deleteVaultPayloadReceipts(batch *pebble.Batch, ws [8]byt
 		if len(key) != 17 {
 			continue
 		}
-		var receipt PayloadReceipt
-		if err := json.Unmarshal(iter.Value(), &receipt); err != nil || validatePayloadReceipt(receipt.OpID, receipt.EngramID, receipt.PayloadSHA256) != nil {
+		receipt, err := decodePayloadReceipt(iter.Value())
+		if err != nil {
+			slog.Warn("clear vault: preserved unrecognized 17-byte 0x19 record", "vault_prefix", fmt.Sprintf("%x", ws), "key", fmt.Sprintf("%x", key))
 			continue
 		}
 		if !bytes.Equal(key, keys.PayloadReceiptKey(ws, receipt.OpID)) {
+			slog.Warn("clear vault: preserved payload receipt key mismatch", "vault_prefix", fmt.Sprintf("%x", ws), "key", fmt.Sprintf("%x", key))
 			continue
 		}
 		if err := batch.Delete(append([]byte(nil), key...), nil); err != nil {

@@ -206,6 +206,20 @@ type Engine struct {
 	vaultOpWG      sync.WaitGroup
 	vaultOpStopped atomic.Bool
 
+	// Required post-commit enrichment is detached from request cancellation but
+	// remains bounded by postCommitTimeout and the engine lifecycle. Stop fences
+	// new work and drains this WaitGroup before shutting down downstream workers
+	// or allowing the caller to close Pebble.
+	postCommitMu       sync.RWMutex
+	postCommitWG       sync.WaitGroup
+	postCommitStopped  atomic.Bool
+	postCommitCounters postCommitCounters
+
+	// afterPrimaryCommit and beforeEntityRelationships are deterministic test
+	// seams. Production leaves them nil.
+	afterPrimaryCommit        func()
+	beforeEntityRelationships func()
+
 	hnswRegistry *hnsw.Registry // per-vault HNSW indexes (shared with activation)
 
 	// vaultMu provides per-vault mutual exclusion for destructive vault operations
@@ -473,6 +487,11 @@ func (e *Engine) Stop() {
 		e.vaultOpMu.Lock()
 		e.vaultOpStopped.Store(true)
 		e.vaultOpMu.Unlock()
+
+		// Required post-commit writes can touch Pebble and HNSW after the primary
+		// engram commit. Fence, cancel through stopCtx, and drain them before
+		// stopping those downstream subsystems.
+		e.drainRequiredPostCommit()
 
 		if e.autoAssoc != nil {
 			e.autoAssoc.Stop()
@@ -911,126 +930,29 @@ func (e *Engine) Write(ctx context.Context, req *mbp.WriteRequest) (*mbp.WriteRe
 		return nil, fmt.Errorf("write engram: %w", err)
 	}
 
+	if e.afterPrimaryCommit != nil {
+		e.afterPrimaryCommit()
+	}
+	callerProvidedAny := callerSummary != "" || len(callerEntities) > 0
+	skipBackgroundEnrich := (inlineMode == "caller_only" && callerProvidedAny) || inlineMode == "disabled"
+	postCommitOutcome := e.runRequiredPostCommit([]requiredPostCommitItem{{
+		wsPrefix:                  wsPrefix,
+		id:                        id,
+		embedding:                 req.Embedding,
+		callerEntities:            callerEntities,
+		callerRelationships:       callerRelationships,
+		callerEntityRelationships: req.EntityRelationships,
+		completeRelationshipStage: inlineMode != "background_only",
+		skipBackgroundEnrich:      skipBackgroundEnrich,
+	}})[0]
+	writeHint := ""
+	if postCommitOutcome.degraded {
+		writeHint = postCommitHint
+	}
+
 	// Store content hash → engram ID mapping for future dedup lookups.
 	if err := e.store.PutContentHash(ctx, wsPrefix, contentHash, id); err != nil {
 		slog.Warn("engine: failed to store content hash", "id", id.String(), "err", err)
-	}
-
-	// When the caller provided an embedding, mark DigestEmbed so the retroactive
-	// processor does not overwrite it, then insert into HNSW inline so the vector
-	// is searchable immediately (the retroactive processor skips DigestEmbed-flagged
-	// engrams and therefore never calls HNSWInsert for them).
-	if len(req.Embedding) > 0 {
-		existing, _ := e.store.GetDigestFlags(ctx, plugin.ULID(id))
-		if err := e.store.SetDigestFlag(ctx, id, existing|plugin.DigestEmbed); err != nil {
-			slog.Warn("engine: failed to set DigestEmbed flag", "id", id.String(), "err", err)
-		}
-		if err := e.hnswRegistry.Insert(ctx, wsPrefix, [16]byte(id), req.Embedding); err != nil {
-			slog.Warn("engine: failed to insert client embedding into HNSW", "id", id.String(), "err", err)
-		}
-	}
-
-	// Store caller-provided inline entities in the entity table (not as KeyPoints).
-	if len(callerEntities) > 0 {
-		ws, _ := e.store.FindVaultPrefix(id)
-		var linkedEntityNames []string
-		for _, ent := range callerEntities {
-			typ := strings.ToLower(strings.TrimSpace(ent.Type))
-			if typ == "" {
-				typ = "other"
-			}
-			record := storage.EntityRecord{
-				Name:       ent.Name,
-				Type:       typ,
-				Confidence: 1.0,
-			}
-			if err := e.store.UpsertEntityRecord(ctx, record, "inline"); err != nil {
-				slog.Warn("engine: failed to store inline entity", "name", ent.Name, "err", err)
-				continue
-			}
-			if err := e.store.WriteEntityEngramLink(ctx, ws, id, ent.Name); err != nil {
-				slog.Warn("engine: failed to link inline entity", "name", ent.Name, "err", err)
-				continue
-			}
-			linkedEntityNames = append(linkedEntityNames, ent.Name)
-		}
-		// Write co-occurrence pairs for entities co-appearing in this engram.
-		for i := 0; i < len(linkedEntityNames); i++ {
-			for j := i + 1; j < len(linkedEntityNames); j++ {
-				if err := e.store.IncrementEntityCoOccurrence(ctx, ws, linkedEntityNames[i], linkedEntityNames[j]); err != nil {
-					slog.Warn("engine: failed to increment co-occurrence", "vault", req.Vault, "engram", id.String(), "entity_a", linkedEntityNames[i], "entity_b", linkedEntityNames[j], "err", err)
-				}
-				if err := e.store.UpsertRelationshipRecord(ctx, ws, id, storage.RelationshipRecord{
-					FromEntity: linkedEntityNames[i],
-					ToEntity:   linkedEntityNames[j],
-					RelType:    "co_occurs_with",
-					Weight:     0.3,
-					Source:     "co-occurrence",
-				}); err != nil {
-					slog.Warn("engine: failed to upsert co_occurs_with relationship", "vault", req.Vault, "engram", id.String(), "entity_a", linkedEntityNames[i], "entity_b", linkedEntityNames[j], "err", err)
-				}
-			}
-		}
-		// Mark entities as caller-provided so the retroactive processor skips extraction.
-		existing, _ := e.store.GetDigestFlags(ctx, plugin.ULID(id))
-		_ = e.store.SetDigestFlag(ctx, id, existing|plugin.DigestEntities)
-	}
-
-	// Create associations from caller-provided relationships (after engram is stored).
-	for _, rel := range callerRelationships {
-		targetULID, parseErr := storage.ParseULID(rel.TargetID)
-		if parseErr != nil {
-			slog.Warn("engine: inline relationship has invalid target_id", "target_id", rel.TargetID, "error", parseErr)
-			continue
-		}
-		relAssoc := &storage.Association{
-			TargetID:   targetULID,
-			RelType:    storage.RelType(relTypeFromString(rel.Relation)),
-			Weight:     rel.Weight,
-			Confidence: 1.0,
-			CreatedAt:  time.Now(),
-		}
-		if writeErr := e.store.WriteAssociation(ctx, wsPrefix, id, targetULID, relAssoc); writeErr != nil {
-			slog.Warn("engine: failed to write inline relationship", "target_id", rel.TargetID, "error", writeErr)
-		}
-	}
-
-	// Store caller-provided entity-to-entity relationships in the 0x21 relationship index.
-	if len(req.EntityRelationships) > 0 {
-		wsER, _ := e.store.FindVaultPrefix(id)
-		for _, er := range req.EntityRelationships {
-			if er.FromEntity == "" || er.ToEntity == "" || er.RelType == "" {
-				continue
-			}
-			weight := er.Weight
-			if weight <= 0 {
-				weight = 0.9
-			}
-			if err := e.store.UpsertRelationshipRecord(ctx, wsER, id, storage.RelationshipRecord{
-				FromEntity: er.FromEntity,
-				ToEntity:   er.ToEntity,
-				RelType:    er.RelType,
-				Weight:     weight,
-				Source:     "inline",
-			}); err != nil {
-				slog.Warn("engine: failed to store entity relationship", "vault", req.Vault, "engram", id.String(), "from", er.FromEntity, "to", er.ToEntity, "rel_type", er.RelType, "err", err)
-			}
-		}
-	}
-
-	// Determine if we should skip background enrichment.
-	// caller_only: skip if any caller data was provided
-	// caller_preferred: the retroactive processor checks per-field (handled there)
-	// disabled: skip entirely (no enrichment at all)
-	callerProvidedAny := callerSummary != "" || len(callerEntities) > 0
-	skipBackgroundEnrich := (inlineMode == "caller_only" && callerProvidedAny) || inlineMode == "disabled"
-
-	// If we should skip background enrichment, set the DigestEnrich flag now
-	// so the retroactive processor skips this engram.
-	if skipBackgroundEnrich {
-		if flagErr := e.store.SetDigestFlag(ctx, id, plugin.DigestEnrich); flagErr != nil {
-			slog.Warn("engine: failed to set enrich digest flag for inline enrichment", "id", id.String(), "error", flagErr)
-		}
 	}
 
 	// Persist vault name for discovery (idempotent, cheap)
@@ -1178,6 +1100,7 @@ func (e *Engine) Write(ctx context.Context, req *mbp.WriteRequest) (*mbp.WriteRe
 	return &mbp.WriteResponse{
 		ID:        id.String(),
 		CreatedAt: time.Now().UnixNano(),
+		Hint:      writeHint,
 	}, nil
 }
 
@@ -1364,7 +1287,34 @@ func (e *Engine) WriteBatch(ctx context.Context, reqs []*mbp.WriteRequest) ([]*m
 		}
 	}
 
-	// Phase 3: Post-commit async work for each successfully written engram.
+	if e.afterPrimaryCommit != nil {
+		e.afterPrimaryCommit()
+	}
+	postCommitItems := make([]requiredPostCommitItem, n)
+	for i := range reqs {
+		if errs[i] != nil || responses[i] == nil || responses[i].Hint == "duplicate_content" {
+			continue
+		}
+		p := &prepared[i]
+		postCommitItems[i] = requiredPostCommitItem{
+			wsPrefix:                  p.wsPrefix,
+			id:                        ids[i],
+			embedding:                 reqs[i].Embedding,
+			callerEntities:            p.callerEntities,
+			callerRelationships:       p.callerRelationships,
+			callerEntityRelationships: p.callerEntityRelationships,
+			completeRelationshipStage: p.inlineMode != "background_only",
+			skipBackgroundEnrich:      p.skipBackgroundEnrich,
+		}
+	}
+	postCommitOutcomes := e.runRequiredPostCommit(postCommitItems)
+	for i := range postCommitOutcomes {
+		if postCommitOutcomes[i].degraded {
+			responses[i].Hint = postCommitHint
+		}
+	}
+
+	// Phase 3: Post-commit background and derived work for each successfully written engram.
 	for i := range reqs {
 		if errs[i] != nil || responses[i] == nil {
 			continue
@@ -1375,114 +1325,6 @@ func (e *Engine) WriteBatch(ctx context.Context, reqs []*mbp.WriteRequest) ([]*m
 		}
 		p := &prepared[i]
 		id := ids[i]
-
-		// Store caller-provided inline entities in the entity table (not as KeyPoints).
-		if len(p.callerEntities) > 0 {
-			ws, _ := e.store.FindVaultPrefix(id)
-			var linkedEntityNames []string
-			for _, ent := range p.callerEntities {
-				typ := strings.ToLower(strings.TrimSpace(ent.Type))
-				if typ == "" {
-					typ = "other"
-				}
-				record := storage.EntityRecord{
-					Name:       ent.Name,
-					Type:       typ,
-					Confidence: 1.0,
-				}
-				if err := e.store.UpsertEntityRecord(ctx, record, "inline"); err != nil {
-					slog.Warn("engine: batch: failed to store inline entity", "name", ent.Name, "err", err)
-					continue
-				}
-				if err := e.store.WriteEntityEngramLink(ctx, ws, id, ent.Name); err != nil {
-					slog.Warn("engine: batch: failed to link inline entity", "name", ent.Name, "err", err)
-					continue
-				}
-				linkedEntityNames = append(linkedEntityNames, ent.Name)
-			}
-			// Write co-occurrence pairs for entities co-appearing in this engram.
-			for i := 0; i < len(linkedEntityNames); i++ {
-				for j := i + 1; j < len(linkedEntityNames); j++ {
-					if err := e.store.IncrementEntityCoOccurrence(ctx, ws, linkedEntityNames[i], linkedEntityNames[j]); err != nil {
-						slog.Warn("engine: batch: failed to increment co-occurrence", "vault", p.vaultName, "engram", id.String(), "entity_a", linkedEntityNames[i], "entity_b", linkedEntityNames[j], "err", err)
-					}
-					if err := e.store.UpsertRelationshipRecord(ctx, ws, id, storage.RelationshipRecord{
-						FromEntity: linkedEntityNames[i],
-						ToEntity:   linkedEntityNames[j],
-						RelType:    "co_occurs_with",
-						Weight:     0.3,
-						Source:     "co-occurrence",
-					}); err != nil {
-						slog.Warn("engine: batch: failed to upsert co_occurs_with relationship", "vault", p.vaultName, "engram", id.String(), "entity_a", linkedEntityNames[i], "entity_b", linkedEntityNames[j], "err", err)
-					}
-				}
-			}
-			// Mark entities as caller-provided so the retroactive processor skips extraction.
-			existing, _ := e.store.GetDigestFlags(ctx, plugin.ULID(id))
-			_ = e.store.SetDigestFlag(ctx, id, existing|plugin.DigestEntities)
-		}
-
-		for _, rel := range p.callerRelationships {
-			targetULID, parseErr := storage.ParseULID(rel.TargetID)
-			if parseErr != nil {
-				slog.Warn("engine: batch: skipping inline relationship with invalid target_id", "target_id", rel.TargetID, "err", parseErr)
-				continue
-			}
-			relAssoc := &storage.Association{
-				TargetID:   targetULID,
-				RelType:    storage.RelType(relTypeFromString(rel.Relation)),
-				Weight:     rel.Weight,
-				Confidence: 1.0,
-				CreatedAt:  time.Now(),
-			}
-			if err := e.store.WriteAssociation(ctx, p.wsPrefix, id, targetULID, relAssoc); err != nil {
-				slog.Warn("engine: batch: failed to write inline relationship", "target_id", rel.TargetID, "err", err)
-			}
-		}
-
-		// Store caller-provided entity-to-entity relationships in the 0x21 relationship index.
-		if len(p.callerEntityRelationships) > 0 {
-			wsER, ok := e.store.FindVaultPrefix(id)
-			if !ok {
-				slog.Warn("engine: batch: failed to find vault prefix for entity relationships", "vault", p.vaultName, "engram", id.String())
-			} else {
-				for _, er := range p.callerEntityRelationships {
-					if er.FromEntity == "" || er.ToEntity == "" || er.RelType == "" {
-						continue
-					}
-					weight := er.Weight
-					if weight <= 0 {
-						weight = 0.9
-					}
-					if err := e.store.UpsertRelationshipRecord(ctx, wsER, id, storage.RelationshipRecord{
-						FromEntity: er.FromEntity,
-						ToEntity:   er.ToEntity,
-						RelType:    er.RelType,
-						Weight:     weight,
-						Source:     "inline",
-					}); err != nil {
-						slog.Warn("engine: batch: failed to store entity relationship", "vault", p.vaultName, "engram", id.String(), "from", er.FromEntity, "to", er.ToEntity, "rel_type", er.RelType, "err", err)
-					}
-				}
-			}
-		}
-
-		// When the caller provided an embedding, mark DigestEmbed so the retroactive
-		// processor does not overwrite it, then insert into HNSW inline so the vector
-		// is searchable immediately.
-		if len(reqs[i].Embedding) > 0 {
-			existing, _ := e.store.GetDigestFlags(ctx, plugin.ULID(id))
-			if err := e.store.SetDigestFlag(ctx, id, existing|plugin.DigestEmbed); err != nil {
-				slog.Warn("engine: batch: failed to set DigestEmbed flag", "id", id.String(), "err", err)
-			}
-			if err := e.hnswRegistry.Insert(ctx, p.wsPrefix, [16]byte(id), reqs[i].Embedding); err != nil {
-				slog.Warn("engine: batch: failed to insert client embedding into HNSW", "id", id.String(), "err", err)
-			}
-		}
-
-		if p.skipBackgroundEnrich {
-			_ = e.store.SetDigestFlag(ctx, id, plugin.DigestEnrich)
-		}
 
 		if err := e.store.WriteVaultName(p.wsPrefix, p.vaultName); err != nil {
 			slog.Warn("engine: failed to persist vault name", "vault", p.vaultName, "err", err)

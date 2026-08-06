@@ -25,10 +25,29 @@ type LLMStats struct {
 type ObservabilitySnapshot struct {
 	System     SystemStats                   `json:"system"`
 	Storage    StorageStats                  `json:"storage"`
-	Processors []ProcessorStats             `json:"processors"`
+	PostCommit PostCommitStats               `json:"post_commit"`
+	Processors []ProcessorStats              `json:"processors"`
 	Workers    WorkerStatsSnapshot           `json:"cognitive_workers"`
 	Vaults     map[string]VaultObservability `json:"vaults"`
 	LLM        *LLMStats                     `json:"llm,omitempty"`
+}
+
+// PostCommitStats holds fixed-cardinality aggregate outcomes for required
+// persistence that runs after the primary engram commit.
+type PostCommitStats struct {
+	Attempts                   int64 `json:"attempts"`
+	Completed                  int64 `json:"completed"`
+	Degraded                   int64 `json:"degraded"`
+	EntityRecordFailures       int64 `json:"entity_record_failures"`
+	EntityLinkFailures         int64 `json:"entity_link_failures"`
+	CoOccurrenceFailures       int64 `json:"co_occurrence_failures"`
+	AssociationFailures        int64 `json:"association_failures"`
+	EntityRelationshipFailures int64 `json:"entity_relationship_failures"`
+	DigestFlagFailures         int64 `json:"digest_flag_failures"`
+	EmbeddingFailures          int64 `json:"embedding_failures"`
+	Timeouts                   int64 `json:"timeouts"`
+	ShutdownCancellations      int64 `json:"shutdown_cancellations"`
+	ShutdownRejections         int64 `json:"shutdown_rejections"`
 }
 
 // SystemStats holds Go runtime and process-level metrics.
@@ -259,6 +278,7 @@ func (e *Engine) Observability(ctx context.Context, version string, uptimeSecond
 	return &ObservabilitySnapshot{
 		System:     sys,
 		Storage:    stor,
+		PostCommit: e.postCommitCounters.snapshot(),
 		Processors: processors,
 		Workers:    workers,
 		Vaults:     vaults,

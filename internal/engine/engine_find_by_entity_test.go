@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/scrypster/muninndb/internal/storage"
 	"github.com/stretchr/testify/require"
@@ -113,9 +114,10 @@ func TestFindByEntity_ExcludesSoftDeleted(t *testing.T) {
 // FindByEntity walked the reverse index oldest-first and stopped at the cap, so
 // for any entity with more than `limit` observations every recent write was
 // invisible. It writes more engrams than a single page, then asserts:
-//   (1) a capped read returns the NEWEST engrams, newest-first;
-//   (2) offset paginates through older engrams without overlap;
-//   (3) Total reflects the full set, not the page.
+//
+//	(1) a capped read returns the NEWEST engrams, newest-first;
+//	(2) offset paginates through older engrams without overlap;
+//	(3) Total reflects the full set, not the page.
 func TestFindByEntity_NewestFirstAndPaging(t *testing.T) {
 	t.Parallel()
 	eng, cleanup := testEnv(t)
@@ -131,10 +133,17 @@ func TestFindByEntity_NewestFirstAndPaging(t *testing.T) {
 		Name: entity, Type: "concept", Source: "inline",
 	}, "inline"))
 
-	// Write engrams in order; ULIDs are monotonic, so ids[i] for larger i is newer.
+	// Give each fixture a distinct timestamp so ULID order deterministically
+	// represents creation order. NewULID creates a fresh monotonic entropy source
+	// per call, so independently generated IDs in one millisecond are unordered.
+	createdAt := time.Now().Add(-time.Duration(total) * time.Millisecond)
 	ids := make([]storage.ULID, 0, total)
 	for i := 0; i < total; i++ {
-		e := &storage.Engram{Concept: "paging", Content: "obs"}
+		e := &storage.Engram{
+			Concept:   "paging",
+			Content:   "obs",
+			CreatedAt: createdAt.Add(time.Duration(i) * time.Millisecond),
+		}
 		id, err := eng.store.WriteEngram(ctx, ws, e)
 		require.NoError(t, err)
 		require.NoError(t, eng.store.WriteEntityEngramLink(ctx, ws, id, entity))

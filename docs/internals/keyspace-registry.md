@@ -47,7 +47,7 @@ prefix — see the vault-reuse note at the bottom).
 | 0x16 | ws+id(16)+ts(8)+seq(4) | provenance | async worker |
 | 0x17 | ws | migration version+cursor | |
 | 0x18 | ws+ulid | quantize params + int8 embedding | ERF v2 vector |
-| **0x19** | siphash(opID)(8) → JSON receipt | idempotency | **shared with replication (see below) — safe only by JSON-vs-msgpack decode accident** |
+| **0x19** | siphash(opID)(8) → legacy JSON receipt; ws(8)+siphash(opID)(8) → payload JSON receipt | idempotency + payload identity | **shared with replication (see below); receipt readers and cleanup must discriminate exact key shape and validate values** |
 | 0x1A | ws+episodeID(16)[+0xFF+pos(4)] | episode/frame | |
 | 0x1B | ws | uint8 FTS schema version | |
 | 0x1C | ws+src+dst | PAS transition | |
@@ -104,12 +104,17 @@ keyspace; coincidental, safe, but confusing. Prefer `0x2C+` for new storage pref
    (`prefix_test.go`), so 0x11–0x14 are now storage-only. No action needed; do not
    reintroduce an auth key in 0x11–0x14.
 
-2. **0x19 is shared idempotency+replication territory.** `PurgeExpiredIdempotency` scans
-   the *entire* 0x19 range including replication log/epoch entries and only survives
-   because msgpack payloads fail JSON unmarshal (silently skipped). Any special-cased key
-   there must be **exact-match, never prefix-skip** (as `snapshot.go` already does for
-   `cluster_epoch`). Never switch replication values to JSON or receipts to msgpack
-   without revisiting this.
+2. **0x19 is shared idempotency+payload-receipt+replication territory.** Legacy
+   idempotency receipts have exact 9-byte keys (`0x19|siphash(opID)`); vault-scoped payload
+   receipts have exact 17-byte keys (`0x19|ws|siphash(opID)`). Replication log and metadata
+   keys also share this prefix. `PurgeExpiredIdempotency` may delete only decoded legacy
+   receipts with exact 9-byte keys, or exact-schema payload receipts with exact 17-byte
+   keys whose full stored `op_id` recomputes the same key. Vault cleanup applies the same
+   strict 17-byte validation. Malformed or mismatched records are alarmed and preserved.
+   Any other
+   special-cased key must be **exact-match, never prefix-skip** (as `snapshot.go` already
+   does for `cluster_epoch`). Never change replication or receipt encodings without
+   revisiting every 0x19 scanner.
 
 3. **0x0C tag index is now read by tag-scoped recall (#619).** `ListByTagInRange` /
    `ListByTagsAllInRange` (`internal/storage/query.go`) seed the candidate pool for

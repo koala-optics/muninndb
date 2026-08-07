@@ -1,9 +1,11 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/scrypster/muninndb/internal/prefix"
@@ -54,6 +56,13 @@ var clearVaultDataPrefixes = []byte{
 //   - 0x1F entity records (global by entity hash; orphan records are pruned
 //     after vault-scoped links are removed)
 func (ps *PebbleStore) ClearVault(ctx context.Context, ws [8]byte) (int64, error) {
+	mu := payloadReceiptVaultLocks.For(ws[:])
+	mu.Lock()
+	defer mu.Unlock()
+	return ps.clearVault(ctx, ws)
+}
+
+func (ps *PebbleStore) clearVault(ctx context.Context, ws [8]byte) (int64, error) {
 	// Capture count before anything is deleted.
 	vaultCount := ps.GetVaultCount(ctx, ws)
 	entityMentions, err := ps.collectVaultEntityMentions(ws)
@@ -107,6 +116,9 @@ func (ps *PebbleStore) ClearVault(ctx context.Context, ws [8]byte) (int64, error
 	if err := ps.deleteVaultEntityReverseIndex(batch, ws); err != nil {
 		return 0, fmt.Errorf("clear vault: delete entity reverse index: %w", err)
 	}
+	if err := ps.deleteVaultPayloadReceipts(batch, ws); err != nil {
+		return 0, fmt.Errorf("clear vault: delete payload receipts: %w", err)
+	}
 	if err := batch.Commit(pebble.Sync); err != nil {
 		return 0, fmt.Errorf("clear vault: commit: %w", err)
 	}
@@ -141,6 +153,39 @@ func (ps *PebbleStore) ClearVault(ctx context.Context, ws [8]byte) (int64, error
 	ps.recentActiveCache.Delete(ws)
 
 	return vaultCount, nil
+}
+
+func (ps *PebbleStore) deleteVaultPayloadReceipts(batch *pebble.Batch, ws [8]byte) error {
+	lo := make([]byte, 9)
+	lo[0] = prefix.Idempotency
+	copy(lo[1:], ws[:])
+	iter, err := ps.db.NewIter(&pebble.IterOptions{
+		LowerBound: lo,
+		UpperBound: keys.PrefixUpperBound(lo),
+	})
+	if err != nil {
+		return err
+	}
+	defer iter.Close()
+	for valid := iter.First(); valid; valid = iter.Next() {
+		key := iter.Key()
+		if len(key) != 17 {
+			continue
+		}
+		receipt, err := decodePayloadReceipt(iter.Value())
+		if err != nil {
+			slog.Warn("clear vault: preserved unrecognized 17-byte 0x19 record", "vault_prefix", fmt.Sprintf("%x", ws), "key", fmt.Sprintf("%x", key))
+			continue
+		}
+		if !bytes.Equal(key, keys.PayloadReceiptKey(ws, receipt.OpID)) {
+			slog.Warn("clear vault: preserved payload receipt key mismatch", "vault_prefix", fmt.Sprintf("%x", ws), "key", fmt.Sprintf("%x", key))
+			continue
+		}
+		if err := batch.Delete(append([]byte(nil), key...), nil); err != nil {
+			return err
+		}
+	}
+	return iter.Error()
 }
 
 func (ps *PebbleStore) collectVaultEntityMentions(ws [8]byte) (map[string]int, error) {

@@ -20,6 +20,7 @@ var allMCPTools = []string{
 	"muninn_remember_batch",
 	"muninn_recall",
 	"muninn_read",
+	"muninn_payload_receipt",
 	"muninn_forget",
 	"muninn_link",
 	"muninn_contradictions",
@@ -60,6 +61,7 @@ var allMCPTools = []string{
 	"muninn_trust",
 	"muninn_entity",
 	"muninn_entities",
+	"muninn_owner_inventory",
 }
 
 // adminLogin POSTs to the UI login endpoint (:8476) and returns the muninn_session cookie.
@@ -349,6 +351,34 @@ func TestSmoke_AllMCPTools(t *testing.T) {
 		})
 		if id, _ := result["id"].(string); id == "" {
 			t.Errorf("expected id in result, got: %v", result)
+		}
+	})
+
+	t.Run("muninn_payload_receipt", func(t *testing.T) {
+		const opID = "smoke-payload-receipt"
+		remember := mcpTool(t, tok, "muninn_remember", map[string]any{
+			"vault":   vault,
+			"concept": "payload receipt smoke test",
+			"content": "smoke test payload receipt",
+			"op_id":   opID,
+		})
+		memoryID, _ := remember["id"].(string)
+		if memoryID == "" {
+			t.Fatalf("expected id in payload-bound remember result, got: %v", remember)
+		}
+		result := mcpTool(t, tok, "muninn_payload_receipt", map[string]any{
+			"vault": vault,
+			"op_id": opID,
+		})
+		if result["memory_id"] != memoryID {
+			t.Fatalf("payload receipt memory_id = %v, want %s", result["memory_id"], memoryID)
+		}
+		digest, _ := result["observed_payload_sha256"].(string)
+		if len(digest) != 64 {
+			t.Fatalf("payload receipt digest length = %d, want 64", len(digest))
+		}
+		if len(result) != 2 {
+			t.Fatalf("payload receipt exposed unexpected fields: %v", result)
 		}
 	})
 
@@ -954,6 +984,30 @@ func TestSmoke_AllMCPTools(t *testing.T) {
 		})
 		if errVal, hasErr := result["error"]; hasErr {
 			t.Errorf("muninn_entities returned error field: %v", errVal)
+		}
+	})
+
+	t.Run("muninn_owner_inventory", func(t *testing.T) {
+		result := mcpTool(t, tok, "muninn_owner_inventory", map[string]any{
+			"vault":  vault,
+			"limit":  1,
+			"offset": 0,
+		})
+		if total, ok := result["total"].(float64); !ok || total < 2 {
+			t.Errorf("muninn_owner_inventory total = %v, want at least 2", result["total"])
+		}
+		if limit := result["limit"]; limit != float64(1) {
+			t.Errorf("muninn_owner_inventory limit = %v, want 1", limit)
+		}
+		if offset := result["offset"]; offset != float64(0) {
+			t.Errorf("muninn_owner_inventory offset = %v, want 0", offset)
+		}
+		engrams, ok := result["engrams"].([]any)
+		if !ok || len(engrams) != 1 {
+			t.Errorf("muninn_owner_inventory engrams = %v, want one row", result["engrams"])
+		}
+		if entityCount, ok := result["entity_count"].(float64); !ok || entityCount < 3 {
+			t.Errorf("muninn_owner_inventory entity_count = %v, want at least 3", result["entity_count"])
 		}
 	})
 

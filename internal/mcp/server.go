@@ -32,23 +32,6 @@ type MCPServer struct {
 
 	sseSessionsMu sync.RWMutex
 	sseSessions   map[string]*sseSession // sessionID → session
-	// NOTE: idempotencyLocks grows by one entry per unique op_id seen during the
-	// process lifetime. In practice op_id cardinality is low (client-generated,
-	// not per-request UUIDs), so growth is bounded by usage patterns. The
-	// canonical exactly-once guarantee lives in Pebble; the in-memory lock only
-	// prevents the concurrent check→write TOCTOU race during the narrow window
-	// before a receipt is written. Disk accumulation is addressed by
-	// runIdempotencySweep (see engine.go).
-	idempotencyLocks sync.Map
-}
-
-// getIdempotencyLock returns (or lazily creates) a per-op_id mutex. This is
-// used by handleRemember to prevent TOCTOU races when two concurrent requests
-// arrive with the same op_id: only one goroutine at a time can execute the
-// check→write→store-receipt flow for a given op_id.
-func (s *MCPServer) getIdempotencyLock(opID string) *sync.Mutex {
-	v, _ := s.idempotencyLocks.LoadOrStore(opID, &sync.Mutex{})
-	return v.(*sync.Mutex)
 }
 
 type sseSession struct {
@@ -254,19 +237,24 @@ func (s *MCPServer) dispatchToolCall(ctx context.Context, w http.ResponseWriter,
 		}
 	}
 
+	if req.Params.Name == "muninn_remember" {
+		s.handleRememberRaw(ctx, w, req.ID, vault, args, req.Params.RawArguments)
+		return
+	}
+
 	handlers := map[string]func(context.Context, http.ResponseWriter, json.RawMessage, string, map[string]any){
-		"muninn_remember":       s.handleRemember,
-		"muninn_remember_batch": s.handleRememberBatch,
-		"muninn_recall":         s.handleRecall,
-		"muninn_read":           s.handleRead,
-		"muninn_forget":         s.handleForget,
-		"muninn_link":           s.handleLink,
-		"muninn_contradictions": s.handleContradictions,
-		"muninn_status":         s.handleStatus,
-		"muninn_evolve":         s.handleEvolve,
-		"muninn_consolidate":    s.handleConsolidate,
-		"muninn_session":        s.handleSession,
-		"muninn_decide":         s.handleDecide,
+		"muninn_payload_receipt": s.handlePayloadReceipt,
+		"muninn_remember_batch":  s.handleRememberBatch,
+		"muninn_recall":          s.handleRecall,
+		"muninn_read":            s.handleRead,
+		"muninn_forget":          s.handleForget,
+		"muninn_link":            s.handleLink,
+		"muninn_contradictions":  s.handleContradictions,
+		"muninn_status":          s.handleStatus,
+		"muninn_evolve":          s.handleEvolve,
+		"muninn_consolidate":     s.handleConsolidate,
+		"muninn_session":         s.handleSession,
+		"muninn_decide":          s.handleDecide,
 		// Epic 18: tools 12-17
 		"muninn_restore":                   s.handleRestore,
 		"muninn_traverse":                  s.handleTraverse,
@@ -319,9 +307,10 @@ func (s *MCPServer) dispatchToolCall(ctx context.Context, w http.ResponseWriter,
 		// SGD learning loop feedback
 		"muninn_feedback": s.handleFeedback,
 
-		// Entity aggregate view
-		"muninn_entity":   s.handleEntity,
-		"muninn_entities": s.handleEntities,
+		// Entity aggregate and passive owner inventory views
+		"muninn_entity":          s.handleEntity,
+		"muninn_entities":        s.handleEntities,
+		"muninn_owner_inventory": s.handleOwnerInventory,
 
 		// Trust label
 		"muninn_trust": s.handleSetTrust,
@@ -344,7 +333,7 @@ func (s *MCPServer) dispatchToolCall(ctx context.Context, w http.ResponseWriter,
 func registeredToolNames() []string {
 	// Keep in sync with the handlers map in dispatchToolCall.
 	return []string{
-		"muninn_remember", "muninn_remember_batch", "muninn_recall", "muninn_read",
+		"muninn_remember", "muninn_payload_receipt", "muninn_remember_batch", "muninn_recall", "muninn_read",
 		"muninn_forget", "muninn_link", "muninn_contradictions", "muninn_status",
 		"muninn_evolve", "muninn_consolidate", "muninn_session", "muninn_decide",
 		"muninn_restore", "muninn_traverse", "muninn_explain", "muninn_state",
@@ -355,7 +344,7 @@ func registeredToolNames() []string {
 		"muninn_entity_state_batch", "muninn_entity_clusters", "muninn_export_graph",
 		"muninn_similar_entities", "muninn_merge_entity", "muninn_entity_timeline",
 		"muninn_replay_enrichment", "muninn_provenance", "muninn_feedback",
-		"muninn_entity", "muninn_entities",
+		"muninn_entity", "muninn_entities", "muninn_owner_inventory",
 		"muninn_trust",
 		"muninn_compare_and_set", "muninn_claim", "muninn_release",
 		"muninn_create_workflow_vault",

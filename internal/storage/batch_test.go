@@ -121,6 +121,25 @@ func TestStoreBatch_DiscardAfterCommit_IsIdempotent(t *testing.T) {
 
 // TestStoreBatch_DefaultsApplied verifies that the batch applies the same
 // field defaults (state, confidence, stability, timestamps) as WriteEngram.
+func TestStoreBatch_DiscardAfterCommit_ClosesConcreteBatch(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStoreForBatch(t)
+	ws := store.VaultPrefix("closed-after-commit")
+	batch := store.NewBatch().(*pebbleStoreBatch)
+	if err := batch.WriteEngram(ctx, ws, &Engram{Concept: "closed", Content: "batch"}); err != nil {
+		t.Fatalf("WriteEngram: %v", err)
+	}
+	if err := batch.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	batch.Discard()
+	if batch.batch != nil {
+		t.Fatal("committed batch retained its concrete batch after Discard")
+	}
+	batch.Discard()
+}
+
 func TestStoreBatch_DefaultsApplied(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStoreForBatch(t)

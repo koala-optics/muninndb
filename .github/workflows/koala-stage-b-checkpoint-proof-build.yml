@@ -3,9 +3,21 @@ name: Koala Stage B Checkpoint Proof Build
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: Operation to run
+        required: true
+        default: checkpoint-proof-helper
+        type: choice
+        options:
+          - checkpoint-proof-helper
+          - pr84-payload-receipt-qualification
       helper_commit:
         description: Exact 40-character Koala commit containing the helper
-        required: true
+        required: false
+        type: string
+      qualification_commit:
+        description: Exact authorized PR 84 commit
+        required: false
         type: string
 
 permissions:
@@ -27,6 +39,7 @@ env:
 
 jobs:
   build:
+    if: inputs.mode == 'checkpoint-proof-helper'
     name: Build pinned checkpoint verifier helper
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -260,3 +273,105 @@ jobs:
             /tmp/koala-stage-b-checkpoint-proof/provenance.sha256
           if-no-files-found: warn
           retention-days: 30
+
+  qualify-pr84:
+    if: inputs.mode == 'pr84-payload-receipt-qualification'
+    name: Qualify exact PR 84 payload-receipt commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      AUTHORIZED_COMMIT: a9c1f785b86195975cbc1c8f8611ac78d5871d87
+    steps:
+      - name: Validate exact authorized qualification input
+        shell: bash
+        env:
+          QUALIFICATION_COMMIT: ${{ inputs.qualification_commit }}
+        run: |
+          set -euo pipefail
+          test "$QUALIFICATION_COMMIT" = "$AUTHORIZED_COMMIT"
+
+      - name: Check out exact authorized PR commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.AUTHORIZED_COMMIT }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify exact authorized checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$AUTHORIZED_COMMIT"
+
+      - name: Run exact dispatch workflow contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          contract_root="$(mktemp -d)"
+          mkdir -p \
+            "$contract_root/.github/workflows" \
+            "$contract_root/scripts/tests"
+          git show "$GITHUB_SHA:.github/workflows/ci.yml" > \
+            "$contract_root/.github/workflows/ci.yml"
+          git show "$GITHUB_SHA:.github/workflows/koala-stage-b-checkpoint-proof-build.yml" > \
+            "$contract_root/.github/workflows/koala-stage-b-checkpoint-proof-build.yml"
+          git show "$GITHUB_SHA:scripts/tests/test_koala_pr84_qualification_workflow.py" > \
+            "$contract_root/scripts/tests/test_koala_pr84_qualification_workflow.py"
+          python3 "$contract_root/scripts/tests/test_koala_pr84_qualification_workflow.py"
+
+      - name: Set up exact Go toolchain
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Fetch immutable hash-checked local embed assets
+        shell: bash
+        env:
+          MODEL_URL: https://huggingface.co/Xenova/bge-small-en-v1.5/resolve/ea104dacec62c0de699686887e3f920caeb4f3e3/onnx/model_int8.onnx
+          MODEL_SHA256: bf64d05457cb391fa88d045faf5927a15ea36d96228ddf23ea970087afdc1197
+          TOKENIZER_URL: https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/5c38ec7c405ec4b44b94cc5a9bb96e735b38267a/tokenizer.json
+          TOKENIZER_SHA256: d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66
+          ORT_URL: https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-linux-x64-1.24.2.tgz
+          ORT_SHA256: 43725474ba5663642e17684717946693850e2005efbd724ac72da278fead25e6
+        run: |
+          set -euo pipefail
+          asset_dir=internal/plugin/embed/assets
+          mkdir -p "$asset_dir"
+          curl --fail --location --silent --show-error \
+            "$MODEL_URL" --output "$asset_dir/model_int8.onnx"
+          printf '%s  %s\n' "$MODEL_SHA256" "$asset_dir/model_int8.onnx" | \
+            sha256sum --check --strict
+          curl --fail --location --silent --show-error \
+            "$TOKENIZER_URL" --output "$asset_dir/tokenizer.json"
+          printf '%s  %s\n' "$TOKENIZER_SHA256" "$asset_dir/tokenizer.json" | \
+            sha256sum --check --strict
+          curl --fail --location --silent --show-error \
+            "$ORT_URL" --output /tmp/onnxruntime-linux-x64.tgz
+          printf '%s  %s\n' "$ORT_SHA256" /tmp/onnxruntime-linux-x64.tgz | \
+            sha256sum --check --strict
+          tar -xzf /tmp/onnxruntime-linux-x64.tgz -C /tmp \
+            onnxruntime-linux-x64-1.24.2/lib/libonnxruntime.so.1.24.2
+          cp /tmp/onnxruntime-linux-x64-1.24.2/lib/libonnxruntime.so.1.24.2 \
+            "$asset_dir/libonnxruntime_linux_amd64.so"
+
+      - name: Build web assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd web
+          npm ci --ignore-scripts
+          npm run build
+
+      - name: Run exact PR 84 qualification gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          go build -tags localassets -o muninndb-server ./cmd/muninn/...
+          go vet -tags localassets ./...
+          go test -tags localassets ./... -timeout 300s -race
+          go test -tags localassets,integration -v -timeout 120s ./cmd/muninn/...
+          go test -tags localassets,integration -v -timeout 120s ./internal/plugin/embed/...
+          git diff --check

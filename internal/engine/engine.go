@@ -877,6 +877,16 @@ func (e *Engine) Hello(ctx context.Context, req *mbp.HelloRequest) (*mbp.HelloRe
 
 // Write implements mbp.EngineAPI.Write.
 func (e *Engine) Write(ctx context.Context, req *mbp.WriteRequest) (*mbp.WriteResponse, error) {
+	return e.write(ctx, req, nil)
+}
+
+// payloadWrite binds a new write to one server-owned request-payload receipt.
+type payloadWrite struct {
+	opID   string
+	digest string
+}
+
+func (e *Engine) write(ctx context.Context, req *mbp.WriteRequest, payload *payloadWrite) (*mbp.WriteResponse, error) {
 	writeStart := time.Now()
 	wsPrefix := e.store.ResolveVaultPrefix(req.Vault)
 	e.activity.Record(wsPrefix)
@@ -914,6 +924,13 @@ func (e *Engine) Write(ctx context.Context, req *mbp.WriteRequest) (*mbp.WriteRe
 	if existingID, err := e.store.GetContentHash(ctx, wsPrefix, contentHash); err == nil && existingID != (storage.ULID{}) {
 		// A mapping exists — verify the engram is still live (not soft-deleted).
 		if existingEng, err := e.store.GetEngram(ctx, wsPrefix, existingID); err == nil && existingEng.State != storage.StateSoftDeleted {
+			// Payload-bound duplicate success still needs durable proof tying this
+			// operation to the existing memory before the server can acknowledge it.
+			if payload != nil {
+				if err := e.store.WritePayloadReceipt(ctx, wsPrefix, payload.opID, existingID.String(), payload.digest); err != nil {
+					return nil, fmt.Errorf("write payload receipt for duplicate content: %w", err)
+				}
+			}
 			// Reinforce: increment access count and update LastAccess
 			// to signal that this content is being re-experienced.
 			// Release the stripe lock before UpdateMetadata — the dedup decision
@@ -1012,8 +1029,15 @@ func (e *Engine) Write(ctx context.Context, req *mbp.WriteRequest) (*mbp.WriteRe
 		return nil, err
 	}
 
-	// Write to store
-	id, err := e.store.WriteEngram(ctx, wsPrefix, eng)
+	// Write to store. Payload-bound MCP writes commit the engram and receipt in
+	// one Pebble batch; all other transports retain the existing WriteEngram path.
+	var id storage.ULID
+	var err error
+	if payload != nil {
+		id, err = e.store.WriteEngramWithPayloadReceipt(ctx, wsPrefix, eng, payload.opID, payload.digest)
+	} else {
+		id, err = e.store.WriteEngram(ctx, wsPrefix, eng)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("write engram: %w", err)
 	}
@@ -1326,6 +1350,83 @@ func (e *Engine) Write(ctx context.Context, req *mbp.WriteRequest) (*mbp.WriteRe
 		ID:        id.String(),
 		CreatedAt: time.Now().UnixNano(),
 	}, nil
+}
+
+var (
+	// ErrPayloadReceiptConflict means an operation ID is already bound to a
+	// different complete request payload in the resolved vault.
+	ErrPayloadReceiptConflict = errors.New("payload receipt conflict")
+	// ErrLegacyPayloadReceipt means only the old global, digest-free receipt
+	// exists. It cannot be promoted into payload proof.
+	ErrLegacyPayloadReceipt = errors.New("legacy idempotency receipt lacks payload proof")
+)
+
+// WriteWithPayloadReceipt performs a payload-bound MCP write while preserving
+// Write's existing behavior for gRPC, REST, MQL, and digest-free callers.
+func (e *Engine) WriteWithPayloadReceipt(ctx context.Context, req *mbp.WriteRequest, opID, payloadSHA256 string) (*mbp.WriteResponse, error) {
+	if req == nil {
+		return nil, fmt.Errorf("%w: write request is required", ErrInvalidRequest)
+	}
+	if err := storage.ValidatePayloadIdentity(opID, payloadSHA256); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+	}
+	vaultName := req.Vault
+	if vaultName == "" {
+		vaultName = "default"
+	}
+	wsPrefix := e.store.ResolveVaultPrefix(vaultName)
+	mu := e.getIdempotencyLock(opID)
+	mu.Lock()
+	defer mu.Unlock()
+
+	receipt, err := e.store.CheckPayloadReceipt(ctx, wsPrefix, opID)
+	if err != nil {
+		return nil, err
+	}
+	if receipt != nil {
+		if receipt.PayloadSHA256 != payloadSHA256 {
+			return nil, ErrPayloadReceiptConflict
+		}
+		receiptID, parseErr := storage.ParseULID(receipt.EngramID)
+		if parseErr != nil {
+			return nil, fmt.Errorf("invalid stored payload receipt engram_id: %w", parseErr)
+		}
+		existing, readErr := e.store.GetEngram(ctx, wsPrefix, receiptID)
+		if readErr == nil && existing.State != storage.StateSoftDeleted {
+			return &mbp.WriteResponse{ID: receipt.EngramID, Hint: "idempotent"}, nil
+		}
+		if readErr != nil && !errors.Is(readErr, storage.ErrNotFound) {
+			return nil, fmt.Errorf("verify payload receipt engram: %w", readErr)
+		}
+		// A hard- or soft-deleted engram cannot be acknowledged by an old receipt.
+		// Delete only this already-validated exact receipt, then execute the write again.
+		if err := e.store.DeletePayloadReceipt(ctx, wsPrefix, opID, receipt.EngramID, receipt.PayloadSHA256); err != nil {
+			return nil, fmt.Errorf("delete dangling payload receipt: %w", err)
+		}
+	}
+	if legacy, err := e.store.CheckIdempotency(ctx, opID); err != nil {
+		return nil, err
+	} else if legacy != nil {
+		return nil, ErrLegacyPayloadReceipt
+	}
+
+	// Payload identity is the complete original MCP arguments object. Prevent
+	// the legacy Write path from creating a separate global receipt.
+	copyReq := *req
+	copyReq.Vault = vaultName
+	copyReq.IdempotentID = ""
+	return e.write(ctx, &copyReq, &payloadWrite{opID: opID, digest: payloadSHA256})
+}
+
+// ReadPayloadReceipt returns the server-owned receipt for one resolved vault.
+func (e *Engine) ReadPayloadReceipt(ctx context.Context, vault, opID string) (*storage.PayloadReceipt, error) {
+	if opID == "" {
+		return nil, fmt.Errorf("%w: op_id is required", ErrInvalidRequest)
+	}
+	if vault == "" {
+		vault = "default"
+	}
+	return e.store.CheckPayloadReceipt(ctx, e.store.ResolveVaultPrefix(vault), opID)
 }
 
 // MaxBatchSize is the maximum number of items allowed in a single WriteBatch call.

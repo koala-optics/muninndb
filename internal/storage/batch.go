@@ -132,10 +132,15 @@ func (b *pebbleStoreBatch) WriteEngram(ctx context.Context, wsPrefix [8]byte, en
 	// 0x10: relevance bucket key
 	b.batch.Set(keys.RelevanceBucketKey(wsPrefix, eng.Relevance, id16), []byte{}, nil)
 
-	// 0x22: LastAccess index — seed with LastAccess (= CreatedAt for new engrams).
+	// 0x22: LastAccess index - seed with LastAccess (= CreatedAt for new engrams).
 	laMillis := eng.LastAccess.UnixMilli()
 	laKey := keys.LastAccessIndexKey(wsPrefix, laMillis, id16)
 	b.batch.Set(laKey, nil, nil)
+
+	// 0x2B: vault-scoped concept reverse index.
+	if eng.Concept != "" {
+		b.batch.Set(keys.ConceptIndexKey(wsPrefix, keys.Hash(eng.Concept), id16), []byte{}, nil)
+	}
 
 	b.pendingItems = append(b.pendingItems, batchPendingItem{wsPrefix: wsPrefix, eng: eng})
 	return nil
@@ -277,7 +282,9 @@ func (b *pebbleStoreBatch) Commit() error {
 
 // Discard releases the batch resources. Safe to call after Commit (idempotent).
 func (b *pebbleStoreBatch) Discard() {
-	if !b.committed {
-		b.batch.Close()
+	if b.batch == nil {
+		return
 	}
+	_ = b.batch.Close()
+	b.batch = nil
 }

@@ -7,9 +7,9 @@ import (
 )
 
 // Bootstrap ensures an admin user, session secret, and default vault config exist.
-// On first run, creates "root" with the default password "password", sets the
-// "default" vault to public (no API key required), and prints a reminder to
-// change the password. Subsequent runs are no-ops.
+// On first run, creates "root" with the default password "password" or the value
+// of MUNINN_ADMIN_PASSWORD. On subsequent runs, a non-empty environment value is
+// applied to the existing root account; otherwise its password remains unchanged.
 // secretPath is where the session signing secret is persisted (e.g. dataDir/auth_secret).
 func Bootstrap(store *Store, secretPath string) (secret []byte, err error) {
 	// Load or generate session secret
@@ -25,9 +25,10 @@ func Bootstrap(store *Store, secretPath string) (secret []byte, err error) {
 		slog.Info("generated new session secret", "path", secretPath)
 	}
 
+	envPassword := os.Getenv("MUNINN_ADMIN_PASSWORD")
+
 	// Create root admin if none exists
 	if !store.AdminExists() {
-		envPassword := os.Getenv("MUNINN_ADMIN_PASSWORD")
 		adminPassword := envPassword
 		if adminPassword == "" {
 			adminPassword = "password"
@@ -58,6 +59,11 @@ func Bootstrap(store *Store, secretPath string) (secret []byte, err error) {
 			fmt.Println("│  in the admin UI before exposing to a network.     │")
 			fmt.Println("└──────────────────────────────────────────────────┘")
 		}
+	} else if envPassword != "" {
+		if changeErr := store.ChangeAdminPassword("root", envPassword); changeErr != nil {
+			return nil, fmt.Errorf("apply MUNINN_ADMIN_PASSWORD to root admin: %w", changeErr)
+		}
+		slog.Info("root admin password updated from MUNINN_ADMIN_PASSWORD")
 	}
 
 	// Ensure at least one vault config exists. Covers both fresh installs

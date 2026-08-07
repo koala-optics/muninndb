@@ -61,6 +61,7 @@ var allMCPTools = []string{
 	"muninn_trust",
 	"muninn_entity",
 	"muninn_entities",
+	"muninn_owner_inventory",
 }
 
 // adminLogin POSTs to the UI login endpoint (:8476) and returns the muninn_session cookie.
@@ -983,6 +984,30 @@ func TestSmoke_AllMCPTools(t *testing.T) {
 		})
 		if errVal, hasErr := result["error"]; hasErr {
 			t.Errorf("muninn_entities returned error field: %v", errVal)
+		}
+	})
+
+	t.Run("muninn_owner_inventory", func(t *testing.T) {
+		result := mcpTool(t, tok, "muninn_owner_inventory", map[string]any{
+			"vault":  vault,
+			"limit":  1,
+			"offset": 0,
+		})
+		if total, ok := result["total"].(float64); !ok || total < 2 {
+			t.Errorf("muninn_owner_inventory total = %v, want at least 2", result["total"])
+		}
+		if limit := result["limit"]; limit != float64(1) {
+			t.Errorf("muninn_owner_inventory limit = %v, want 1", limit)
+		}
+		if offset := result["offset"]; offset != float64(0) {
+			t.Errorf("muninn_owner_inventory offset = %v, want 0", offset)
+		}
+		engrams, ok := result["engrams"].([]any)
+		if !ok || len(engrams) != 1 {
+			t.Errorf("muninn_owner_inventory engrams = %v, want one row", result["engrams"])
+		}
+		if entityCount, ok := result["entity_count"].(float64); !ok || entityCount < 3 {
+			t.Errorf("muninn_owner_inventory entity_count = %v, want at least 3", result["entity_count"])
 		}
 	})
 

@@ -79,6 +79,45 @@ func TestBootstrap_Idempotent(t *testing.T) {
 	}
 }
 
+func TestBootstrap_EnvPasswordAppliedOnExistingInstance(t *testing.T) {
+	store := newTestStore(t)
+	secretPath := filepath.Join(t.TempDir(), "auth_secret")
+
+	if _, err := auth.Bootstrap(store, secretPath); err != nil {
+		t.Fatalf("Bootstrap first run: %v", err)
+	}
+	t.Setenv("MUNINN_ADMIN_PASSWORD", "replacement-password")
+	if _, err := auth.Bootstrap(store, secretPath); err != nil {
+		t.Fatalf("Bootstrap existing instance: %v", err)
+	}
+
+	if err := store.ValidateAdmin("root", "replacement-password"); err != nil {
+		t.Errorf("environment password was not applied: %v", err)
+	}
+	if err := store.ValidateAdmin("root", "password"); err == nil {
+		t.Error("old password remains valid after environment password update")
+	}
+}
+
+func TestBootstrap_EnvPasswordNotSetIdempotent(t *testing.T) {
+	store := newTestStore(t)
+	secretPath := filepath.Join(t.TempDir(), "auth_secret")
+
+	if _, err := auth.Bootstrap(store, secretPath); err != nil {
+		t.Fatalf("Bootstrap first run: %v", err)
+	}
+	if err := store.ChangeAdminPassword("root", "manual-change"); err != nil {
+		t.Fatalf("ChangeAdminPassword: %v", err)
+	}
+	if _, err := auth.Bootstrap(store, secretPath); err != nil {
+		t.Fatalf("Bootstrap existing instance: %v", err)
+	}
+
+	if err := store.ValidateAdmin("root", "manual-change"); err != nil {
+		t.Errorf("password changed without MUNINN_ADMIN_PASSWORD: %v", err)
+	}
+}
+
 // TestBootstrap_SecretFileExists verifies that if a secret file already exists
 // Bootstrap reuses it without overwriting.
 func TestBootstrap_SecretFileExists(t *testing.T) {

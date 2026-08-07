@@ -7,8 +7,8 @@ import (
 
 func TestAllToolDefinitionsCount(t *testing.T) {
 	tools := allToolDefinitions()
-	if len(tools) != 45 {
-		t.Errorf("expected 45 tools, got %d", len(tools))
+	if len(tools) != 46 {
+		t.Errorf("expected 46 tools, got %d", len(tools))
 	}
 }
 
@@ -112,6 +112,7 @@ func TestExpectedToolNames(t *testing.T) {
 		// Entity aggregate view
 		"muninn_entity",
 		"muninn_entities",
+		"muninn_owner_inventory",
 	}
 	for _, name := range expected {
 		if !names[name] {

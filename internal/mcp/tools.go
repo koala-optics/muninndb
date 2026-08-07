@@ -919,6 +919,19 @@ func allToolDefinitions() []ToolDefinition {
 				"required": []string{},
 			},
 		},
+		{
+			Name:        "muninn_owner_inventory",
+			Description: "Returns one passive engram inventory page plus the exact vault entity count. The response echoes limit and offset; continue until an explicit empty page at offset=total to prove complete enumeration.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"vault":  vaultProp,
+					"limit":  map[string]any{"type": "integer", "minimum": 1, "maximum": maxOwnerInventoryLimit, "default": defaultOwnerInventoryLimit, "description": "Page size (1-200, default 100)"},
+					"offset": map[string]any{"type": "integer", "minimum": 0, "maximum": maxOwnerInventoryOffset, "default": 0, "description": "Zero-based inventory offset"},
+				},
+				"required": []string{},
+			},
+		},
 		// Trust label
 		{
 			Name:        "muninn_trust",

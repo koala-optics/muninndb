@@ -97,11 +97,13 @@ jobs:
           go vet ./cmd/koala-stage-b-checkpoint-proof
           git diff --check
 
-      - name: Install pinned crane
+      - name: Install pinned registry clients
         shell: bash
         env:
           CRANE_VERSION: v0.21.7
           CRANE_SHA256: 1a57bc98207fa1c0d04bf760699099e26f8383499bfd55b99c1b919a928a7230
+          FLYCTL_VERSION: v0.4.52
+          FLYCTL_SHA256: f1d02cd67b328b69649b68648de6d67b18a0bd0acc862fc0a809862ee5e0e919
         run: |
           set -euo pipefail
           archive="go-containerregistry_Linux_x86_64.tar.gz"
@@ -111,6 +113,13 @@ jobs:
           printf '%s  %s\n' "$CRANE_SHA256" "/tmp/${archive}" | sha256sum --check --strict
           tar -xzf "/tmp/${archive}" -C /usr/local/bin crane
           crane version
+          archive="flyctl_${FLYCTL_VERSION#v}_Linux_x86_64.tar.gz"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            "https://github.com/superfly/flyctl/releases/download/${FLYCTL_VERSION}/${archive}" \
+            --output "/tmp/${archive}"
+          printf '%s  %s\n' "$FLYCTL_SHA256" "/tmp/${archive}" | sha256sum --check --strict
+          tar -xzf "/tmp/${archive}" -C /usr/local/bin flyctl
+          flyctl version
 
       - name: Authenticate exact baseline and helper registries
         shell: bash
@@ -121,7 +130,7 @@ jobs:
         run: |
           set -euo pipefail
           printf '%s' "$GHCR_TOKEN" | crane auth login ghcr.io --username "$GHCR_USERNAME" --password-stdin
-          printf '%s' "$FLY_API_TOKEN" | crane auth login registry.fly.io --username x --password-stdin
+          flyctl auth docker --access-token "$FLY_API_TOKEN"
 
       - name: Pull and fingerprint exact baseline binary
         shell: bash

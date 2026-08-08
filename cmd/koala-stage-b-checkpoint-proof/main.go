@@ -819,6 +819,9 @@ func failureSummary(_ error) publicSummary {
 }
 
 func runCLI(args []string, output io.Writer) (exitCode int) {
+	if len(args) > 0 && args[0] == ownerEvidenceMode {
+		return runOwnerEvidenceCLI(args[1:], output)
+	}
 	defer func() {
 		if recover() != nil {
 			_ = json.NewEncoder(output).Encode(failureSummary(errors.New("checkpoint proof internal fatal")))

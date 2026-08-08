@@ -32,7 +32,7 @@ env:
   BASELINE_SOURCE_COMMIT: be975fb1215e75208adf4b340ba95e21415f04cb
   BASELINE_IMAGE: registry.fly.io/koala-muninndb@sha256:c06842e1452f2aab4c1f01207adf9406bfe757b4984da516568006f1f5c8ad86
   BASELINE_DIGEST: sha256:c06842e1452f2aab4c1f01207adf9406bfe757b4984da516568006f1f5c8ad86
-  HELPER_IMAGE: ghcr.io/koala-optics/muninndb:stage-b-checkpoint-proof-v1-amd64
+  HELPER_IMAGE: ghcr.io/koala-optics/muninndb:stage-b-owner-evidence-v2-amd64
   HELPER_DOCKERFILE_PATH: scripts/patches/koala-stage-b-checkpoint-proof.Dockerfile
   EXPECTED_HELPER_DOCKERFILE_SHA256: 5d05e25d5be292ad6572c75ee427bba5041eec4904f499753bdba81c8c6e548d
   RECEIPT_DIR: /tmp/koala-stage-b-checkpoint-proof
@@ -56,7 +56,7 @@ jobs:
           [[ "$BASELINE_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
           [[ "$BASELINE_IMAGE" = "registry.fly.io/koala-muninndb@$BASELINE_DIGEST" ]]
           [[ "$BASELINE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
-          [[ "$HELPER_IMAGE" = ghcr.io/koala-optics/muninndb:stage-b-checkpoint-proof-* ]]
+          [[ "$HELPER_IMAGE" = ghcr.io/koala-optics/muninndb:stage-b-owner-evidence-* ]]
 
       - name: Check out exact helper ref
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -75,6 +75,8 @@ jobs:
           test -f "$HELPER_DOCKERFILE_PATH"
           test -f cmd/koala-stage-b-checkpoint-proof/main.go
           test -f cmd/koala-stage-b-checkpoint-proof/main_test.go
+          test -f cmd/koala-stage-b-checkpoint-proof/owner_evidence.go
+          test -f cmd/koala-stage-b-checkpoint-proof/owner_evidence_test.go
           dockerfile_sha256="$(sha256sum "$HELPER_DOCKERFILE_PATH" | awk '{print $1}')"
           test "$dockerfile_sha256" = "$EXPECTED_HELPER_DOCKERFILE_SHA256"
           mkdir -p "$RECEIPT_DIR"
@@ -91,7 +93,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          go test ./cmd/koala-stage-b-checkpoint-proof
+          go test -race ./cmd/koala-stage-b-checkpoint-proof
           go vet ./cmd/koala-stage-b-checkpoint-proof
           git diff --check
 
@@ -164,15 +166,15 @@ jobs:
             HELPER_SOURCE_COMMIT=${{ inputs.helper_commit }}
           labels: |
             org.opencontainers.image.revision=${{ inputs.helper_commit }}
-            org.opencontainers.image.version=stage-b-checkpoint-proof-v1
+            org.opencontainers.image.version=stage-b-owner-evidence-v2
             org.opencontainers.image.source=https://github.com/koala-optics/muninndb
-            io.koala.stage-b.artifact-role=checkpoint-proof-helper-not-serving-image
+            io.koala.stage-b.artifact-role=checkpoint-and-owner-evidence-helper-not-serving-image
             io.koala.stage-b.baseline.source=${{ env.BASELINE_SOURCE_COMMIT }}
             io.koala.stage-b.baseline.digest=${{ env.BASELINE_DIGEST }}
             io.koala.stage-b.baseline.binary.sha256=${{ env.BASELINE_BINARY_SHA256 }}
             io.koala.stage-b.dockerfile.sha256=${{ env.HELPER_DOCKERFILE_SHA256 }}
 
-      - name: Run non-production full-corpus witness
+      - name: Run network-disabled non-production full-corpus witnesses
         shell: bash
         env:
           BUILD_DIGEST: ${{ steps.build.outputs.digest }}
@@ -217,6 +219,43 @@ jobs:
           sha256sum "$witness_root/public-summary.json" | awk '{print $1}' > "$RECEIPT_DIR/witness-public-summary.sha256"
           sha256sum "$witness_root/private-proof.json" | awk '{print $1}' > "$RECEIPT_DIR/witness-private-receipt.sha256"
 
+          owner_root="$RECEIPT_DIR/owner-witness"
+          mkdir -p "$owner_root"
+          chmod 0700 "$owner_root"
+          KOALA_OWNER_EVIDENCE_WITNESS_FIXTURE="$owner_root/fixture" \
+            go test ./cmd/koala-stage-b-checkpoint-proof -run '^TestWriteNonProductionOwnerWitnessFixture$' -count=1
+          docker run --rm --network none \
+            --user "$(id -u):$(id -g)" \
+            -v "$owner_root:/owner-witness" "$witness_image" \
+            owner-evidence \
+            --data-root /owner-witness/fixture/source \
+            --checkpoint-receipt /owner-witness/fixture/checkpoint.json \
+            --owner-binding /owner-witness/fixture/binding.json \
+            --output-dir /owner-witness/fixture/evidence \
+            > "$owner_root/public-summary.json"
+          test "$(stat -c '%a' "$owner_root/fixture/evidence")" = 700
+          test "$(stat -c '%a' "$owner_root/fixture/evidence/manifest.json")" = 600
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          root = Path("/tmp/koala-stage-b-checkpoint-proof/owner-witness")
+          summary = json.loads((root / "public-summary.json").read_text())
+          manifest = json.loads((root / "fixture/evidence/manifest.json").read_text())
+          if not summary.get("valid"):
+              raise SystemExit("owner-evidence witness failed closed")
+          if summary.get("engram_count") != 502385 or manifest.get("engram_count") != 502385:
+              raise SystemExit("owner-evidence witness did not scan the full qualified record count")
+          if summary.get("page_count") != 2513 or manifest.get("page_count") != 2513:
+              raise SystemExit("owner-evidence witness did not emit exact pagination plus terminal page")
+          if summary.get("authentication_key_count") != 2:
+              raise SystemExit("owner-evidence witness authentication inventory is incomplete")
+          for name in ("manifest_sha256", "receipt_sha256"):
+              if not isinstance(summary.get(name), str) or len(summary[name]) != 64:
+                  raise SystemExit(f"owner-evidence witness {name} is malformed")
+          PY
+          sha256sum "$owner_root/public-summary.json" | awk '{print $1}' > "$RECEIPT_DIR/owner-witness-public-summary.sha256"
+          sha256sum "$owner_root/fixture/evidence/manifest.json" | awk '{print $1}' > "$RECEIPT_DIR/owner-witness-manifest.sha256"
+
       - name: Write immutable provenance receipt
         shell: bash
         env:
@@ -247,6 +286,8 @@ jobs:
               "baseline_binary_sha256": (directory / "baseline-binary.sha256").read_text().strip(),
               "witness_public_summary_sha256": (directory / "witness-public-summary.sha256").read_text().strip(),
               "witness_private_receipt_sha256": (directory / "witness-private-receipt.sha256").read_text().strip(),
+              "owner_witness_public_summary_sha256": (directory / "owner-witness-public-summary.sha256").read_text().strip(),
+              "owner_witness_manifest_sha256": (directory / "owner-witness-manifest.sha256").read_text().strip(),
           }
           path = directory / "provenance.json"
           path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
@@ -257,18 +298,20 @@ jobs:
         if: always()
         shell: bash
         run: |
-          rm -rf "$RECEIPT_DIR/witness"
+          rm -rf "$RECEIPT_DIR/witness" "$RECEIPT_DIR/owner-witness"
 
       - name: Upload safe helper receipts
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: koala-stage-b-checkpoint-proof-v1-amd64
+          name: koala-stage-b-owner-evidence-v2-amd64
           path: |
             /tmp/koala-stage-b-checkpoint-proof/helper-dockerfile.sha256
             /tmp/koala-stage-b-checkpoint-proof/baseline-binary.sha256
             /tmp/koala-stage-b-checkpoint-proof/witness-public-summary.sha256
             /tmp/koala-stage-b-checkpoint-proof/witness-private-receipt.sha256
+            /tmp/koala-stage-b-checkpoint-proof/owner-witness-public-summary.sha256
+            /tmp/koala-stage-b-checkpoint-proof/owner-witness-manifest.sha256
             /tmp/koala-stage-b-checkpoint-proof/provenance.json
             /tmp/koala-stage-b-checkpoint-proof/provenance.sha256
           if-no-files-found: warn

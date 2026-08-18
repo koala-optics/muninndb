@@ -24,8 +24,8 @@ import (
 
 const (
 	proofSchemaVersion   = "koala-muninn-stage-b-checkpoint-proof-v1"
-	baselineImageDigest  = "sha256:c06842e1452f2aab4c1f01207adf9406bfe757b4984da516568006f1f5c8ad86"
-	baselineSourceCommit = "be975fb1215e75208adf4b340ba95e21415f04cb"
+	baselineImageDigest  = "sha256:fca31180b5acf13e57d5cc4e1662124834d1c338c96baab329178cf860525c27"
+	baselineSourceCommit = "c8f205dc3f86ff9c9b785ee8e3cd45ce55fe3877"
 	backupTimeout        = 30 * time.Minute
 )
 

@@ -44,7 +44,7 @@ const (
 	ownerMaxAuthKeys          = 10_000
 	ownerMaxAuthBytes         = 4 * 1024 * 1024
 	ownerMaxAge               = 5 * time.Minute
-	ownerExpectedTarget       = "db241f29f67ee9fcd240456350478a870e8660fc2f75a90cff37e997a4020abc"
+	ownerExpectedTarget       = "b9ab0e60e612c9ebd182fc6d1c0adeb662b527a3b58245cdd5775fbf4aed3754"
 	ownerERFFixedOverhead     = 152
 	ownerERFVariableStart     = 152
 	ownerERFTrailerSize       = 4

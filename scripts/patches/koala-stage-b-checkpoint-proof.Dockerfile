@@ -3,8 +3,8 @@
 # production baseline image and its existing muninndb-server binary.
 FROM debian:bookworm-slim@sha256:63a496b5d3b99214b39f5ed70eb71a61e590a77979c79cbee4faf991f8c0783e AS builder
 
-ARG GO_ARCHIVE_URL=https://go.dev/dl/go1.26.5.linux-amd64.tar.gz
-ARG GO_ARCHIVE_SHA256=5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f053
+ARG GO_ARCHIVE_URL=https://go.dev/dl/go1.26.6.linux-amd64.tar.gz
+ARG GO_ARCHIVE_SHA256=708effb774be8237570d0add163225abbdfaf4fca28b2611df167beba4feef89
 ARG BASELINE_BINARY_SHA256
 ARG HELPER_SOURCE_COMMIT
 
@@ -21,7 +21,7 @@ RUN set -eux; \
     printf '%s  %s\n' "$GO_ARCHIVE_SHA256" /tmp/go.tar.gz | sha256sum --check --strict; \
     tar -C /usr/local -xzf /tmp/go.tar.gz; \
     rm /tmp/go.tar.gz; \
-    go version | grep -Fx 'go version go1.26.5 linux/amd64'
+    go version | grep -Fx 'go version go1.26.6 linux/amd64'
 
 COPY go.mod go.sum ./
 RUN go mod download
@@ -34,7 +34,7 @@ RUN --network=none test -n "$BASELINE_BINARY_SHA256"; \
       -o /koala-stage-b-checkpoint-proof ./cmd/koala-stage-b-checkpoint-proof; \
     test "$(stat -c '%a' /koala-stage-b-checkpoint-proof)" = 755
 
-FROM registry.fly.io/koala-muninndb@sha256:c06842e1452f2aab4c1f01207adf9406bfe757b4984da516568006f1f5c8ad86
+FROM registry.fly.io/koala-muninndb@sha256:fca31180b5acf13e57d5cc4e1662124834d1c338c96baab329178cf860525c27
 ARG BASELINE_BINARY_SHA256
 RUN test "$(sha256sum /usr/local/bin/muninndb-server | awk '{print $1}')" = "$BASELINE_BINARY_SHA256"
 COPY --from=builder /koala-stage-b-checkpoint-proof /usr/local/bin/koala-stage-b-checkpoint-proof

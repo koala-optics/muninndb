@@ -266,10 +266,15 @@ func (s *MCPServer) handleRememberBatch(ctx context.Context, w http.ResponseWrit
 		if errs[i] != nil {
 			results[i] = batchItemResult{Index: i, Status: "error", Error: errs[i].Error()}
 		} else {
-			results[i] = batchItemResult{Index: i, ID: responses[i].ID, Concept: reqs[i].Concept, Status: "ok"}
+			results[i] = batchItemResult{Index: i, ID: responses[i].ID, Concept: reqs[i].Concept, Status: "ok", Hint: responses[i].Hint}
 		}
 		if malformedCounts[i] > 0 {
-			results[i].Hint = fmt.Sprintf("%d entity item(s) were malformed (expected {\"name\":\"...\",\"type\":\"...\"} objects) and were skipped.", malformedCounts[i])
+			malformedHint := fmt.Sprintf("%d entity item(s) were malformed (expected {\"name\":\"...\",\"type\":\"...\"} objects) and were skipped.", malformedCounts[i])
+			if results[i].Hint == "" {
+				results[i].Hint = malformedHint
+			} else {
+				results[i].Hint += "; " + malformedHint
+			}
 		}
 	}
 	sendResult(w, id, textContent(mustJSON(map[string]any{

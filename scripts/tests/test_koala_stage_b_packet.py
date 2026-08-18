@@ -79,12 +79,12 @@ class StageBPacketTests(unittest.TestCase):
         self.assertIsNone(value["authorization"]["authorization_receipt_sha256"])
         self.assertEqual(
             value["qualification"]["source_commit"],
-            "acef6bedbbd839f9616415e6a7559ad149dc8bc8",
+            "2afea7c16c720553bc8c423eaf53ff97f9b25ae9",
         )
         self.assertEqual(
             value["qualification"]["candidate_image"],
             "ghcr.io/koala-optics/muninndb@sha256:"
-            "5cc1546b854e6b173181ceed139ade783751c1e58bea504bc57cb0a7fa4019df",
+            "e5079f9678503033f6a98cc766e1cdf7718f8fc8d4fcf9909b2e44d503c4778d",
         )
         self.assertEqual(
             value["qualification"]["rollback_rescue_image"],

@@ -29,11 +29,11 @@ PUBLIC_WINDOW_LABEL = "SCHEDULED"
 MAX_PACKET_BYTES = 1_048_576
 
 QUALIFICATION = {
-    "source_commit": "acef6bedbbd839f9616415e6a7559ad149dc8bc8",
-    "source_tag": "koala-v0.9.0-rc.2",
+    "source_commit": "2afea7c16c720553bc8c423eaf53ff97f9b25ae9",
+    "source_tag": "koala-v0.9.0-rc.3",
     "candidate_image": (
         "ghcr.io/koala-optics/muninndb@sha256:"
-        "5cc1546b854e6b173181ceed139ade783751c1e58bea504bc57cb0a7fa4019df"
+        "e5079f9678503033f6a98cc766e1cdf7718f8fc8d4fcf9909b2e44d503c4778d"
     ),
     "rollback_rescue_image": (
         "ghcr.io/koala-optics/muninndb@sha256:"
@@ -41,19 +41,19 @@ QUALIFICATION = {
     ),
     "baseline_image": (
         "registry.fly.io/koala-muninndb:"
-        "deployment-01KSWRX9GKW5M94MQQCBZSJZHS"
+        "deployment-task22-c8f205dc-r2"
     ),
     "baseline_digest": (
         "sha256:"
-        "c06842e1452f2aab4c1f01207adf9406bfe757b4984da516568006f1f5c8ad86"
+        "fca31180b5acf13e57d5cc4e1662124834d1c338c96baab329178cf860525c27"
     ),
-    "harness_target_merge": "880b692832ea3947b95b679839161d514f0cf883",
-    "stage_a_workflow_run": "30347311896",
+    "harness_target_merge": "3d25cc3bacdba99547c8e087b00b71cd6c5ba5c9",
+    "stage_a_workflow_run": "32104737371",
     "stage_a_receipt_sha256": (
-        "dffdfbf015a4b17ef073bb09fb8568fe4333c31ec4b4e713c18ba6f029c0f2ed"
+        "dbcff9cce5881bcaad496fd307a6fe464c8eb0de9cdcc6ed0a8c89aa2dbb256b"
     ),
     "stage_a_cleanup_sha256": (
-        "46ac8f52022679f2bbcf74687a3d6b21bd79ff2827bc5d08a792834c3df32541"
+        "ca1c441ca4b8b670bc091ea08c95d4212a7e154303e62d43b2f7b32e4474a69f"
     ),
     "accepted_records": 502_385,
     "passed_gates": 16,

@@ -203,8 +203,21 @@ func classifyPaths(config proofConfig) (pathRelation, error) {
 	if pathInside(checkpoint, source) {
 		return pathRelation{}, errors.New("source path cannot be inside the checkpoint path")
 	}
-	if pathInside(source, receipt) || pathInside(checkpoint, receipt) || pathInside(receipt, source) || pathInside(receipt, checkpoint) {
+	if pathInside(checkpoint, receipt) || pathInside(receipt, source) || pathInside(receipt, checkpoint) {
 		return pathRelation{}, errors.New("receipt path cannot contain or be contained by source or checkpoint")
+	}
+	if pathInside(source, receipt) {
+		// Single-volume operation: the mounted data volume is the only durable
+		// write surface, so the private receipt may sit directly beside the
+		// nested checkpoint at the source root. Both outputs are written only
+		// after the corresponding source inspections, so neither perturbs the
+		// proof; any deeper or independent-mode nesting still refuses.
+		if !checkpointInsideSource {
+			return pathRelation{}, errors.New("receipt path may nest inside source only when the checkpoint does")
+		}
+		if filepath.Dir(receipt) != source {
+			return pathRelation{}, errors.New("receipt path must be an immediate child of source when nested")
+		}
 	}
 	if checkpointInsideSource && filepath.Dir(checkpoint) != source {
 		return pathRelation{}, errors.New("checkpoint path must be an immediate child of source when nested")
@@ -234,7 +247,7 @@ func executeProofWithIndependentCheckpoint(config proofConfig, runBackup backupR
 		return failureSummary(err), err
 	}
 
-	sourceBefore, err := inspectDataRoot(config.SourceRoot)
+	sourceBefore, err := inspectSourceRoot(config.SourceRoot)
 	if err != nil {
 		return failureSummary(err), err
 	}
@@ -252,7 +265,7 @@ func executeProofWithIndependentCheckpoint(config proofConfig, runBackup backupR
 	if err != nil {
 		return failureSummary(err), err
 	}
-	sourceAfter, err := inspectDataRoot(config.SourceRoot)
+	sourceAfter, err := inspectSourceRoot(config.SourceRoot)
 	if err != nil {
 		return failureSummary(err), err
 	}
@@ -274,7 +287,7 @@ func executeProofWithNestedCheckpoint(config proofConfig, runBackup backupRunner
 		return failureSummary(err), err
 	}
 
-	sourceBefore, err := inspectDataRoot(config.SourceRoot)
+	sourceBefore, err := inspectSourceRoot(config.SourceRoot)
 	if err != nil {
 		return failureSummary(err), err
 	}
@@ -290,7 +303,11 @@ func executeProofWithNestedCheckpoint(config proofConfig, runBackup backupRunner
 	if err != nil {
 		return failureSummary(err), err
 	}
-	sourceAfter, err := inspectDataRootExcluding(config.SourceRoot, filepath.Base(config.CheckpointRoot))
+	// No receipt exclusion is needed even when the receipt nests inside
+	// source: requireAbsent proved it absent at entry and finishProof writes
+	// it only after this inspection, so a file under that name here is a
+	// foreign artifact and correctly refuses as unexpected.
+	sourceAfter, err := inspectSourceRoot(config.SourceRoot, filepath.Base(config.CheckpointRoot))
 	if err != nil {
 		return failureSummary(err), err
 	}
@@ -371,11 +388,28 @@ func validateConfig(config proofConfig) error {
 	return nil
 }
 
-func inspectDataRoot(root string) (stateProof, error) {
-	return inspectDataRootExcluding(root, "")
+// ignoredVolumeEntries are the exact non-store names a production data volume
+// carries beside the store: the serving daemon's embedding-model cache and
+// address file, plus the filesystem's lost+found. Source-root inspections skip
+// them without hashing or walking them; any other unexpected name (for example
+// a stray muninn.pid from a CLI-managed store) still refuses. Checkpoint and
+// restored-root inspections stay strict because the baseline backup writes
+// only the three store entries.
+var ignoredVolumeEntries = map[string]bool{
+	"lost+found":   true,
+	"models":       true,
+	"muninn.addrs": true,
 }
 
-func inspectDataRootExcluding(root, excluded string) (stateProof, error) {
+func inspectDataRoot(root string) (stateProof, error) {
+	return inspectRoot(root, nil, nil)
+}
+
+func inspectSourceRoot(root string, excluded ...string) (stateProof, error) {
+	return inspectRoot(root, ignoredVolumeEntries, excluded)
+}
+
+func inspectRoot(root string, ignored map[string]bool, excluded []string) (stateProof, error) {
 	if err := validateExistingDirectory(root); err != nil {
 		return stateProof{}, fmt.Errorf("data root is unsafe: %w", err)
 	}
@@ -387,7 +421,10 @@ func inspectDataRootExcluding(root, excluded string) (stateProof, error) {
 	seen := make(map[string]bool, len(entries))
 	for _, entry := range entries {
 		name := entry.Name()
-		if excluded != "" && name == excluded {
+		if excludedName(name, excluded) {
+			continue
+		}
+		if ignored[name] {
 			continue
 		}
 		if !allowed[name] {
@@ -414,6 +451,15 @@ func inspectDataRootExcluding(root, excluded string) (stateProof, error) {
 		return stateProof{}, fmt.Errorf("auth_secret proof failed: %w", err)
 	}
 	return stateProof{Pebble: pebbleResult, WAL: walResult, AuthSecret: secretResult}, nil
+}
+
+func excludedName(name string, excluded []string) bool {
+	for _, candidate := range excluded {
+		if candidate != "" && name == candidate {
+			return true
+		}
+	}
+	return false
 }
 
 func scanPebble(path string) (pebbleProof, error) {

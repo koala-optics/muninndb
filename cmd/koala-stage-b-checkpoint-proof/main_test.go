@@ -422,6 +422,200 @@ func TestWriteNonProductionWitnessFixture(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeSourceFixture(t, root, 502385)
+	// The build witness must exercise the exact production /data layout, not a
+	// bare store: the serving daemon also leaves a model cache, an addrs file,
+	// and the volume carries an ext4 lost+found.
+	writeIgnoredProductionEntries(t, root)
+}
+
+func TestExecuteProofIgnoresKnownProductionVolumeEntries(t *testing.T) {
+	source := newSourceFixture(t, 25)
+	writeIgnoredProductionEntries(t, source)
+	checkpoint := filepath.Join(source, "stage-b-checkpoint")
+	receiptPath := filepath.Join(t.TempDir(), "proof.json")
+	binary, binarySHA := fakeBaselineBinary(t)
+
+	summary, err := executeProof(baseTestConfig(source, checkpoint, receiptPath, binary, binarySHA), fixtureBackupRunner(t, nil))
+	if err != nil {
+		t.Fatalf("executeProof() error = %v", err)
+	}
+	if !summary.Valid || !summary.SourceStable || !summary.DatabaseEqual || !summary.AuxiliaryEqual {
+		t.Fatalf("production layout failed: %+v", summary)
+	}
+
+	var receipt proofReceipt
+	readJSON(t, receiptPath, &receipt)
+	if receipt.SourceBefore.Pebble.KeyCount != 25 || receipt.Checkpoint.Pebble.KeyCount != 25 {
+		t.Fatalf("ignored entries perturbed the proof: %+v", receipt)
+	}
+}
+
+func TestExecuteProofIgnoredEntriesNeverEnterTheProof(t *testing.T) {
+	plain := newSourceFixture(t, 5)
+	decorated := newSourceFixture(t, 5)
+	writeIgnoredProductionEntries(t, decorated)
+
+	run := func(source string) proofReceipt {
+		checkpoint := filepath.Join(t.TempDir(), "checkpoint")
+		receiptPath := filepath.Join(t.TempDir(), "proof.json")
+		binary, binarySHA := fakeBaselineBinary(t)
+		if _, err := executeProof(baseTestConfig(source, checkpoint, receiptPath, binary, binarySHA), fixtureBackupRunner(t, nil)); err != nil {
+			t.Fatalf("executeProof() error = %v", err)
+		}
+		var receipt proofReceipt
+		readJSON(t, receiptPath, &receipt)
+		return receipt
+	}
+
+	plainReceipt := run(plain)
+	decoratedReceipt := run(decorated)
+	if !equalState(plainReceipt.SourceBefore, decoratedReceipt.SourceBefore) {
+		t.Fatal("ignored production entries changed the source state proof")
+	}
+}
+
+func TestExecuteProofStillRejectsUnknownTopLevelPaths(t *testing.T) {
+	// The ignore set is exact: anything outside it (for example a stray
+	// muninn.pid from a CLI-managed store) remains an abort-worthy anomaly.
+	for _, unexpected := range []string{"muninn.pid", "muninn.yaml", "unexpected"} {
+		t.Run(unexpected, func(t *testing.T) {
+			source := newSourceFixture(t, 3)
+			writeIgnoredProductionEntries(t, source)
+			if err := os.WriteFile(filepath.Join(source, unexpected), []byte("data"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			checkpoint := filepath.Join(t.TempDir(), "checkpoint")
+			receiptPath := filepath.Join(t.TempDir(), "proof.json")
+			binary, binarySHA := fakeBaselineBinary(t)
+			called := false
+			_, err := executeProof(baseTestConfig(source, checkpoint, receiptPath, binary, binarySHA), func(_, _, _ string) (backupExecution, error) {
+				called = true
+				return backupExecution{}, nil
+			})
+			if err == nil || !strings.Contains(err.Error(), "unexpected top-level path") {
+				t.Fatalf("executeProof() error = %v, want unexpected-path error", err)
+			}
+			if called {
+				t.Fatal("backup ran with an unexpected source path")
+			}
+		})
+	}
+}
+
+func TestExecuteProofRejectsIgnoredNamesInsideCheckpoint(t *testing.T) {
+	// Checkpoint inspection stays strict: the baseline backup writes only the
+	// three store entries, so an ignored-name file inside the checkpoint is
+	// evidence of interference, not of a serving daemon.
+	source := newSourceFixture(t, 3)
+	checkpoint := filepath.Join(t.TempDir(), "checkpoint")
+	receiptPath := filepath.Join(t.TempDir(), "proof.json")
+	binary, binarySHA := fakeBaselineBinary(t)
+
+	runner := fixtureBackupRunner(t, func(checkpointRoot string) {
+		if err := os.WriteFile(filepath.Join(checkpointRoot, "muninn.addrs"), []byte("{}"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	})
+	_, err := executeProof(baseTestConfig(source, checkpoint, receiptPath, binary, binarySHA), runner)
+	if err == nil || !strings.Contains(err.Error(), "unexpected top-level path") {
+		t.Fatalf("executeProof() error = %v, want unexpected-path error", err)
+	}
+}
+
+func TestExecuteProofSupportsReceiptAsImmediateChildOfSource(t *testing.T) {
+	// The production run has exactly one durable write surface - the mounted
+	// volume - so the private receipt must be storable beside the nested
+	// checkpoint at the source root.
+	source := newSourceFixture(t, 25)
+	writeIgnoredProductionEntries(t, source)
+	checkpoint := filepath.Join(source, "stage-b-checkpoint")
+	receiptPath := filepath.Join(source, "stage-b-checkpoint.private-receipt.json")
+	binary, binarySHA := fakeBaselineBinary(t)
+
+	summary, err := executeProof(baseTestConfig(source, checkpoint, receiptPath, binary, binarySHA), fixtureBackupRunner(t, nil))
+	if err != nil {
+		t.Fatalf("executeProof() error = %v", err)
+	}
+	if !summary.Valid || !summary.SourceStable || !summary.DatabaseEqual || !summary.AuxiliaryEqual {
+		t.Fatalf("nested receipt run failed: %+v", summary)
+	}
+	info, err := os.Stat(receiptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0600 {
+		t.Fatalf("receipt mode = %04o, want 0600", got)
+	}
+
+	var receipt proofReceipt
+	readJSON(t, receiptPath, &receipt)
+	if receipt.SourceBefore.Pebble.KeyCount != 25 || receipt.SourceAfter.Pebble.KeyCount != 25 {
+		t.Fatalf("nested receipt perturbed the proof: %+v", receipt)
+	}
+	if !equalState(receipt.SourceBefore, receipt.SourceAfter) {
+		t.Fatal("source stability was lost with a nested receipt")
+	}
+}
+
+func TestExecuteProofRejectsUnsafeNestedReceiptPlacements(t *testing.T) {
+	cases := []struct {
+		name       string
+		checkpoint func(t *testing.T, source string) string
+		receipt    func(source string) string
+	}{
+		{
+			name:       "receipt below immediate child of source",
+			checkpoint: func(_ *testing.T, source string) string { return filepath.Join(source, "stage-b-checkpoint") },
+			receipt:    func(source string) string { return filepath.Join(source, "nested", "proof.json") },
+		},
+		{
+			name:       "receipt inside nested checkpoint",
+			checkpoint: func(_ *testing.T, source string) string { return filepath.Join(source, "stage-b-checkpoint") },
+			receipt:    func(source string) string { return filepath.Join(source, "stage-b-checkpoint", "proof.json") },
+		},
+		{
+			name:       "receipt inside source with independent checkpoint",
+			checkpoint: func(t *testing.T, _ string) string { return filepath.Join(t.TempDir(), "checkpoint") },
+			receipt:    func(source string) string { return filepath.Join(source, "proof.json") },
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			source := newSourceFixture(t, 1)
+			binary, binarySHA := fakeBaselineBinary(t)
+			called := false
+			_, err := executeProof(baseTestConfig(source, testCase.checkpoint(t, source), testCase.receipt(source), binary, binarySHA), func(_, _, _ string) (backupExecution, error) {
+				called = true
+				return backupExecution{}, nil
+			})
+			if err == nil {
+				t.Fatal("executeProof() accepted an unsafe receipt placement")
+			}
+			if called {
+				t.Fatal("backup ran with an unsafe receipt placement")
+			}
+		})
+	}
+}
+
+// writeIgnoredProductionEntries decorates a source fixture with the exact
+// non-store entries a production volume carries: the daemon's model cache and
+// addrs file, plus the filesystem's lost+found.
+func writeIgnoredProductionEntries(t *testing.T, root string) {
+	t.Helper()
+	modelDir := filepath.Join(root, "models", "bge-small")
+	if err := os.MkdirAll(modelDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(modelDir, "model.onnx"), []byte("model-bytes"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "muninn.addrs"), []byte(`{"mcp":"127.0.0.1:8750"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "lost+found"), 0700); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func baseTestConfig(source, checkpoint, receiptPath, binary, binarySHA string) proofConfig {

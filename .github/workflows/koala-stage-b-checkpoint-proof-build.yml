@@ -32,7 +32,7 @@ env:
   BASELINE_SOURCE_COMMIT: c8f205dc3f86ff9c9b785ee8e3cd45ce55fe3877
   BASELINE_IMAGE: registry.fly.io/koala-muninndb@sha256:fca31180b5acf13e57d5cc4e1662124834d1c338c96baab329178cf860525c27
   BASELINE_DIGEST: sha256:fca31180b5acf13e57d5cc4e1662124834d1c338c96baab329178cf860525c27
-  HELPER_IMAGE: ghcr.io/koala-optics/muninndb:stage-b-owner-evidence-v3-amd64
+  HELPER_IMAGE: ghcr.io/koala-optics/muninndb:stage-b-owner-evidence-v4-amd64
   HELPER_DOCKERFILE_PATH: scripts/patches/koala-stage-b-checkpoint-proof.Dockerfile
   EXPECTED_HELPER_DOCKERFILE_SHA256: d22a9d858421a4a0d41ad7f34c0c73482f3eec2366ce83babaf0be2f633c66e3
   RECEIPT_DIR: /tmp/koala-stage-b-checkpoint-proof
@@ -201,8 +201,9 @@ jobs:
             -v "$witness_root:/witness" "$witness_image" \
             --source-root /witness/source \
             --checkpoint-root /witness/source/stage-b-checkpoint \
-            --receipt /witness/private-proof.json \
+            --receipt /witness/source/stage-b-checkpoint.private-receipt.json \
             > "$witness_root/public-summary.json"
+          ln "$witness_root/source/stage-b-checkpoint.private-receipt.json" "$witness_root/private-proof.json"
           test "$(stat -c '%a' "$witness_root/private-proof.json")" = 600
           python3 - <<'PY'
           import json

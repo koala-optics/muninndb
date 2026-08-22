@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble"
+	"github.com/scrypster/muninndb/internal/storage/keys"
 )
 
 func TestClearVault_AllPrefixesGone(t *testing.T) {
@@ -103,7 +104,7 @@ func TestClearVault_ClearsOnlyScopedPayloadReceipts(t *testing.T) {
 	// The 0x19 namespace is shared with global idempotency and replication data.
 	// ClearVault must remove only validated 17-byte payload receipts, not every
 	// key whose first eight payload bytes happen to match the vault prefix.
-	overloadedShort := append([]byte{prefix.Idempotency}, wsA[:]...)
+	overloadedShort := append([]byte{0x19}, wsA[:]...)
 	if err := store.db.Set(overloadedShort, []byte("replication-like"), pebble.Sync); err != nil {
 		t.Fatalf("set overloaded short key: %v", err)
 	}

@@ -685,7 +685,7 @@ func IdempotencyKey(opID string) []byte {
 func PayloadReceiptKey(ws [8]byte, opID string) []byte {
 	hashVal := siphash.Hash(sipKey0, sipKey1, []byte(opID))
 	key := make([]byte, 1+8+8)
-	key[0] = prefix.Idempotency
+	key[0] = 0x19
 	copy(key[1:9], ws[:])
 	binary.BigEndian.PutUint64(key[9:], hashVal)
 	return key

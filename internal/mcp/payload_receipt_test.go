@@ -221,7 +221,7 @@ func TestPayloadReceiptRead_ReturnsOnlyIDAndDigest(t *testing.T) {
 
 func TestPayloadReceiptRead_RequiresConfiguredAuthentication(t *testing.T) {
 	eng := &payloadReceiptFakeEngine{}
-	srv := New(":0", eng, "mdb_required", nil, nil, nil)
+	srv := New(":0", eng, "mdb_required", nil, nil)
 	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_payload_receipt","arguments":{"vault":"default","op_id":"stage-b:auth"}}}`
 	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
 	w := httptest.NewRecorder()
@@ -236,7 +236,7 @@ func TestPayloadReceiptRead_PinnedVaultCannotReadAnotherVault(t *testing.T) {
 		"vault-b\x00stage-b:scope": {EngramID: "vault-b-memory", OpID: "stage-b:scope", PayloadSHA256: mcpPayloadDigestB},
 	}}
 	keys := newMockKeyStore(auth.APIKey{ID: "obs-payload", Vault: "vault-a", Mode: auth.ModeObserve})
-	srv := New(":0", eng, "", keys, nil, nil)
+	srv := New(":0", eng, "", keys, nil)
 	body := mkToolCallBody("muninn_payload_receipt", map[string]any{"op_id": "stage-b:scope"})
 	w := doAuthenticatedPost(srv, "mk_obs-payload", body)
 	var resp JSONRPCResponse

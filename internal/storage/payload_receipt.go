@@ -17,6 +17,9 @@ const payloadSHA256Bytes = 32
 
 // minimal: one fixed striped lock pool serializes payload receipt lifecycle per
 // vault; move it onto a smaller receipt store type only if store decomposition lands.
+// Baseline patch: rc.3's replication-log append (replicateBatch) is deliberately
+// NOT ported - the baseline has no replication subsystem; receipts are durable
+// via the same Pebble sync batch as the engram write.
 var payloadReceiptVaultLocks stripedMutex
 
 // PayloadReceipt is server-owned proof that one vault-scoped operation ID was
@@ -150,7 +153,6 @@ func (ps *PebbleStore) DeletePayloadReceipt(ctx context.Context, ws [8]byte, opI
 	if err := batch.Commit(pebble.Sync); err != nil {
 		return fmt.Errorf("commit payload receipt delete: %w", err)
 	}
-	ps.replicateBatch(batch)
 	return nil
 }
 
@@ -191,7 +193,6 @@ func (ps *PebbleStore) writePayloadReceipt(ctx context.Context, ws [8]byte, opID
 	if err := batch.Commit(pebble.Sync); err != nil {
 		return fmt.Errorf("commit payload receipt: %w", err)
 	}
-	ps.replicateBatch(batch)
 	return nil
 }
 
@@ -239,7 +240,6 @@ func (ps *PebbleStore) writeEngramWithPayloadReceipt(ctx context.Context, ws [8]
 		batch.Discard()
 		return ULID{}, err
 	}
-	ps.replicateBatch(batch.batch)
 	batch.Discard()
 	return eng.ID, nil
 }

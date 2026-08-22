@@ -122,7 +122,7 @@ func (ps *PebbleStore) clearVault(ctx context.Context, ws [8]byte) (int64, error
 
 func (ps *PebbleStore) deleteVaultPayloadReceipts(batch *pebble.Batch, ws [8]byte) error {
 	lo := make([]byte, 9)
-	lo[0] = prefix.Idempotency
+	lo[0] = 0x19 // idempotency/payload-receipt keyspace (baseline has no internal/prefix package)
 	copy(lo[1:], ws[:])
 	iter, err := ps.db.NewIter(&pebble.IterOptions{
 		LowerBound: lo,
@@ -147,66 +147,6 @@ func (ps *PebbleStore) deleteVaultPayloadReceipts(batch *pebble.Batch, ws [8]byt
 			continue
 		}
 		if err := batch.Delete(append([]byte(nil), key...), nil); err != nil {
-			return err
-		}
-	}
-	return iter.Error()
-}
-
-func (ps *PebbleStore) collectVaultEntityMentions(ws [8]byte) (map[string]int, error) {
-	prefixPre := make([]byte, 9)
-	prefixPre[0] = prefix.EntityEngramLink
-	copy(prefixPre[1:], ws[:])
-	wsPlus, err := incrementWS(ws)
-	if err != nil {
-		return nil, err
-	}
-	upperBound := make([]byte, 9)
-	upperBound[0] = prefix.EntityEngramLink
-	copy(upperBound[1:], wsPlus[:])
-
-	iter, err := ps.db.NewIter(&pebble.IterOptions{LowerBound: prefixPre, UpperBound: upperBound})
-	if err != nil {
-		return nil, err
-	}
-	defer iter.Close()
-
-	mentions := make(map[string]int)
-	for valid := iter.First(); valid; valid = iter.Next() {
-		name := string(iter.Value())
-		if name != "" {
-			mentions[name]++
-		}
-	}
-	if err := iter.Error(); err != nil {
-		return nil, err
-	}
-	return mentions, nil
-}
-
-func (ps *PebbleStore) deleteVaultEntityReverseIndex(batch *pebble.Batch, ws [8]byte) error {
-	iter, err := ps.db.NewIter(&pebble.IterOptions{
-		LowerBound: []byte{prefix.EntityReverseIndex},
-		UpperBound: []byte{prefix.CoOccurrence},
-	})
-	if err != nil {
-		return err
-	}
-	defer iter.Close()
-
-	for valid := iter.First(); valid; valid = iter.Next() {
-		k := iter.Key()
-		if len(k) != 33 {
-			continue
-		}
-		var gotWS [8]byte
-		copy(gotWS[:], k[9:17])
-		if gotWS != ws {
-			continue
-		}
-		keyCopy := make([]byte, len(k))
-		copy(keyCopy, k)
-		if err := batch.Delete(keyCopy, nil); err != nil {
 			return err
 		}
 	}

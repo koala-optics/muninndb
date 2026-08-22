@@ -2,8 +2,6 @@ package storage
 
 import (
 	"context"
-	"encoding/json"
-	"sync/atomic"
 	"testing"
 
 	"github.com/cockroachdb/pebble"
@@ -78,118 +76,8 @@ func TestWriteEngramWithPayloadReceipt_WritesConceptIndex(t *testing.T) {
 	}
 }
 
-func TestWritePayloadReceipt_ReplicatesStandaloneReceipt(t *testing.T) {
-	ctx := context.Background()
-	db, err := pebble.Open(t.TempDir(), &pebble.Options{})
-	if err != nil {
-		t.Fatalf("open source db: %v", err)
-	}
-	var calls atomic.Int32
-	var captured []byte
-	store := NewPebbleStore(db, PebbleStoreConfig{RepLogAppend: func(op uint8, key, value []byte) error {
-		if op == 3 {
-			calls.Add(1)
-			captured = append([]byte(nil), value...)
-		}
-		return nil
-	}})
-	t.Cleanup(func() { _ = store.Close() })
-	ws := store.VaultPrefix("payload-standalone-replicated")
-
-	if err := store.WritePayloadReceipt(ctx, ws, "stage-b:standalone-replicated", "memory-existing", payloadDigestA); err != nil {
-		t.Fatalf("WritePayloadReceipt: %v", err)
-	}
-	if calls.Load() != 1 || len(captured) == 0 {
-		t.Fatalf("replication callback calls=%d repr=%d bytes, want one non-empty batch", calls.Load(), len(captured))
-	}
-
-	replicaDB, err := pebble.Open(t.TempDir(), &pebble.Options{})
-	if err != nil {
-		t.Fatalf("open replica db: %v", err)
-	}
-	defer replicaDB.Close()
-	replicaBatch := replicaDB.NewBatch()
-	if err := replicaBatch.SetRepr(captured); err != nil {
-		t.Fatalf("SetRepr: %v", err)
-	}
-	if err := replicaBatch.Commit(pebble.NoSync); err != nil {
-		t.Fatalf("replica commit: %v", err)
-	}
-	_ = replicaBatch.Close()
-
-	value, closer, err := replicaDB.Get(keys.PayloadReceiptKey(ws, "stage-b:standalone-replicated"))
-	if err != nil {
-		t.Fatalf("replica missing standalone payload receipt: %v", err)
-	}
-	defer closer.Close()
-	var receipt PayloadReceipt
-	if err := json.Unmarshal(value, &receipt); err != nil {
-		t.Fatalf("decode replica receipt: %v", err)
-	}
-	if receipt.EngramID != "memory-existing" || receipt.PayloadSHA256 != payloadDigestA {
-		t.Fatalf("replica receipt mismatch: %+v", receipt)
-	}
-}
-
-func TestWriteEngramWithPayloadReceipt_ReplicatesReceiptWithEngram(t *testing.T) {
-	ctx := context.Background()
-	db, err := pebble.Open(t.TempDir(), &pebble.Options{})
-	if err != nil {
-		t.Fatalf("open source db: %v", err)
-	}
-	var calls atomic.Int32
-	var captured []byte
-	store := NewPebbleStore(db, PebbleStoreConfig{RepLogAppend: func(op uint8, key, value []byte) error {
-		if op == 3 {
-			calls.Add(1)
-			captured = append([]byte(nil), value...)
-		}
-		return nil
-	}})
-	t.Cleanup(func() { _ = store.Close() })
-	ws := store.VaultPrefix("payload-replicated")
-
-	id, err := store.WriteEngramWithPayloadReceipt(ctx, ws, &Engram{Concept: "payload", Content: "replicated"}, "stage-b:replicated", payloadDigestA)
-	if err != nil {
-		t.Fatalf("WriteEngramWithPayloadReceipt: %v", err)
-	}
-	if calls.Load() != 1 || len(captured) == 0 {
-		t.Fatalf("replication callback calls=%d repr=%d bytes, want one non-empty batch", calls.Load(), len(captured))
-	}
-
-	replicaDB, err := pebble.Open(t.TempDir(), &pebble.Options{})
-	if err != nil {
-		t.Fatalf("open replica db: %v", err)
-	}
-	defer replicaDB.Close()
-	replicaBatch := replicaDB.NewBatch()
-	if err := replicaBatch.SetRepr(captured); err != nil {
-		t.Fatalf("SetRepr: %v", err)
-	}
-	if err := replicaBatch.Commit(pebble.NoSync); err != nil {
-		t.Fatalf("replica commit: %v", err)
-	}
-	_ = replicaBatch.Close()
-
-	if value, closer, err := replicaDB.Get(keys.EngramKey(ws, [16]byte(id))); err != nil {
-		t.Fatalf("replica missing engram: %v", err)
-	} else {
-		_ = value
-		closer.Close()
-	}
-	value, closer, err := replicaDB.Get(keys.PayloadReceiptKey(ws, "stage-b:replicated"))
-	if err != nil {
-		t.Fatalf("replica missing payload receipt: %v", err)
-	}
-	defer closer.Close()
-	var receipt PayloadReceipt
-	if err := json.Unmarshal(value, &receipt); err != nil {
-		t.Fatalf("decode replica receipt: %v", err)
-	}
-	if receipt.EngramID != id.String() || receipt.PayloadSHA256 != payloadDigestA {
-		t.Fatalf("replica receipt mismatch: %+v", receipt)
-	}
-}
+// Baseline patch: rc.3's replication-log tests (RepLogAppend) are deliberately
+// NOT ported - the baseline has no replication subsystem.
 
 func TestWriteEngramWithPayloadReceipt_InvalidDigestWritesNothing(t *testing.T) {
 	ctx := context.Background()

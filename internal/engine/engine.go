@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -231,6 +232,17 @@ type Engine struct {
 	// database — it cannot grow faster than the corpus itself — so no eviction
 	// is needed.
 	childMu sync.Map
+
+	// idempotencyLocks provides per-op_id mutexes to prevent TOCTOU races in the
+	// payload-receipt check -> write -> store-receipt window.
+	idempotencyLocks sync.Map
+}
+
+// getIdempotencyLock returns (or lazily creates) a per-op_id mutex. Prevents TOCTOU
+// races in the check -> write -> store-receipt window for concurrent calls sharing an op_id.
+func (e *Engine) getIdempotencyLock(opID string) *sync.Mutex {
+	v, _ := e.idempotencyLocks.LoadOrStore(opID, &sync.Mutex{})
+	return v.(*sync.Mutex)
 }
 
 // SetOnWrite registers a callback invoked after every successful Write.

@@ -121,6 +121,9 @@ func (f *fakeEngine) WhereLeftOff(_ context.Context, _ string, _ int) ([]WhereLe
 func (f *fakeEngine) FindByEntity(_ context.Context, _, _ string, _ int) ([]*storage.Engram, error) {
 	return nil, nil
 }
+func (f *fakeEngine) FindByEntityPaged(_ context.Context, _, _ string, limit, offset int) (*engine.FindByEntityResult, error) {
+	return &engine.FindByEntityResult{Engrams: nil, Total: 0, Offset: offset, Limit: limit}, nil
+}
 func (f *fakeEngine) FindByConcept(_ context.Context, _, _ string, _ int) ([]*storage.Engram, error) {
 	return nil, nil
 }
@@ -281,8 +284,8 @@ func TestListTools(t *testing.T) {
 	var result map[string]any
 	json.NewDecoder(w.Body).Decode(&result)
 	tools, _ := result["tools"].([]any)
-	if len(tools) != 39 {
-		t.Errorf("expected 39 tools, got %d", len(tools))
+	if len(tools) != 40 {
+		t.Errorf("expected 40 tools, got %d", len(tools))
 	}
 }
 

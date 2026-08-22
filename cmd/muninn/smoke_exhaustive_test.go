@@ -20,6 +20,7 @@ var allMCPTools = []string{
 	"muninn_remember_batch",
 	"muninn_recall",
 	"muninn_read",
+	"muninn_payload_receipt",
 	"muninn_forget",
 	"muninn_link",
 	"muninn_contradictions",
@@ -344,6 +345,34 @@ func TestSmoke_AllMCPTools(t *testing.T) {
 		})
 		if id, _ := result["id"].(string); id == "" {
 			t.Errorf("expected id in result, got: %v", result)
+		}
+	})
+
+	t.Run("muninn_payload_receipt", func(t *testing.T) {
+		const opID = "smoke-payload-receipt"
+		remember := mcpTool(t, tok, "muninn_remember", map[string]any{
+			"vault":   vault,
+			"concept": "payload receipt smoke test",
+			"content": "smoke test payload receipt",
+			"op_id":   opID,
+		})
+		memoryID, _ := remember["id"].(string)
+		if memoryID == "" {
+			t.Fatalf("expected id in payload-bound remember result, got: %v", remember)
+		}
+		result := mcpTool(t, tok, "muninn_payload_receipt", map[string]any{
+			"vault": vault,
+			"op_id": opID,
+		})
+		if result["memory_id"] != memoryID {
+			t.Fatalf("payload receipt memory_id = %v, want %s", result["memory_id"], memoryID)
+		}
+		digest, _ := result["observed_payload_sha256"].(string)
+		if len(digest) != 64 {
+			t.Fatalf("payload receipt digest length = %d, want 64", len(digest))
+		}
+		if len(result) != 2 {
+			t.Fatalf("payload receipt exposed unexpected fields: %v", result)
 		}
 	})
 

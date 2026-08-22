@@ -12,6 +12,10 @@ import (
 // Use errors.Is to check for this error in callers.
 var ErrVaultNotFound = errors.New("vault not found")
 
+// ErrInvalidRequest is the sentinel for malformed engine requests
+// (payload-receipt path).
+var ErrInvalidRequest = errors.New("invalid request")
+
 // ErrEngramNotFound is returned when an operation references an engram that does not exist.
 // Use errors.Is to check for this error in callers.
 var ErrEngramNotFound = errors.New("engram not found")

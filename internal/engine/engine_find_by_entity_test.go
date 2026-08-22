@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/scrypster/muninndb/internal/storage"
 	"github.com/stretchr/testify/require"
@@ -107,4 +108,84 @@ func TestFindByEntity_ExcludesSoftDeleted(t *testing.T) {
 	}
 	require.True(t, foundActive, "active engram A should appear in FindByEntity results")
 	require.False(t, foundDeleted, "soft-deleted engram B should NOT appear in FindByEntity results")
+}
+
+// TestFindByEntity_NewestFirstAndPaging is the regression test for the bug where
+// FindByEntity walked the reverse index oldest-first and stopped at the cap, so
+// for any entity with more than `limit` observations every recent write was
+// invisible. It writes more engrams than a single page, then asserts:
+//
+//	(1) a capped read returns the NEWEST engrams, newest-first;
+//	(2) offset paginates through older engrams without overlap;
+//	(3) Total reflects the full set, not the page.
+func TestFindByEntity_NewestFirstAndPaging(t *testing.T) {
+	t.Parallel()
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	const vault = "find-by-entity-paging"
+	const entity = "PagingEntity"
+	const total = 60
+	ws := eng.store.ResolveVaultPrefix(vault)
+
+	require.NoError(t, eng.store.UpsertEntityRecord(ctx, storage.EntityRecord{
+		Name: entity, Type: "concept", Source: "inline",
+	}, "inline"))
+
+	// Give each fixture a distinct timestamp so ULID order deterministically
+	// represents creation order. NewULID creates a fresh monotonic entropy source
+	// per call, so independently generated IDs in one millisecond are unordered.
+	createdAt := time.Now().Add(-time.Duration(total) * time.Millisecond)
+	ids := make([]storage.ULID, 0, total)
+	for i := 0; i < total; i++ {
+		e := &storage.Engram{
+			Concept:   "paging",
+			Content:   "obs",
+			CreatedAt: createdAt.Add(time.Duration(i) * time.Millisecond),
+		}
+		id, err := eng.store.WriteEngram(ctx, ws, e)
+		require.NoError(t, err)
+		require.NoError(t, eng.store.WriteEntityEngramLink(ctx, ws, id, entity))
+		ids = append(ids, id)
+	}
+
+	// (1) Capped read returns the newest `limit`, newest-first.
+	const pageSize = 10
+	page0, err := eng.FindByEntityPaged(ctx, vault, entity, pageSize, 0)
+	require.NoError(t, err)
+	require.Len(t, page0.Engrams, pageSize)
+	require.GreaterOrEqual(t, page0.Total, total, "Total should reflect the full set, not the page")
+
+	// Newest-first: page0[0] must be the LAST written id; the page must equal the
+	// final `pageSize` ids in reverse.
+	for i := 0; i < pageSize; i++ {
+		want := ids[total-1-i]
+		require.Equal(t, want, page0.Engrams[i].ID,
+			"page0[%d] should be the %d-th newest engram", i, i)
+	}
+
+	// (2) Next page (offset=pageSize) continues with the next-older block, no overlap.
+	page1, err := eng.FindByEntityPaged(ctx, vault, entity, pageSize, pageSize)
+	require.NoError(t, err)
+	require.Len(t, page1.Engrams, pageSize)
+	for i := 0; i < pageSize; i++ {
+		want := ids[total-1-pageSize-i]
+		require.Equal(t, want, page1.Engrams[i].ID,
+			"page1[%d] should continue newest-first after the first page", i)
+	}
+	// No overlap between page0 and page1.
+	seen := map[storage.ULID]bool{}
+	for _, e := range page0.Engrams {
+		seen[e.ID] = true
+	}
+	for _, e := range page1.Engrams {
+		require.False(t, seen[e.ID], "page1 must not repeat any engram from page0")
+	}
+
+	// (3) Back-compat shim returns the same newest engram first.
+	shim, err := eng.FindByEntity(ctx, vault, entity, pageSize)
+	require.NoError(t, err)
+	require.Len(t, shim, pageSize)
+	require.Equal(t, ids[total-1], shim[0].ID, "FindByEntity shim must also be newest-first")
 }

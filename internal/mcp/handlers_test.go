@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -164,24 +165,22 @@ func (e *noPluginsEngine) RetryEnrich(_ context.Context, _ string, id string) (*
 	}, nil
 }
 
-// idempotentEngine is a fake engine that records Write calls and supports
-// configurable CheckIdempotency responses for testing the op_id path.
+// idempotentEngine is a fake payload-aware engine for the op_id handler tests.
 type idempotentEngine struct {
 	fakeEngine
-	receipt    *storage.IdempotencyReceipt // non-nil → return this on CheckIdempotency
+	receipt    *storage.PayloadReceipt
 	writeCalls int
 }
 
-func (e *idempotentEngine) CheckIdempotency(_ context.Context, _ string) (*storage.IdempotencyReceipt, error) {
-	return e.receipt, nil
-}
-
-func (e *idempotentEngine) WriteIdempotency(_ context.Context, _, _ string) error {
-	return nil
-}
-
-func (e *idempotentEngine) Write(_ context.Context, _ *mbp.WriteRequest) (*mbp.WriteResponse, error) {
+func (e *idempotentEngine) WriteWithPayloadReceipt(_ context.Context, _ *mbp.WriteRequest, opID, payloadSHA256 string) (*mbp.WriteResponse, error) {
+	if e.receipt != nil {
+		if e.receipt.PayloadSHA256 != payloadSHA256 {
+			return nil, errors.New("payload receipt conflict")
+		}
+		return &mbp.WriteResponse{ID: e.receipt.EngramID, Hint: "idempotent"}, nil
+	}
 	e.writeCalls++
+	e.receipt = &storage.PayloadReceipt{EngramID: "fresh-id", OpID: opID, PayloadSHA256: payloadSHA256}
 	return &mbp.WriteResponse{ID: "fresh-id"}, nil
 }
 
@@ -1221,6 +1220,21 @@ func (f *findByEntityEngine) FindByEntity(_ context.Context, _, name string, _ i
 	return nil, nil
 }
 
+// FindByEntityPaged mirrors FindByEntity for the PostgreSQL fixture. The handler
+// calls the paged variant, so this is the method the find_by_entity tests exercise.
+func (f *findByEntityEngine) FindByEntityPaged(_ context.Context, _, name string, limit, offset int) (*engine.FindByEntityResult, error) {
+	if name == "PostgreSQL" {
+		id := storage.NewULID()
+		return &engine.FindByEntityResult{
+			Engrams: []*storage.Engram{{ID: id, Concept: "DB choice", Summary: "Chose PostgreSQL"}},
+			Total:   1,
+			Offset:  offset,
+			Limit:   limit,
+		}, nil
+	}
+	return &engine.FindByEntityResult{Engrams: nil, Total: 0, Offset: offset, Limit: limit}, nil
+}
+
 func TestHandleFindByEntity_HappyPath(t *testing.T) {
 	srv := newTestServerWith(&findByEntityEngine{})
 	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_find_by_entity","arguments":{"vault":"default","entity_name":"PostgreSQL"}}}`
@@ -1287,7 +1301,8 @@ func TestHandleFindByEntity_NoResults(t *testing.T) {
 
 type findByEntityCapturingEngine struct {
 	fakeEngine
-	lastLimit int
+	lastLimit  int
+	lastOffset int
 }
 
 func (f *findByEntityCapturingEngine) FindByEntity(_ context.Context, _, _ string, limit int) ([]*storage.Engram, error) {
@@ -1295,14 +1310,33 @@ func (f *findByEntityCapturingEngine) FindByEntity(_ context.Context, _, _ strin
 	return []*storage.Engram{}, nil
 }
 
+func (f *findByEntityCapturingEngine) FindByEntityPaged(_ context.Context, _, _ string, limit, offset int) (*engine.FindByEntityResult, error) {
+	f.lastLimit = limit
+	f.lastOffset = offset
+	return &engine.FindByEntityResult{Engrams: []*storage.Engram{}, Total: 0, Offset: offset, Limit: limit}, nil
+}
+
 func TestHandleFindByEntity_LimitCapped(t *testing.T) {
 	eng := &findByEntityCapturingEngine{}
 	srv := newTestServerWith(eng)
-	// Request limit=999; handler must cap to 50 before calling engine.
+	// Request limit=999; handler must cap to 500 before calling engine.
 	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_find_by_entity","arguments":{"vault":"default","entity_name":"TestEntity","limit":999}}}`
 	postRPC(t, srv, body)
-	if eng.lastLimit != 50 {
-		t.Errorf("expected engine to receive limit=50 after capping, got %d", eng.lastLimit)
+	if eng.lastLimit != 500 {
+		t.Errorf("expected engine to receive limit=500 after capping, got %d", eng.lastLimit)
+	}
+}
+
+func TestHandleFindByEntity_OffsetPassed(t *testing.T) {
+	eng := &findByEntityCapturingEngine{}
+	srv := newTestServerWith(eng)
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_find_by_entity","arguments":{"vault":"default","entity_name":"TestEntity","limit":10,"offset":30}}}`
+	postRPC(t, srv, body)
+	if eng.lastOffset != 30 {
+		t.Errorf("expected engine to receive offset=30, got %d", eng.lastOffset)
+	}
+	if eng.lastLimit != 10 {
+		t.Errorf("expected engine to receive limit=10, got %d", eng.lastLimit)
 	}
 }
 
@@ -1449,12 +1483,11 @@ func TestHandleWhereLeftOff_LimitCapped(t *testing.T) {
 
 // ── op_id idempotency ─────────────────────────────────────────────────────────
 
-// TestHandleRemember_IdempotentHit verifies that when CheckIdempotency finds a
-// receipt for the given op_id, the cached engram ID is returned immediately
-// with "idempotent":true and the engine's Write method is NOT called.
+// TestHandleRemember_IdempotentHit verifies that an identical payload receipt
+// returns its cached engram ID without producing a new write.
 func TestHandleRemember_IdempotentHit(t *testing.T) {
 	eng := &idempotentEngine{
-		receipt: &storage.IdempotencyReceipt{EngramID: "cached-id-abc", CreatedAt: 1000000},
+		receipt: &storage.PayloadReceipt{EngramID: "cached-id-abc", OpID: "my-unique-op", PayloadSHA256: mcpPayloadDigestA},
 	}
 	srv := newTestServerWith(eng)
 
@@ -1473,9 +1506,8 @@ func TestHandleRemember_IdempotentHit(t *testing.T) {
 		t.Errorf("expected id='cached-id-abc', got %v", content["id"])
 	}
 
-	idempotent, ok := content["idempotent"].(bool)
-	if !ok || !idempotent {
-		t.Errorf("expected idempotent=true, got %v", content["idempotent"])
+	if hint, ok := content["hint"].(string); !ok || hint != "idempotent" {
+		t.Errorf("expected hint='idempotent', got %v", content["hint"])
 	}
 
 	if eng.writeCalls != 0 {
@@ -1514,9 +1546,9 @@ func TestHandleRemember_IdempotentMiss(t *testing.T) {
 }
 
 // TestHandleRemember_NoOpID verifies that muninn_remember without op_id
-// behaves exactly as before — no idempotency check is performed.
+// behaves exactly as before - it uses the ordinary engine Write method.
 func TestHandleRemember_NoOpID(t *testing.T) {
-	eng := &idempotentEngine{receipt: nil}
+	eng := &noOpIDEngine{}
 	srv := newTestServerWith(eng)
 
 	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_remember","arguments":{"vault":"default","content":"plain memory"}}}`
@@ -1532,44 +1564,43 @@ func TestHandleRemember_NoOpID(t *testing.T) {
 	}
 }
 
-// slowIdempotentEngine is like idempotentEngine but introduces a brief delay in
-// Write so that a concurrent goroutine has time to reach the CheckIdempotency
-// gate while the first goroutine is inside Write. Without the per-op_id mutex
-// in handleRemember, both goroutines would see a nil receipt and each call
-// Write — producing two engrams for a single op_id.
+type noOpIDEngine struct {
+	fakeEngine
+	writeCalls int
+}
+
+func (e *noOpIDEngine) Write(_ context.Context, _ *mbp.WriteRequest) (*mbp.WriteResponse, error) {
+	e.writeCalls++
+	return &mbp.WriteResponse{ID: "plain-id"}, nil
+}
+
+// slowIdempotentEngine serializes one payload identity to model the engine's
+// vault/op_id critical section under concurrent MCP calls.
 type slowIdempotentEngine struct {
 	fakeEngine
-	mu         sync.Mutex
-	writeCalls int32 // accessed atomically
-
-	// storedReceipt is written after the first Write completes; subsequent
-	// CheckIdempotency calls inside the lock will see it.
-	storedOpID    string
-	storedReceipt *storage.IdempotencyReceipt
+	mu             sync.Mutex
+	writeCalls     int32 // accessed atomically
+	storedOpID     string
+	storedDigest   string
+	storedEngramID string
 }
 
-func (e *slowIdempotentEngine) CheckIdempotency(_ context.Context, opID string) (*storage.IdempotencyReceipt, error) {
+func (e *slowIdempotentEngine) WriteWithPayloadReceipt(_ context.Context, _ *mbp.WriteRequest, opID, payloadSHA256 string) (*mbp.WriteResponse, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.storedOpID == opID && e.storedReceipt != nil {
-		return e.storedReceipt, nil
+	if e.storedOpID == opID {
+		if e.storedDigest != payloadSHA256 {
+			return nil, errors.New("payload receipt conflict")
+		}
+		return &mbp.WriteResponse{ID: e.storedEngramID, Hint: "idempotent"}, nil
 	}
-	return nil, nil
-}
-
-func (e *slowIdempotentEngine) WriteIdempotency(_ context.Context, opID, engramID string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.storedOpID = opID
-	e.storedReceipt = &storage.IdempotencyReceipt{EngramID: engramID}
-	return nil
-}
-
-func (e *slowIdempotentEngine) Write(_ context.Context, _ *mbp.WriteRequest) (*mbp.WriteResponse, error) {
 	atomic.AddInt32(&e.writeCalls, 1)
-	// Small sleep so a concurrent goroutine can race toward CheckIdempotency.
+	// Keep the critical section open long enough for the concurrent call to queue.
 	time.Sleep(5 * time.Millisecond)
-	return &mbp.WriteResponse{ID: "idempotent-engram"}, nil
+	e.storedOpID = opID
+	e.storedDigest = payloadSHA256
+	e.storedEngramID = "idempotent-engram"
+	return &mbp.WriteResponse{ID: e.storedEngramID}, nil
 }
 
 // Delegate everything else to fakeEngine.
@@ -1648,6 +1679,9 @@ func (e *slowIdempotentEngine) WhereLeftOff(ctx context.Context, vault string, l
 }
 func (e *slowIdempotentEngine) FindByEntity(ctx context.Context, vault, entityName string, limit int) ([]*storage.Engram, error) {
 	return (&fakeEngine{}).FindByEntity(ctx, vault, entityName, limit)
+}
+func (e *slowIdempotentEngine) FindByEntityPaged(ctx context.Context, vault, entityName string, limit, offset int) (*engine.FindByEntityResult, error) {
+	return (&fakeEngine{}).FindByEntityPaged(ctx, vault, entityName, limit, offset)
 }
 func (e *slowIdempotentEngine) SetEntityState(ctx context.Context, entityName, state, mergedInto, entityType string) error {
 	return (&fakeEngine{}).SetEntityState(ctx, entityName, state, mergedInto, entityType)

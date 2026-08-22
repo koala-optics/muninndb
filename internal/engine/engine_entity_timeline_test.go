@@ -102,6 +102,26 @@ func TestGetEntityTimeline_LimitCaps(t *testing.T) {
 	if timeline.MentionCount != 5 {
 		t.Errorf("Expected mention count 5 (total), got %d", timeline.MentionCount)
 	}
+
+	// REGRESSION GUARD: a capped timeline must keep the most RECENT `limit`
+	// mentions, not the oldest. i=0 is newest (now), i=4 is oldest (now-4h).
+	// The old oldest-first scan returned the 3 OLDEST and silently hid recent
+	// history; this asserts the 3 NEWEST are present. Entries are sorted
+	// ascending for display, so the newest of the kept set is the last entry.
+	if len(timeline.Entries) != 3 {
+		t.Fatalf("expected 3 entries, got %d", len(timeline.Entries))
+	}
+	newest := timeline.Entries[len(timeline.Entries)-1].CreatedAt
+	oldestKept := timeline.Entries[0].CreatedAt
+	// newest kept must be within ~1s of `now` (i=0), not now-4h.
+	if now.Sub(newest) > time.Second {
+		t.Errorf("capped timeline missing the most recent mention: newest kept=%v, expected ~%v (oldest-first truncation regression)", newest, now)
+	}
+	// oldest kept must be now-2h (i=2), i.e. the 3rd-newest, NOT now-4h.
+	expectedOldestKept := now.Add(-2 * time.Hour)
+	if oldestKept.Sub(expectedOldestKept).Abs() > time.Second {
+		t.Errorf("capped timeline kept wrong window: oldest kept=%v, expected ~%v (the 3 newest are now, now-1h, now-2h)", oldestKept, expectedOldestKept)
+	}
 }
 
 func TestGetEntityTimeline_EntityNotFound(t *testing.T) {

@@ -34,7 +34,7 @@ RUN --network=none test -n "$BASELINE_BINARY_SHA256"; \
       -o /koala-stage-b-checkpoint-proof ./cmd/koala-stage-b-checkpoint-proof; \
     test "$(stat -c '%a' /koala-stage-b-checkpoint-proof)" = 755
 
-FROM registry.fly.io/koala-muninndb@sha256:fca31180b5acf13e57d5cc4e1662124834d1c338c96baab329178cf860525c27
+FROM registry.fly.io/koala-muninndb@sha256:1c9d9581f06d075aba948581f90451004d010d4e2623573fad8e87c58341f4d2
 ARG BASELINE_BINARY_SHA256
 RUN test "$(sha256sum /usr/local/bin/muninndb-server | awk '{print $1}')" = "$BASELINE_BINARY_SHA256"
 COPY --from=builder /koala-stage-b-checkpoint-proof /usr/local/bin/koala-stage-b-checkpoint-proof

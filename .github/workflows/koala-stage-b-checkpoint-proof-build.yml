@@ -34,7 +34,7 @@ env:
   BASELINE_DIGEST: sha256:1c9d9581f06d075aba948581f90451004d010d4e2623573fad8e87c58341f4d2
   HELPER_IMAGE: ghcr.io/koala-optics/muninndb:stage-b-owner-evidence-v5-amd64
   HELPER_DOCKERFILE_PATH: scripts/patches/koala-stage-b-checkpoint-proof.Dockerfile
-  EXPECTED_HELPER_DOCKERFILE_SHA256: d22a9d858421a4a0d41ad7f34c0c73482f3eec2366ce83babaf0be2f633c66e3
+  EXPECTED_HELPER_DOCKERFILE_SHA256: 3da96f4a56390bb2ee80825fd5fa4d5cb9b23d15a1670f16d6008b74f991aa47
   RECEIPT_DIR: /tmp/koala-stage-b-checkpoint-proof
 
 jobs:

@@ -15,8 +15,28 @@ type JSONRPCRequest struct {
 }
 
 type JSONRPCParams struct {
-	Name      string         `json:"name"`
-	Arguments map[string]any `json:"arguments"`
+	Name         string          `json:"name"`
+	Arguments    map[string]any  `json:"arguments"`
+	RawArguments json.RawMessage `json:"-"`
+}
+
+// UnmarshalJSON preserves the original arguments object for payload-receipt
+// hashing while retaining the existing float64-backed map used by handlers.
+func (p *JSONRPCParams) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	p.Name = raw.Name
+	p.RawArguments = append(p.RawArguments[:0], raw.Arguments...)
+	p.Arguments = nil
+	if len(raw.Arguments) == 0 || string(raw.Arguments) == "null" {
+		return nil
+	}
+	return json.Unmarshal(raw.Arguments, &p.Arguments)
 }
 
 type JSONRPCResponse struct {

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -39,27 +38,12 @@ func parseEmbeddingArg(args map[string]any) ([]float32, string) {
 	return embedding, ""
 }
 
-func (s *MCPServer) handleRemember(ctx context.Context, w http.ResponseWriter, id json.RawMessage, vault string, args map[string]any) {
-	opID, _ := args["op_id"].(string)
-	if opID != "" {
-		// Acquire a per-op_id mutex to prevent TOCTOU races: without this lock,
-		// two concurrent requests with the same op_id could both pass the nil
-		// receipt check and each call Write, producing duplicate engrams.
-		// defer mu.Unlock() holds the lock until the handler returns, covering
-		// the entire check→write→store-receipt window.
-		mu := s.getIdempotencyLock(opID)
-		mu.Lock()
-		defer mu.Unlock()
-
-		// Re-check inside lock (now safe from concurrent duplicates).
-		if receipt, err := s.engine.CheckIdempotency(ctx, opID); err == nil && receipt != nil {
-			out, _ := json.Marshal(map[string]any{
-				"id":         receipt.EngramID,
-				"idempotent": true,
-			})
-			sendResult(w, id, textContent(string(out)))
-			return
-		}
+func (s *MCPServer) handleRememberRaw(ctx context.Context, w http.ResponseWriter, id json.RawMessage, vault string, args map[string]any, rawArguments json.RawMessage) {
+	opIDValue, hasOpID := args["op_id"]
+	opID, validOpID := opIDValue.(string)
+	if hasOpID && (!validOpID || strings.TrimSpace(opID) == "") {
+		sendError(w, id, -32602, "invalid params: 'op_id' must be a non-empty string")
+		return
 	}
 
 	content, ok := args["content"].(string)
@@ -113,15 +97,32 @@ func (s *MCPServer) handleRemember(ctx context.Context, w http.ResponseWriter, i
 		req.Embedding = emb
 	}
 
-	resp, err := s.engine.Write(ctx, req)
+	var resp *mbp.WriteResponse
+	var err error
+	if opID != "" {
+		payloadEngine, ok := s.engine.(interface {
+			WriteWithPayloadReceipt(context.Context, *mbp.WriteRequest, string, string) (*mbp.WriteResponse, error)
+		})
+		if !ok {
+			sendError(w, id, -32000, "tool error: payload receipts are not supported by this server")
+			return
+		}
+		if len(rawArguments) == 0 {
+			sendError(w, id, -32000, "tool error: original arguments are unavailable for payload receipt")
+			return
+		}
+		digest, digestErr := canonicalArgumentsSHA256(rawArguments)
+		if digestErr != nil {
+			sendError(w, id, -32602, "invalid params: "+digestErr.Error())
+			return
+		}
+		resp, err = payloadEngine.WriteWithPayloadReceipt(ctx, req, opID, digest)
+	} else {
+		resp, err = s.engine.Write(ctx, req)
+	}
 	if err != nil {
 		sendError(w, id, -32000, "tool error: "+err.Error())
 		return
-	}
-	if opID != "" {
-		if err := s.engine.WriteIdempotency(ctx, opID, resp.ID); err != nil {
-			slog.Warn("mcp: failed to record idempotency receipt", "op_id", opID, "engram_id", resp.ID, "err", err)
-		}
 	}
 	result := WriteResult{ID: resp.ID, Concept: req.Concept}
 	if resp.Hint != "" {
@@ -136,6 +137,35 @@ func (s *MCPServer) handleRemember(ctx context.Context, w http.ResponseWriter, i
 		result.Hint += fmt.Sprintf("%d entity item(s) were malformed (expected {\"name\":\"...\",\"type\":\"...\"} objects) and were skipped.", malformed)
 	}
 	sendResult(w, id, textContent(mustJSON(result)))
+}
+
+func (s *MCPServer) handlePayloadReceipt(ctx context.Context, w http.ResponseWriter, id json.RawMessage, vault string, args map[string]any) {
+	opID, ok := args["op_id"].(string)
+	if !ok || strings.TrimSpace(opID) == "" {
+		sendError(w, id, -32602, "invalid params: 'op_id' is required (non-empty string)")
+		return
+	}
+	payloadEngine, ok := s.engine.(interface {
+		ReadPayloadReceipt(context.Context, string, string) (*storage.PayloadReceipt, error)
+	})
+	if !ok {
+		sendError(w, id, -32000, "tool error: payload receipts are not supported by this server")
+		return
+	}
+	receipt, err := payloadEngine.ReadPayloadReceipt(ctx, vault, opID)
+	if err != nil {
+		sendError(w, id, -32000, "tool error: "+err.Error())
+		return
+	}
+	if receipt == nil {
+		sendError(w, id, -32000, "tool error: payload receipt not found")
+		return
+	}
+	out := map[string]string{
+		"memory_id":               receipt.EngramID,
+		"observed_payload_sha256": receipt.PayloadSHA256,
+	}
+	sendResult(w, id, textContent(mustJSON(out)))
 }
 
 func (s *MCPServer) handleRememberBatch(ctx context.Context, w http.ResponseWriter, id json.RawMessage, vault string, args map[string]any) {

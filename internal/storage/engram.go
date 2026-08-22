@@ -29,7 +29,7 @@ func (ps *PebbleStore) GetEngram(ctx context.Context, wsPrefix [8]byte, id ULID)
 		return nil, fmt.Errorf("get engram: %w", err)
 	}
 	if val == nil {
-		return nil, fmt.Errorf("engram not found")
+		return nil, fmt.Errorf("engram %w", ErrNotFound)
 	}
 
 	// Decode

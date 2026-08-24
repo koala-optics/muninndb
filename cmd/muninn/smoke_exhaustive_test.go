@@ -382,6 +382,31 @@ func TestSmoke_AllMCPTools(t *testing.T) {
 		}
 	})
 
+	t.Run("muninn_owner_census", func(t *testing.T) {
+		first := mcpTool(t, tok, "muninn_owner_census", map[string]any{
+			"vault": vault,
+		})
+		for _, key := range []string{"total", "entity_count", "identity_sha256"} {
+			if _, present := first[key]; !present {
+				t.Fatalf("owner census missing %s: %v", key, first)
+			}
+		}
+		total, _ := first["total"].(float64)
+		if total < 1 {
+			t.Fatalf("owner census total = %v, want >= 1", first["total"])
+		}
+		digest, _ := first["identity_sha256"].(string)
+		if len(digest) != 64 {
+			t.Fatalf("owner census digest = %q, want 64 hex chars", digest)
+		}
+		second := mcpTool(t, tok, "muninn_owner_census", map[string]any{
+			"vault": vault,
+		})
+		if second["total"] != first["total"] || second["identity_sha256"] != first["identity_sha256"] {
+			t.Fatalf("stable vault produced unequal censuses: %v vs %v", first, second)
+		}
+	})
+
 	t.Run("muninn_remember_batch", func(t *testing.T) {
 		result := mcpTool(t, tok, "muninn_remember_batch", map[string]any{
 			"vault": vault,

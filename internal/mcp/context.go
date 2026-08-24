@@ -215,7 +215,8 @@ func isReadOnlyTool(name string) bool {
 		"muninn_provenance",
 		"muninn_entity",
 		"muninn_entities",
-		"muninn_owner_inventory":
+		"muninn_owner_inventory",
+		"muninn_owner_census":
 		return true
 	}
 	return false

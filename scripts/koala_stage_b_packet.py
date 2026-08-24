@@ -41,11 +41,11 @@ QUALIFICATION = {
     ),
     "baseline_image": (
         "registry.fly.io/koala-muninndb:"
-        "deployment-ee801f0-r1"
+        "deployment-8d89b67-r1"
     ),
     "baseline_digest": (
         "sha256:"
-        "b84d5003db7da19f0ce930dab5f6f4235e1fd4c43143fc86dc2527aa9b066456"
+        "dc4336d451cf6682a5bb801d4ab07a092b731bcd342d5bfd479dea6b47f343f3"
     ),
     "harness_target_merge": "3d25cc3bacdba99547c8e087b00b71cd6c5ba5c9",
     "stage_a_workflow_run": "32104737371",

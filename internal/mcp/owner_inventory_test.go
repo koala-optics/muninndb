@@ -31,7 +31,7 @@ func TestHandleOwnerInventory_HappyPath(t *testing.T) {
 		}},
 		Total: 9, Limit: 2, Offset: 4, EntityCount: 17,
 	}}
-	srv := New(":0", eng, "", nil, nil, nil)
+	srv := New(":0", eng, "", nil, nil)
 	w := postRPC(t, srv, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"muninn_owner_inventory","arguments":{"vault":"inventory","limit":2,"offset":4}}}`)
 	resp := decodeResp(t, w.Body.String())
 	if resp.Error != nil {
@@ -61,7 +61,7 @@ func TestHandleOwnerInventory_ExplicitEmptyTerminalPage(t *testing.T) {
 	eng := &ownerInventoryTestEngine{result: &OwnerInventoryResult{
 		Engrams: []OwnerInventoryEngram{}, Total: 3, Limit: 2, Offset: 3, EntityCount: 8,
 	}}
-	srv := New(":0", eng, "", nil, nil, nil)
+	srv := New(":0", eng, "", nil, nil)
 	w := postRPC(t, srv, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"muninn_owner_inventory","arguments":{"limit":2,"offset":3}}}`)
 	resp := decodeResp(t, w.Body.String())
 	if resp.Error != nil {
@@ -89,7 +89,7 @@ func TestHandleOwnerInventory_InvalidArgumentsDoNotCallEngine(t *testing.T) {
 	for _, args := range cases {
 		t.Run(args, func(t *testing.T) {
 			eng := &ownerInventoryTestEngine{}
-			srv := New(":0", eng, "", nil, nil, nil)
+			srv := New(":0", eng, "", nil, nil)
 			w := postRPC(t, srv, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"muninn_owner_inventory","arguments":`+args+`}}`)
 			resp := decodeResp(t, w.Body.String())
 			if resp.Error == nil || resp.Error.Code != -32602 {
@@ -114,7 +114,7 @@ func TestHandleOwnerInventory_UnavailableAndErrorsAreSanitized(t *testing.T) {
 
 	t.Run("owner error", func(t *testing.T) {
 		eng := &ownerInventoryTestEngine{err: errors.New("secret owner detail")}
-		srv := New(":0", eng, "", nil, nil, nil)
+		srv := New(":0", eng, "", nil, nil)
 		w := postRPC(t, srv, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"muninn_owner_inventory","arguments":{}}}`)
 		resp := decodeResp(t, w.Body.String())
 		if resp.Error == nil || !strings.Contains(resp.Error.Message, "read failed") {

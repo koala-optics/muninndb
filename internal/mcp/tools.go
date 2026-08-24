@@ -839,5 +839,16 @@ func allToolDefinitions() []ToolDefinition {
 				"required": []string{},
 			},
 		},
+		{
+			Name:        "muninn_owner_census",
+			Description: "Returns one whole-vault active census in a single server-side scan: exact count of non-deleted, non-archived engrams, exact entity count, and an order-independent SHA-256 digest of the active owner identities. Two equal censuses prove the active set did not change between them.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"vault": vaultProp,
+				},
+				"required": []string{},
+			},
+		},
 	}
 }

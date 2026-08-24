@@ -57,6 +57,7 @@ var allMCPTools = []string{
 	"muninn_entity",
 	"muninn_entities",
 	"muninn_owner_inventory",
+	"muninn_owner_census",
 }
 
 // adminLogin POSTs to the UI login endpoint (:8476) and returns the muninn_session cookie.
@@ -402,6 +403,31 @@ func TestSmoke_AllMCPTools(t *testing.T) {
 		rows, _ := result["engrams"].([]any)
 		if len(rows) != 1 {
 			t.Fatalf("owner inventory page size = %d, want 1", len(rows))
+		}
+	})
+
+	t.Run("muninn_owner_census", func(t *testing.T) {
+		first := mcpTool(t, tok, "muninn_owner_census", map[string]any{
+			"vault": vault,
+		})
+		for _, key := range []string{"total", "entity_count", "identity_sha256"} {
+			if _, present := first[key]; !present {
+				t.Fatalf("owner census missing %s: %v", key, first)
+			}
+		}
+		total, _ := first["total"].(float64)
+		if total < 1 {
+			t.Fatalf("owner census total = %v, want >= 1", first["total"])
+		}
+		digest, _ := first["identity_sha256"].(string)
+		if len(digest) != 64 {
+			t.Fatalf("owner census digest = %q, want 64 hex chars", digest)
+		}
+		second := mcpTool(t, tok, "muninn_owner_census", map[string]any{
+			"vault": vault,
+		})
+		if second["total"] != first["total"] || second["identity_sha256"] != first["identity_sha256"] {
+			t.Fatalf("stable vault produced unequal censuses: %v vs %v", first, second)
 		}
 	})
 

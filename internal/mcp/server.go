@@ -272,6 +272,7 @@ func (s *MCPServer) dispatchToolCall(ctx context.Context, w http.ResponseWriter,
 		"muninn_entity":          s.handleEntity,
 		"muninn_entities":        s.handleEntities,
 		"muninn_owner_inventory": s.handleOwnerInventory,
+		"muninn_owner_census":    s.handleOwnerCensus,
 	}
 
 	handler, found := handlers[req.Params.Name]
@@ -300,6 +301,7 @@ func registeredToolNames() []string {
 		"muninn_similar_entities", "muninn_merge_entity", "muninn_entity_timeline",
 		"muninn_replay_enrichment", "muninn_provenance", "muninn_feedback",
 		"muninn_entity", "muninn_entities", "muninn_owner_inventory",
+		"muninn_owner_census",
 	}
 }
 

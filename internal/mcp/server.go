@@ -268,9 +268,10 @@ func (s *MCPServer) dispatchToolCall(ctx context.Context, w http.ResponseWriter,
 		// SGD learning loop feedback
 		"muninn_feedback": s.handleFeedback,
 
-		// Entity aggregate view
-		"muninn_entity":   s.handleEntity,
-		"muninn_entities": s.handleEntities,
+		// Entity aggregate and passive owner inventory views
+		"muninn_entity":          s.handleEntity,
+		"muninn_entities":        s.handleEntities,
+		"muninn_owner_inventory": s.handleOwnerInventory,
 	}
 
 	handler, found := handlers[req.Params.Name]
@@ -298,7 +299,7 @@ func registeredToolNames() []string {
 		"muninn_entity_state_batch", "muninn_entity_clusters", "muninn_export_graph",
 		"muninn_similar_entities", "muninn_merge_entity", "muninn_entity_timeline",
 		"muninn_replay_enrichment", "muninn_provenance", "muninn_feedback",
-		"muninn_entity", "muninn_entities",
+		"muninn_entity", "muninn_entities", "muninn_owner_inventory",
 	}
 }
 

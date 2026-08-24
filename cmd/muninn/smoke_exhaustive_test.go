@@ -56,6 +56,7 @@ var allMCPTools = []string{
 	"muninn_feedback",
 	"muninn_entity",
 	"muninn_entities",
+	"muninn_owner_inventory",
 }
 
 // adminLogin POSTs to the UI login endpoint (:8476) and returns the muninn_session cookie.
@@ -373,6 +374,34 @@ func TestSmoke_AllMCPTools(t *testing.T) {
 		}
 		if len(result) != 2 {
 			t.Fatalf("payload receipt exposed unexpected fields: %v", result)
+		}
+	})
+
+	t.Run("muninn_owner_inventory", func(t *testing.T) {
+		mcpTool(t, tok, "muninn_remember", map[string]any{
+			"vault":   vault,
+			"concept": "owner inventory smoke test",
+			"content": "smoke test owner inventory row",
+		})
+		result := mcpTool(t, tok, "muninn_owner_inventory", map[string]any{
+			"vault": vault,
+			"limit": 1,
+		})
+		for _, key := range []string{"engrams", "total", "limit", "offset", "entity_count"} {
+			if _, present := result[key]; !present {
+				t.Fatalf("owner inventory missing %s: %v", key, result)
+			}
+		}
+		if result["limit"] != float64(1) || result["offset"] != float64(0) {
+			t.Fatalf("owner inventory pagination echo = %v", result)
+		}
+		total, _ := result["total"].(float64)
+		if total < 1 {
+			t.Fatalf("owner inventory total = %v, want >= 1", result["total"])
+		}
+		rows, _ := result["engrams"].([]any)
+		if len(rows) != 1 {
+			t.Fatalf("owner inventory page size = %d, want 1", len(rows))
 		}
 	})
 

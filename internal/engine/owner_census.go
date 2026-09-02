@@ -23,10 +23,18 @@ type OwnerCensusResult struct {
 	IdentitySHA256 string
 }
 
-// ownerCensusRowHash hashes the same owner-facing identity fields the
-// muninn_owner_inventory page exposes (id, concept, content, confidence,
-// tags, created_at, embed_dim), length-prefixed so field boundaries are
-// unambiguous. Rows hash identically iff their owner projections match.
+// ownerCensusRowHash hashes the identity of one active owner row: which
+// row exists and what it says (id, concept, content, tags, created_at),
+// length-prefixed so field boundaries are unambiguous. The census digest is
+// therefore an identity of the ACTIVE OWNER ROW SET, and it deliberately
+// excludes the two columns the server itself mutates in place on the live
+// 0x01 record without any owner write: confidence (cognitive workers and
+// reinforce-on-duplicate via storage.UpdateConfidence / UpdateMetadata) and
+// embed_dim (the retroactive embedding processor via
+// storage.UpdateEmbedding, which patches EmbedDim in the ERF record). With
+// those included, two censuses on a vault whose row count never changed
+// disagreed on every call while a retroactive embed pass ran; with them
+// excluded, two censuses on a quiet-by-count vault agree.
 func ownerCensusRowHash(engram *storage.Engram) [32]byte {
 	hasher := sha256.New()
 	writeField := func(field []byte) {
@@ -39,9 +47,6 @@ func ownerCensusRowHash(engram *storage.Engram) [32]byte {
 	writeField([]byte(id))
 	writeField([]byte(engram.Concept))
 	writeField([]byte(engram.Content))
-	var confidence [4]byte
-	binary.BigEndian.PutUint32(confidence[:], uint32(engram.Confidence*1e6))
-	writeField(confidence[:])
 	var count [8]byte
 	binary.BigEndian.PutUint64(count[:], uint64(len(engram.Tags)))
 	writeField(count[:])
@@ -51,7 +56,6 @@ func ownerCensusRowHash(engram *storage.Engram) [32]byte {
 	var created [8]byte
 	binary.BigEndian.PutUint64(created[:], uint64(engram.CreatedAt.Unix()))
 	writeField(created[:])
-	writeField([]byte{uint8(engram.EmbedDim)})
 	var digest [32]byte
 	hasher.Sum(digest[:0])
 	return digest

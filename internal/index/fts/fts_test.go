@@ -2,7 +2,9 @@ package fts
 
 import (
 	"context"
+	"errors"
 	"os"
+	"reflect"
 	"testing"
 
 	"github.com/cockroachdb/pebble"
@@ -25,6 +27,21 @@ func openTestDB(t *testing.T) (*pebble.DB, func()) {
 		db.Close()
 		os.RemoveAll(dir)
 	}
+}
+
+type cancelOnErrCheckContext struct {
+	context.Context
+	cancel   context.CancelFunc
+	cancelAt int
+	checks   int
+}
+
+func (ctx *cancelOnErrCheckContext) Err() error {
+	ctx.checks++
+	if ctx.checks == ctx.cancelAt {
+		ctx.cancel()
+	}
+	return ctx.Context.Err()
 }
 
 // TestIndexEngramUpdatesStats verifies that IndexEngram updates per-term document
@@ -71,6 +88,124 @@ func TestIndexEngramUpdatesStats(t *testing.T) {
 }
 
 // TestFTSRankingOrder verifies that the most relevant document ranks first.
+func TestTopScoredIDsMatchesFullOrdering(t *testing.T) {
+	scores := make(map[[16]byte]float64)
+	for i, score := range []float64{4, 9, 1, 9, 5, 5, 2, 8, 3, 7} {
+		var id [16]byte
+		id[15] = byte(i + 1)
+		scores[id] = score
+	}
+
+	all, err := topScoredIDs(context.Background(), scores, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, topK := range []int{1, 3, 7, len(scores), len(scores) + 1} {
+		got, err := topScoredIDs(context.Background(), scores, topK)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := all
+		if len(want) > topK {
+			want = want[:topK]
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("topScoredIDs(..., %d) = %+v, want %+v", topK, got, want)
+		}
+	}
+}
+
+func TestTopScoredIDsDeterministicTies(t *testing.T) {
+	scores := make(map[[16]byte]float64)
+	for _, suffix := range []byte{5, 1, 4, 2, 3} {
+		var id [16]byte
+		id[15] = suffix
+		scores[id] = 1
+	}
+
+	for attempt := 0; attempt < 10; attempt++ {
+		got, err := topScoredIDs(context.Background(), scores, 3)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, want := range []byte{1, 2, 3} {
+			if got[i].ID[15] != want {
+				t.Fatalf("attempt %d result %d ID suffix = %d, want %d", attempt, i, got[i].ID[15], want)
+			}
+		}
+	}
+}
+
+func TestTopScoredIDsNonPositiveReturnsAll(t *testing.T) {
+	scores := map[[16]byte]float64{{1}: 1, {2}: 2, {3}: 3}
+	for _, topK := range []int{0, -1} {
+		got, err := topScoredIDs(context.Background(), scores, topK)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != len(scores) {
+			t.Fatalf("topScoredIDs(..., %d) returned %d results, want %d", topK, len(got), len(scores))
+		}
+	}
+}
+
+func TestTopScoredIDsHonorsCancellation(t *testing.T) {
+	scores := map[[16]byte]float64{{1}: 1, {2}: 2, {3}: 3}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	results, err := topScoredIDs(ctx, scores, 2)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("topScoredIDs error = %v, want context.Canceled", err)
+	}
+	if results != nil {
+		t.Fatalf("topScoredIDs results = %+v, want nil", results)
+	}
+}
+
+func TestSearchHonorsPreCancelledContext(t *testing.T) {
+	db, cleanup := openTestDB(t)
+	defer cleanup()
+	idx := New(db)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	results, err := idx.Search(ctx, [8]byte{}, "stage", 30)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Search error = %v, want context.Canceled", err)
+	}
+	if results != nil {
+		t.Fatalf("Search results = %+v, want nil", results)
+	}
+}
+
+func TestSearchHonorsCancellationDuringPostingScan(t *testing.T) {
+	db, cleanup := openTestDB(t)
+	defer cleanup()
+	idx := New(db)
+	store := storage.NewPebbleStore(db, storage.PebbleStoreConfig{CacheSize: 100})
+	ws := store.VaultPrefix("cancel-scan")
+	for i := 0; i < 100; i++ {
+		var id [16]byte
+		id[15] = byte(i)
+		if err := idx.IndexEngram(ws, id, "stage", "", "", nil); err != nil {
+			t.Fatalf("IndexEngram: %v", err)
+		}
+	}
+
+	base, cancel := context.WithCancel(context.Background())
+	ctx := &cancelOnErrCheckContext{Context: base, cancel: cancel, cancelAt: 4}
+	results, err := idx.Search(ctx, ws, "stage", 30)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Search error = %v, want context.Canceled", err)
+	}
+	if results != nil {
+		t.Fatalf("Search results = %+v, want nil", results)
+	}
+	if ctx.checks != ctx.cancelAt {
+		t.Fatalf("context checks = %d, want cancellation at check %d", ctx.checks, ctx.cancelAt)
+	}
+}
+
 func TestFTSRankingOrder(t *testing.T) {
 	db, cleanup := openTestDB(t)
 	defer cleanup()

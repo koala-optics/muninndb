@@ -29,12 +29,12 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  BASELINE_SOURCE_COMMIT: 73393cc0f021f31ac02916a0895ca0eeaae1848e
-  BASELINE_IMAGE: registry.fly.io/koala-muninndb@sha256:23214aa0b71c70c05746998e870935a74375cf954de387807241e3bfd4dda621
-  BASELINE_DIGEST: sha256:23214aa0b71c70c05746998e870935a74375cf954de387807241e3bfd4dda621
-  HELPER_IMAGE: ghcr.io/koala-optics/muninndb:stage-b-owner-evidence-v8-amd64
+  BASELINE_SOURCE_COMMIT: 03857686ce102ba2f62ed283e1d5e9f1084f4348
+  BASELINE_IMAGE: registry.fly.io/koala-muninndb@sha256:d2a0c5b24a05344496fdc9b17933ed06b33e4958b346fdc369efddd9de6664ba
+  BASELINE_DIGEST: sha256:d2a0c5b24a05344496fdc9b17933ed06b33e4958b346fdc369efddd9de6664ba
+  HELPER_IMAGE: ghcr.io/koala-optics/muninndb:stage-b-owner-evidence-v9-amd64
   HELPER_DOCKERFILE_PATH: scripts/patches/koala-stage-b-checkpoint-proof.Dockerfile
-  EXPECTED_HELPER_DOCKERFILE_SHA256: 33661771c6f78b8a2430c8644294ab87728d94803a76adece93d0922fc989817
+  EXPECTED_HELPER_DOCKERFILE_SHA256: cf90ece810ac9c5786ac5b5559186688641522d90125704197ea7a9e3e271035
   RECEIPT_DIR: /tmp/koala-stage-b-checkpoint-proof
 
 jobs:

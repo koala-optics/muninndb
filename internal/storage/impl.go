@@ -727,6 +727,18 @@ func (ps *PebbleStore) TransitionCache() *TransitionCache {
 	return ps.transCache
 }
 
+// FlushMemtable forces the active memtable to be written out to a durable
+// L0 sstable and blocks until that flush completes. It is a maintenance
+// call, not part of the write path: WAL replay on Open reconstructs the
+// memtable in memory, and db.Close() must otherwise flush that (possibly
+// large) memtable at shutdown - which can dominate the shutdown budget when
+// the store was opened recently and replayed a large WAL. Calling this once
+// after Open, while the machine is still idle/fenced, moves that cost off
+// the shutdown critical path so a subsequent Close() is near-instant.
+func (ps *PebbleStore) FlushMemtable() error {
+	return ps.db.Flush()
+}
+
 // Close flushes all pending writes and closes the Pebble database. Idempotent.
 func (ps *PebbleStore) Close() error {
 	var closeErr error

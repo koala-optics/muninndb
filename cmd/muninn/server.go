@@ -735,6 +735,29 @@ func applyMemoryLimits() {
 	)
 }
 
+// shutdownTimeout returns the hard deadline for graceful shutdown before the
+// process force-exits. store.Close (WAL sync + Pebble close) can exceed the
+// historical 30s default when the store was recently opened and replayed a
+// large WAL - stopping the machine soon after a boot then force-exits code 1
+// mid-flush (observed 2026-09-07: a stop ~14s after a 710k-entry WAL replay
+// timed out at 30s). MUNINN_SHUTDOWN_TIMEOUT (a Go duration, e.g. "90s")
+// raises it without a rebuild. The default is unchanged at 30s, so behaviour
+// is identical unless the env var is set. This deadline MUST stay strictly
+// below the platform's own stop grace (Fly stop_config.timeout) so the server
+// reaches its own clean exit_code-0 path before the platform SIGKILLs it.
+func shutdownTimeout() time.Duration {
+	const defaultTimeout = 30 * time.Second
+	if s := os.Getenv("MUNINN_SHUTDOWN_TIMEOUT"); s != "" {
+		if d, err := time.ParseDuration(s); err == nil && d > 0 {
+			return d
+		}
+		slog.Warn("invalid MUNINN_SHUTDOWN_TIMEOUT; using default",
+			"value", s, "default", defaultTimeout,
+		)
+	}
+	return defaultTimeout
+}
+
 // runStartupMigrations runs all idempotent storage migrations on startup.
 // It enumerates every known vault and calls MigrateBuckets for each one.
 // Migration errors are non-fatal: a warning is logged and startup continues.
@@ -1834,11 +1857,12 @@ func runServer() {
 		}
 		gc.Stop()
 	}()
+	shutTimeout := shutdownTimeout()
 	select {
 	case <-shutdownDone:
 		slog.Info("shutdown complete")
-	case <-time.After(30 * time.Second):
-		slog.Error("shutdown timed out after 30s; forcing exit")
+	case <-time.After(shutTimeout):
+		slog.Error("shutdown timed out; forcing exit", "timeout", shutTimeout)
 		os.Exit(1)
 	}
 }

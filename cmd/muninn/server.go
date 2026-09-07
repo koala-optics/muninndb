@@ -1292,6 +1292,21 @@ func runServer() {
 	// Run startup migrations before the engine is built.
 	runStartupMigrations(context.Background(), store)
 
+	// Flush the WAL-replayed memtable to a durable L0 sstable now, while the
+	// machine is still idle, so a later graceful stop's store.Close() does not
+	// have to flush a large memtable inside the shutdown deadline. Boot replay
+	// of a large WAL reconstructs the memtable in memory; without this, the
+	// first stop soon after boot pays the whole flush cost at shutdown time
+	// (observed 2026-09-07: a stop ~14s after a 710k-entry replay force-exited
+	// at the 30s shutdown deadline mid-flush). Advisory: a flush failure is
+	// logged and tolerated - the shutdown path still flushes as before.
+	flushStart := time.Now()
+	if err := store.FlushMemtable(); err != nil {
+		slog.Warn("startup memtable flush failed; shutdown will flush instead", "err", err)
+	} else {
+		slog.Info("startup memtable flush complete", "duration", time.Since(flushStart))
+	}
+
 	// Create GroupCommitter
 	gc := wal.NewGroupCommitter(mol, db)
 

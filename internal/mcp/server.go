@@ -311,6 +311,7 @@ func (s *MCPServer) dispatchToolCall(ctx context.Context, w http.ResponseWriter,
 		"muninn_entity":          s.handleEntity,
 		"muninn_entities":        s.handleEntities,
 		"muninn_owner_inventory": s.handleOwnerInventory,
+		"muninn_owner_census":    s.handleOwnerCensus,
 
 		// Trust label
 		"muninn_trust": s.handleSetTrust,
@@ -348,6 +349,7 @@ func registeredToolNames() []string {
 		"muninn_trust",
 		"muninn_compare_and_set", "muninn_claim", "muninn_release",
 		"muninn_create_workflow_vault",
+		"muninn_owner_census",
 	}
 }
 

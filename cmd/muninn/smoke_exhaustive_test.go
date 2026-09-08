@@ -62,6 +62,7 @@ var allMCPTools = []string{
 	"muninn_entity",
 	"muninn_entities",
 	"muninn_owner_inventory",
+	"muninn_owner_census",
 }
 
 // adminLogin POSTs to the UI login endpoint (:8476) and returns the muninn_session cookie.

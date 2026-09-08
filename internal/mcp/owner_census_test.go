@@ -27,7 +27,7 @@ func TestHandleOwnerCensus_HappyPath(t *testing.T) {
 		EntityCount:    17,
 		IdentitySHA256: strings.Repeat("ab", 32),
 	}}
-	srv := New(":0", eng, "", nil, nil)
+	srv := New(":0", eng, "", nil, nil, nil)
 	w := postRPC(t, srv, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"muninn_owner_census","arguments":{"vault":"census"}}}`)
 	resp := decodeResp(t, w.Body.String())
 	if resp.Error != nil {
@@ -50,7 +50,7 @@ func TestHandleOwnerCensus_HappyPath(t *testing.T) {
 
 func TestHandleOwnerCensus_EngineErrorIsOpaque(t *testing.T) {
 	eng := &ownerCensusTestEngine{err: errors.New("pebble: internal detail")}
-	srv := New(":0", eng, "", nil, nil)
+	srv := New(":0", eng, "", nil, nil, nil)
 	w := postRPC(t, srv, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"muninn_owner_census","arguments":{}}}`)
 	resp := decodeResp(t, w.Body.String())
 	if resp.Error == nil {
@@ -62,7 +62,7 @@ func TestHandleOwnerCensus_EngineErrorIsOpaque(t *testing.T) {
 }
 
 func TestHandleOwnerCensus_UnavailableWithoutEngineSupport(t *testing.T) {
-	srv := New(":0", &fakeEngine{}, "", nil, nil)
+	srv := New(":0", &fakeEngine{}, "", nil, nil, nil)
 	w := postRPC(t, srv, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"muninn_owner_census","arguments":{}}}`)
 	resp := decodeResp(t, w.Body.String())
 	if resp.Error == nil || !strings.Contains(resp.Error.Message, "unavailable") {

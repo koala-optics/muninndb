@@ -487,9 +487,17 @@ func (s *MCPServer) handleSSEMessage(w http.ResponseWriter, r *http.Request) {
 	s.processAndPushSSE(w, r, []chan []byte{sess.ch}, sessionID)
 }
 
-// handleStreamablePost handles POST /mcp requests. Supports both standalone
-// JSON-RPC (response in POST body) and the Streamable HTTP pattern where the
-// client also has an SSE connection open and expects responses on that stream.
+// handleStreamablePost handles POST /mcp requests. The response is returned in
+// the POST body only, even when the caller also holds a GET /mcp SSE stream.
+//
+// Until 2026-09 the response was ALSO pushed to every open SSE stream whose
+// AuthContext.Token matched the caller's. Token is the shared bearer secret, so
+// every session of one deployment matched: each tools/call result (a 68 KB
+// find_by_entity page, say) was fanned out to N unrelated sessions, each of
+// which logged "Received a response for an unknown message ID" and dropped
+// the stream. One deployment wrote 162 GB of those logs in four weeks. The
+// legacy GET /mcp + POST /mcp/message?sessionId= pair still pushes to its own
+// stream (handleSSEMessage), which is the only path that needs SSE delivery.
 func (s *MCPServer) handleStreamablePost(w http.ResponseWriter, r *http.Request) {
 	if r.ContentLength > 1<<20 {
 		w.Header().Set("Content-Type", "application/json")
@@ -507,23 +515,17 @@ func (s *MCPServer) handleStreamablePost(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	r = r.WithContext(contextWithAuth(r.Context(), a))
-
-	// If the client also has SSE streams open, route through the async
-	// SSE handler so the response is pushed to ALL matching event streams
-	// (some clients read from SSE even when they POST to the base URL).
-	sseChannels := s.findSSEChannelsByToken(a.Token)
-	if len(sseChannels) > 0 {
-		s.processAndPushSSE(w, r, sseChannels, "streamable")
-		return
-	}
-
-	// No SSE stream — pure POST, return response in body.
 	s.handleRPC(w, r)
 }
 
 // findSSEChannelsByToken returns all SSE channels matching the given auth token.
 // Returns nil for empty tokens to prevent cross-session contamination on open
 // (no-auth) servers where every session has Token == "".
+//
+// No longer consulted by handleStreamablePost (see its doc comment): a bearer
+// token identifies a deployment, not a session, so it cannot select the
+// caller's own stream. Kept for the concurrency tests that pin the RWMutex
+// discipline (#174).
 func (s *MCPServer) findSSEChannelsByToken(token string) []chan []byte {
 	if token == "" {
 		return nil

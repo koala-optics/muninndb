@@ -9,7 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- **MCP Streamable HTTP: POST `/mcp` responses are no longer broadcast to every
+  SSE stream sharing the bearer token.** `handleStreamablePost` matched SSE
+  sessions by `AuthContext.Token`, which for a static `mdb_` token is the whole
+  deployment, so each tools/call result (including 68 KB `find_by_entity` pages)
+  was pushed to N unrelated sessions; each logged "Received a response for an
+  unknown message ID" and dropped its stream. One deployment wrote 162 GB of
+  those client logs in four weeks. Streamable POSTs now answer in the POST body
+  only; the legacy `GET /mcp` + `POST /mcp/message?sessionId=` pair still pushes
+  to its own stream. Pinned by `internal/mcp/server_streamable_fanout_test.go`.
 
 ---
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 type ownerCensusTestEngine struct {
@@ -13,12 +14,37 @@ type ownerCensusTestEngine struct {
 	err    error
 	calls  int
 	vault  string
+	budget time.Duration
 }
 
-func (e *ownerCensusTestEngine) OwnerCensus(_ context.Context, vault string) (*OwnerCensusResult, error) {
+func (e *ownerCensusTestEngine) OwnerCensus(ctx context.Context, vault string) (*OwnerCensusResult, error) {
 	e.calls++
 	e.vault = vault
+	if deadline, ok := ctx.Deadline(); ok {
+		e.budget = time.Until(deadline)
+	}
 	return e.result, e.err
+}
+
+func TestHandleOwnerCensus_GetsLongerDeadline(t *testing.T) {
+	eng := &ownerCensusTestEngine{result: &OwnerCensusResult{IdentitySHA256: strings.Repeat("ab", 32)}}
+	srv := New(":0", eng, "", nil, nil, nil)
+	postRPC(t, srv, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"muninn_owner_census","arguments":{}}}`)
+	if eng.budget <= requestDeadline || eng.budget > ownerCensusDeadline {
+		t.Fatalf("census deadline budget = %v, want in (%v, %v]", eng.budget, requestDeadline, ownerCensusDeadline)
+	}
+}
+
+func TestDeadlineFor_OtherCallsKeepSharedDeadline(t *testing.T) {
+	for _, req := range []JSONRPCRequest{
+		{Method: "tools/call", Params: &JSONRPCParams{Name: "muninn_owner_inventory"}},
+		{Method: "tools/call"},
+		{Method: "tools/list"},
+	} {
+		if got := deadlineFor(&req); got != requestDeadline {
+			t.Fatalf("deadlineFor(%+v) = %v, want %v", req, got, requestDeadline)
+		}
+	}
 }
 
 func TestHandleOwnerCensus_HappyPath(t *testing.T) {

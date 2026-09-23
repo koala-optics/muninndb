@@ -1,0 +1,82 @@
+name: Koala Baseline Rebuild
+
+# Rebuilds the untouched stock upstream baseline that koala-rc-qualify.yml
+# migrates from. The original pin (ghcr.io/scrypster/muninndb@sha256:1c4995f4...)
+# was removed upstream by 2026-09-23 (manifest unknown), so rc qualification
+# could no longer pull it. This builds the exact upstream tag with its own
+# Dockerfile, no Koala patches, into a separately named Koala GHCR tag.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: koala-baseline-rebuild
+  cancel-in-progress: false
+
+env:
+  BASELINE_SOURCE_TAG: v0.9.0
+  BASELINE_SOURCE_COMMIT: 3eed40c928450b93a237a1b15f847363ac6e3a0c
+  BASELINE_IMAGE: ghcr.io/koala-optics/muninndb:baseline-v0.9.0-amd64
+
+jobs:
+  build:
+    name: Build stock upstream baseline image
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out exact upstream source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.BASELINE_SOURCE_COMMIT }}
+          persist-credentials: false
+
+      - name: Verify source commit
+        run: test "$(git rev-parse HEAD)" = "$BASELINE_SOURCE_COMMIT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+
+      - name: Log in to Koala GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish baseline tag
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: ${{ env.BASELINE_IMAGE }}
+          provenance: mode=max
+          sbom: true
+          no-cache: true
+          labels: |
+            org.opencontainers.image.revision=${{ env.BASELINE_SOURCE_COMMIT }}
+            org.opencontainers.image.version=${{ env.BASELINE_SOURCE_TAG }}
+            org.opencontainers.image.source=https://github.com/koala-optics/muninndb
+
+      - name: Record baseline digest
+        env:
+          BUILD_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$BUILD_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          mkdir -p /tmp/koala-baseline
+          printf 'ghcr.io/koala-optics/muninndb@%s\n' "$BUILD_DIGEST" > /tmp/koala-baseline/baseline-image.txt
+          printf '%s\n' "$BASELINE_SOURCE_COMMIT" > /tmp/koala-baseline/source-commit.txt
+          cat /tmp/koala-baseline/baseline-image.txt
+
+      - name: Upload baseline receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: koala-baseline-v0.9.0-amd64
+          path: /tmp/koala-baseline/
+          retention-days: 90

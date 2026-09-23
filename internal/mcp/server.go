@@ -137,10 +137,23 @@ func (s *MCPServer) withMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func (s *MCPServer) handleRPC(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-	defer cancel()
+const (
+	requestDeadline = 30 * time.Second
+	// muninn_owner_census is a read-only single scan over every active row
+	// (14-27s on a ~587K-row vault), so the shared 30s deadline cut it off in
+	// production. Kept under the Stage B client's 60s read timeout so a slow
+	// census still returns a named JSON-RPC error instead of a dropped socket.
+	ownerCensusDeadline = 55 * time.Second
+)
 
+func deadlineFor(req *JSONRPCRequest) time.Duration {
+	if req.Method == "tools/call" && req.Params != nil && req.Params.Name == "muninn_owner_census" {
+		return ownerCensusDeadline
+	}
+	return requestDeadline
+}
+
+func (s *MCPServer) handleRPC(w http.ResponseWriter, r *http.Request) {
 	var req JSONRPCRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		sendError(w, nil, -32700, "parse error")
@@ -150,6 +163,9 @@ func (s *MCPServer) handleRPC(w http.ResponseWriter, r *http.Request) {
 		sendError(w, req.ID, -32600, "invalid request: jsonrpc must be '2.0'")
 		return
 	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), deadlineFor(&req))
+	defer cancel()
 
 	a := authFromContext(r.Context())
 	switch {

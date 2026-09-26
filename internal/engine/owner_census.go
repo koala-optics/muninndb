@@ -6,10 +6,17 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"sort"
 
 	"github.com/scrypster/muninndb/internal/storage"
 )
+
+// ErrOwnerCensusEntityCount marks a census that failed in the entity count
+// after its row scan, so the MCP handler can name the failing phase without
+// exposing storage detail to the caller.
+var ErrOwnerCensusEntityCount = errors.New("owner census entity count")
 
 // OwnerCensusResult is one whole-vault active census: the exact count of
 // non-deleted, non-archived engrams plus an order-independent digest of
@@ -82,7 +89,7 @@ func (e *Engine) OwnerCensus(ctx context.Context, vault string) (*OwnerCensusRes
 	}
 	entityCount, err := e.CountEntities(ctx, vault)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", ErrOwnerCensusEntityCount, err)
 	}
 	sort.Slice(rowHashes, func(i, j int) bool {
 		return bytes.Compare(rowHashes[i][:], rowHashes[j][:]) < 0

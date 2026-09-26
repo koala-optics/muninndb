@@ -3,6 +3,8 @@ package mcp
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -32,6 +34,32 @@ func TestHandleOwnerCensus_GetsLongerDeadline(t *testing.T) {
 	postRPC(t, srv, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"muninn_owner_census","arguments":{}}}`)
 	if eng.budget <= requestDeadline || eng.budget > ownerCensusDeadline {
 		t.Fatalf("census deadline budget = %v, want in (%v, %v]", eng.budget, requestDeadline, ownerCensusDeadline)
+	}
+}
+
+// A streamable POST whose token also holds an open SSE stream is dispatched by
+// processAndPushSSE, not handleRPC; the census must get the same deadline there
+// (rc.5 production: census cut off at 30.1s on this path).
+func TestStreamablePost_OwnerCensusWithOpenSSE_GetsLongerDeadline(t *testing.T) {
+	eng := &ownerCensusTestEngine{result: &OwnerCensusResult{IdentitySHA256: strings.Repeat("ab", 32)}}
+	srv := New(":0", eng, "mdb_census", nil, nil, nil)
+	srv.sseSessionsMu.Lock()
+	srv.sseSessions["census-sse"] = &sseSession{
+		ch:   make(chan []byte, 4),
+		auth: AuthContext{Token: "mdb_census", Authorized: true},
+	}
+	srv.sseSessionsMu.Unlock()
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"muninn_owner_census","arguments":{}}}`
+	r := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+	r.Header.Set("Authorization", "Bearer mdb_census")
+	srv.handleStreamablePost(httptest.NewRecorder(), r)
+
+	if eng.calls != 1 {
+		t.Fatalf("census calls = %d, want 1", eng.calls)
+	}
+	if eng.budget <= requestDeadline || eng.budget > ownerCensusDeadline {
+		t.Fatalf("census deadline budget via SSE = %v, want in (%v, %v]", eng.budget, requestDeadline, ownerCensusDeadline)
 	}
 }
 

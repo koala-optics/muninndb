@@ -582,7 +582,7 @@ func (s *MCPServer) processAndPushSSE(w http.ResponseWriter, r *http.Request, ch
 	// Use a detached context so the POST connection closing won't cancel
 	// the tool call. This is critical — Claude Code may close the POST
 	// before a slow tool call completes.
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), deadlineFor(&req))
 	defer cancel()
 
 	var buf bytes.Buffer

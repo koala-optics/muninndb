@@ -3,7 +3,12 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"log/slog"
 	"net/http"
+	"time"
+
+	"github.com/scrypster/muninndb/internal/engine"
 )
 
 type ownerCensusEngine interface {
@@ -30,6 +35,23 @@ func (a *mcpEngineAdapter) OwnerCensus(ctx context.Context, vault string) (*Owne
 	}, nil
 }
 
+// ownerCensusErrorClass names why a census failed with a fixed label only.
+// rc.5 production (heartbeat 36249093341) returned one opaque message for
+// every cause, so a 30s SSE-path cut could not be told apart from a storage
+// error without a second session reproducing it.
+func ownerCensusErrorClass(err error) string {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return "deadline exceeded"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.Is(err, engine.ErrOwnerCensusEntityCount):
+		return "entity count"
+	default:
+		return "storage"
+	}
+}
+
 func (s *MCPServer) handleOwnerCensus(
 	ctx context.Context,
 	w http.ResponseWriter,
@@ -42,9 +64,13 @@ func (s *MCPServer) handleOwnerCensus(
 		sendError(w, id, -32000, "tool error: owner census is unavailable")
 		return
 	}
+	started := time.Now()
 	result, err := reader.OwnerCensus(ctx, vault)
 	if err != nil {
-		sendError(w, id, -32000, "tool error: owner census read failed")
+		class := ownerCensusErrorClass(err)
+		slog.Warn("mcp: owner census failed", "vault", vault, "class", class,
+			"elapsed", time.Since(started), "err", err)
+		sendError(w, id, -32000, "tool error: owner census read failed ("+class+")")
 		return
 	}
 	sendResult(w, id, textContent(mustJSON(result)))

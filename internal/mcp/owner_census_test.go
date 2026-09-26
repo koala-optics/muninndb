@@ -3,11 +3,14 @@ package mcp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/scrypster/muninndb/internal/engine"
 )
 
 type ownerCensusTestEngine struct {
@@ -112,6 +115,32 @@ func TestHandleOwnerCensus_EngineErrorIsOpaque(t *testing.T) {
 	}
 	if strings.Contains(resp.Error.Message, "pebble") {
 		t.Fatalf("engine detail leaked: %q", resp.Error.Message)
+	}
+}
+
+// The -32000 message names the failure class with a fixed label, so a
+// client-side log shows why a census failed without server log retention.
+func TestHandleOwnerCensus_ErrorNamesClass(t *testing.T) {
+	detail := errors.New("pebble: internal detail")
+	for _, tc := range []struct {
+		err  error
+		want string
+	}{
+		{fmt.Errorf("scan: %w", context.DeadlineExceeded), "tool error: owner census read failed (deadline exceeded)"},
+		{context.Canceled, "tool error: owner census read failed (canceled)"},
+		{fmt.Errorf("%w: %w", engine.ErrOwnerCensusEntityCount, detail), "tool error: owner census read failed (entity count)"},
+		{detail, "tool error: owner census read failed (storage)"},
+	} {
+		eng := &ownerCensusTestEngine{err: tc.err}
+		srv := New(":0", eng, "", nil, nil, nil)
+		w := postRPC(t, srv, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"muninn_owner_census","arguments":{}}}`)
+		resp := decodeResp(t, w.Body.String())
+		if resp.Error == nil || resp.Error.Code != -32000 || resp.Error.Message != tc.want {
+			t.Fatalf("err %v: got %+v, want -32000 %q", tc.err, resp.Error, tc.want)
+		}
+		if strings.Contains(resp.Error.Message, "pebble") {
+			t.Fatalf("engine detail leaked: %q", resp.Error.Message)
+		}
 	}
 }
 

@@ -90,8 +90,9 @@ type EngineInterface interface {
 	// FindByEntity returns engrams that mention the given entity name,
 	// scanned from the 0x23 reverse index; on zero exact matches the vault's
 	// entity names are fuzzy-resolved by token overlap and the result reports
-	// which entity actually served the lookup. Results are limited to limit entries.
-	FindByEntity(ctx context.Context, vault, entityName string, limit int) (*engine.FindByEntityResult, error)
+	// which entity actually served the lookup. Results are limited to limit entries
+	// after skipping offset live entries.
+	FindByEntity(ctx context.Context, vault, entityName string, limit, offset int) (*engine.FindByEntityResult, error)
 
 	// FindByConcept returns engrams whose Concept exactly matches the given
 	// string, scanned from the 0x2B concept reverse index. Hash collisions

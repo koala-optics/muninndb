@@ -1279,7 +1279,7 @@ func TestHandleStatus_IncludesEnrichmentMode(t *testing.T) {
 
 type findByEntityEngine struct{ fakeEngine }
 
-func (f *findByEntityEngine) FindByEntity(_ context.Context, _, name string, _ int) (*engine.FindByEntityResult, error) {
+func (f *findByEntityEngine) FindByEntity(_ context.Context, _, name string, _, _ int) (*engine.FindByEntityResult, error) {
 	if name == "PostgreSQL" {
 		id := storage.NewULID()
 		return &engine.FindByEntityResult{
@@ -1358,22 +1358,47 @@ func TestHandleFindByEntity_NoResults(t *testing.T) {
 
 type findByEntityCapturingEngine struct {
 	fakeEngine
-	lastLimit int
+	lastLimit  int
+	lastOffset int
 }
 
-func (f *findByEntityCapturingEngine) FindByEntity(_ context.Context, _, _ string, limit int) (*engine.FindByEntityResult, error) {
+func (f *findByEntityCapturingEngine) FindByEntity(_ context.Context, _, _ string, limit, offset int) (*engine.FindByEntityResult, error) {
 	f.lastLimit = limit
+	f.lastOffset = offset
 	return &engine.FindByEntityResult{}, nil
 }
 
-func TestHandleFindByEntity_LimitCapped(t *testing.T) {
+func TestHandleFindByEntity_PaginationParameters(t *testing.T) {
 	eng := &findByEntityCapturingEngine{}
 	srv := newTestServerWith(eng)
-	// Request limit=999; handler must cap to 50 before calling engine.
-	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_find_by_entity","arguments":{"vault":"default","entity_name":"TestEntity","limit":999}}}`
-	postRPC(t, srv, body)
-	if eng.lastLimit != 50 {
-		t.Errorf("expected engine to receive limit=50 after capping, got %d", eng.lastLimit)
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_find_by_entity","arguments":{"vault":"default","entity_name":"TestEntity","limit":500,"offset":50}}}`
+	w := postRPC(t, srv, body)
+	content := extractInnerJSON(t, decodeResp(t, w.Body.String()))
+	if eng.lastLimit != 500 {
+		t.Errorf("expected engine to receive limit=500, got %d", eng.lastLimit)
+	}
+	if eng.lastOffset != 50 {
+		t.Errorf("expected engine to receive offset=50, got %d", eng.lastOffset)
+	}
+	if content["limit"] != float64(500) || content["offset"] != float64(50) {
+		t.Errorf("expected response limit=500 and offset=50, got limit=%v offset=%v", content["limit"], content["offset"])
+	}
+}
+
+func TestHandleFindByEntity_NegativeOffsetNormalized(t *testing.T) {
+	eng := &findByEntityCapturingEngine{}
+	srv := newTestServerWith(eng)
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_find_by_entity","arguments":{"vault":"default","entity_name":"TestEntity","offset":-5}}}`
+	w := postRPC(t, srv, body)
+	content := extractInnerJSON(t, decodeResp(t, w.Body.String()))
+	if eng.lastLimit != 20 {
+		t.Errorf("expected default limit=20, got %d", eng.lastLimit)
+	}
+	if eng.lastOffset != 0 {
+		t.Errorf("expected negative offset to normalize to 0, got %d", eng.lastOffset)
+	}
+	if content["limit"] != float64(20) || content["offset"] != float64(0) {
+		t.Errorf("expected response limit=20 and offset=0, got limit=%v offset=%v", content["limit"], content["offset"])
 	}
 }
 
@@ -1722,8 +1747,8 @@ func (e *slowIdempotentEngine) GetEnrichmentMode(ctx context.Context) string {
 func (e *slowIdempotentEngine) WhereLeftOff(ctx context.Context, vault string, limit int) ([]WhereLeftOffEntry, error) {
 	return (&fakeEngine{}).WhereLeftOff(ctx, vault, limit)
 }
-func (e *slowIdempotentEngine) FindByEntity(ctx context.Context, vault, entityName string, limit int) (*engine.FindByEntityResult, error) {
-	return (&fakeEngine{}).FindByEntity(ctx, vault, entityName, limit)
+func (e *slowIdempotentEngine) FindByEntity(ctx context.Context, vault, entityName string, limit, offset int) (*engine.FindByEntityResult, error) {
+	return (&fakeEngine{}).FindByEntity(ctx, vault, entityName, limit, offset)
 }
 func (e *slowIdempotentEngine) SetEntityState(ctx context.Context, entityName, state, mergedInto, entityType string) error {
 	return (&fakeEngine{}).SetEntityState(ctx, entityName, state, mergedInto, entityType)

@@ -129,7 +129,7 @@ func (f *fakeEngine) GetEnrichmentMode(_ context.Context) string {
 func (f *fakeEngine) WhereLeftOff(_ context.Context, _ string, _ int) ([]WhereLeftOffEntry, error) {
 	return []WhereLeftOffEntry{}, nil
 }
-func (f *fakeEngine) FindByEntity(_ context.Context, _, _ string, _ int) (*engine.FindByEntityResult, error) {
+func (f *fakeEngine) FindByEntity(_ context.Context, _, _ string, _, _ int) (*engine.FindByEntityResult, error) {
 	return &engine.FindByEntityResult{}, nil
 }
 func (f *fakeEngine) FindByConcept(_ context.Context, _, _ string, _ int) ([]*storage.Engram, error) {

@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/scrypster/muninndb/internal/storage"
 	"github.com/stretchr/testify/require"
@@ -63,12 +64,58 @@ func TestFindByEntity_FuzzyArticleVariant(t *testing.T) {
 	ws := eng.store.ResolveVaultPrefix(vault)
 	id := linkEntityEngram(t, eng, ws, "knock-design", "The Knock")
 
-	res, err := eng.FindByEntity(ctx, vault, "knock", 20)
+	res, err := eng.FindByEntity(ctx, vault, "knock", 20, 0)
 	require.NoError(t, err)
 	require.Len(t, res.Engrams, 1)
 	require.Equal(t, id, res.Engrams[0].ID)
 	require.Equal(t, "The Knock", res.MatchedEntity, "resolution must be reported")
 	require.True(t, res.Fuzzy, "article-variant hit must be marked fuzzy")
+}
+
+func TestFindByEntity_OffsetPreservesResolution(t *testing.T) {
+	t.Parallel()
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	writeLinked := func(vault, entity, concept string, minute int) storage.ULID {
+		ws := eng.store.ResolveVaultPrefix(vault)
+		require.NoError(t, eng.store.UpsertEntityRecord(ctx, storage.EntityRecord{
+			Name: entity, Type: "concept", Source: "inline",
+		}, "inline"))
+		id, err := eng.store.WriteEngram(ctx, ws, &storage.Engram{
+			Concept: concept, Content: concept,
+			CreatedAt: time.Now().Add(time.Duration(minute) * time.Minute),
+		})
+		require.NoError(t, err)
+		require.NoError(t, eng.store.WriteEntityEngramLink(ctx, ws, id, entity))
+		return id
+	}
+
+	const exactVault = "fuzzy-offset-exact"
+	writeLinked(exactVault, "knock", "exact", 0)
+	writeLinked(exactVault, "The Knock", "fuzzy-candidate", 1)
+	res, err := eng.FindByEntity(ctx, exactVault, "knock", 20, 1)
+	require.NoError(t, err)
+	require.Empty(t, res.Engrams)
+	require.Equal(t, "knock", res.MatchedEntity, "an exhausted exact page must not fall through to a fuzzy entity")
+	require.False(t, res.Fuzzy)
+
+	const fuzzyVault = "fuzzy-offset-page"
+	first := writeLinked(fuzzyVault, "The Knock", "older", 0)
+	writeLinked(fuzzyVault, "The Knock", "newer", 1)
+	res, err = eng.FindByEntity(ctx, fuzzyVault, "knock", 20, 1)
+	require.NoError(t, err)
+	require.Len(t, res.Engrams, 1)
+	require.Equal(t, first, res.Engrams[0].ID)
+	require.Equal(t, "The Knock", res.MatchedEntity)
+	require.True(t, res.Fuzzy)
+
+	res, err = eng.FindByEntity(ctx, fuzzyVault, "knock", 20, 2)
+	require.NoError(t, err)
+	require.Empty(t, res.Engrams)
+	require.Equal(t, "The Knock", res.MatchedEntity)
+	require.True(t, res.Fuzzy)
 }
 
 // TestFindByEntity_FuzzySeparatorVariant covers hyphen/space separator
@@ -83,7 +130,7 @@ func TestFindByEntity_FuzzySeparatorVariant(t *testing.T) {
 	ws := eng.store.ResolveVaultPrefix(vault)
 	id := linkEntityEngram(t, eng, ws, "cycle-log", "dream cycle")
 
-	res, err := eng.FindByEntity(ctx, vault, "dream-cycle", 20)
+	res, err := eng.FindByEntity(ctx, vault, "dream-cycle", 20, 0)
 	require.NoError(t, err)
 	require.Len(t, res.Engrams, 1)
 	require.Equal(t, id, res.Engrams[0].ID)
@@ -103,7 +150,7 @@ func TestFindByEntity_FuzzyConcatenationVariant(t *testing.T) {
 	ws := eng.store.ResolveVaultPrefix(vault)
 	id := linkEntityEngram(t, eng, ws, "arcade-platform", "Token Arcade")
 
-	res, err := eng.FindByEntity(ctx, vault, "TokenArcade", 20)
+	res, err := eng.FindByEntity(ctx, vault, "TokenArcade", 20, 0)
 	require.NoError(t, err)
 	require.Len(t, res.Engrams, 1)
 	require.Equal(t, id, res.Engrams[0].ID)
@@ -129,7 +176,7 @@ func TestFindByEntity_FuzzyRanking(t *testing.T) {
 	// {arcade, board} vs "Arcade Board" → Jaccard 1.0; vs "Arcade" → 0.5.
 	// (A bare case variant like "arcade board" would hit the exact path —
 	// EntityNameHash already normalizes case.)
-	res, err := eng.FindByEntity(ctx, vault, "the arcade board", 20)
+	res, err := eng.FindByEntity(ctx, vault, "the arcade board", 20, 0)
 	require.NoError(t, err)
 	require.Equal(t, "Arcade Board", res.MatchedEntity, "full token overlap (Jaccard 1.0) must outrank partial (0.5)")
 	require.True(t, res.Fuzzy)
@@ -152,7 +199,7 @@ func TestFindByEntity_NoPhantomMatch(t *testing.T) {
 	linkEntityEngram(t, eng, ws, "knock-design", "The Knock")
 
 	// Unrelated tokens: no match.
-	res, err := eng.FindByEntity(ctx, vault, "zebra migration", 20)
+	res, err := eng.FindByEntity(ctx, vault, "zebra migration", 20, 0)
 	require.NoError(t, err)
 	require.Empty(t, res.Engrams)
 	require.Empty(t, res.MatchedEntity)
@@ -160,7 +207,7 @@ func TestFindByEntity_NoPhantomMatch(t *testing.T) {
 
 	// Stopword-only query: "the" must not match "The Knock" — the article
 	// carries no identity and the entity's non-stopword token is "knock".
-	res, err = eng.FindByEntity(ctx, vault, "the", 20)
+	res, err = eng.FindByEntity(ctx, vault, "the", 20, 0)
 	require.NoError(t, err)
 	require.Empty(t, res.Engrams, "an article must not fuzzy-match every article-bearing entity")
 	require.False(t, res.Fuzzy)
@@ -182,7 +229,7 @@ func TestFindByEntity_NoPartialOverlapMatch(t *testing.T) {
 	ws := eng.store.ResolveVaultPrefix(vault)
 	linkEntityEngram(t, eng, ws, "band-doc", "Arcade Fire")
 
-	res, err := eng.FindByEntity(ctx, vault, "Token Arcade", 20)
+	res, err := eng.FindByEntity(ctx, vault, "Token Arcade", 20, 0)
 	require.NoError(t, err)
 	require.Empty(t, res.Engrams, "one shared token on an otherwise unrelated multi-word entity must not match")
 	require.Empty(t, res.MatchedEntity)

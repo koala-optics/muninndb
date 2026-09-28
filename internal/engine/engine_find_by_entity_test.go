@@ -45,7 +45,7 @@ func TestFindByEntity_ExcludesArchived(t *testing.T) {
 	require.NoError(t, err)
 
 	// FindByEntity must return only the active engram.
-	res, err := eng.FindByEntity(ctx, vault, "SharedEntity", 50)
+	res, err := eng.FindByEntity(ctx, vault, "SharedEntity", 50, 0)
 	require.NoError(t, err)
 	require.Equal(t, "SharedEntity", res.MatchedEntity)
 	require.False(t, res.Fuzzy, "exact lookup must not be marked fuzzy")
@@ -89,12 +89,95 @@ func TestFindByEntity_NewestFirst(t *testing.T) {
 		ids[i] = id
 	}
 
-	res, err := eng.FindByEntity(ctx, vault, entity, 3)
+	res, err := eng.FindByEntity(ctx, vault, entity, 3, 0)
 	require.NoError(t, err)
 	require.Len(t, res.Engrams, 3)
 	for i := range res.Engrams {
 		require.Equal(t, ids[len(ids)-1-i], res.Engrams[i].ID)
 	}
+}
+
+func TestFindByEntity_Pagination(t *testing.T) {
+	t.Parallel()
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	const vault = "find-by-entity-pagination"
+	const entity = "PagedEntity"
+	ws := eng.store.ResolveVaultPrefix(vault)
+	require.NoError(t, eng.store.UpsertEntityRecord(ctx, storage.EntityRecord{
+		Name: entity, Type: "concept", Source: "inline",
+	}, "inline"))
+
+	ids := make([]storage.ULID, 60)
+	for i := range ids {
+		id, err := eng.store.WriteEngram(ctx, ws, &storage.Engram{
+			Concept: "paged", Content: "observation",
+			CreatedAt: time.Now().Add(time.Duration(i) * time.Minute),
+		})
+		require.NoError(t, err)
+		require.NoError(t, eng.store.WriteEntityEngramLink(ctx, ws, id, entity))
+		ids[i] = id
+	}
+
+	pageOne, err := eng.FindByEntity(ctx, vault, entity, 50, 0)
+	require.NoError(t, err)
+	require.Len(t, pageOne.Engrams, 50)
+	pageOneIDs := make([]storage.ULID, len(pageOne.Engrams))
+	for i, engram := range pageOne.Engrams {
+		want := ids[len(ids)-1-i]
+		require.Equal(t, want, engram.ID, "page one must be newest-first")
+		pageOneIDs[i] = engram.ID
+	}
+
+	pageTwo, err := eng.FindByEntity(ctx, vault, entity, 50, 50)
+	require.NoError(t, err)
+	require.Len(t, pageTwo.Engrams, 10)
+	for i, engram := range pageTwo.Engrams {
+		require.Equal(t, ids[9-i], engram.ID, "page two must continue newest-first")
+		require.NotContains(t, pageOneIDs, engram.ID, "pages must not overlap")
+	}
+
+	all, err := eng.FindByEntity(ctx, vault, entity, 500, 0)
+	require.NoError(t, err)
+	require.Len(t, all.Engrams, 60)
+	for i, engram := range all.Engrams {
+		require.Equal(t, ids[len(ids)-1-i], engram.ID, "all results must be newest-first")
+	}
+}
+
+func TestFindByEntity_OffsetSkipsOnlyLiveEngrams(t *testing.T) {
+	t.Parallel()
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	const vault = "find-by-entity-live-offset"
+	const entity = "LiveOffsetEntity"
+	ws := eng.store.ResolveVaultPrefix(vault)
+	require.NoError(t, eng.store.UpsertEntityRecord(ctx, storage.EntityRecord{
+		Name: entity, Type: "concept", Source: "inline",
+	}, "inline"))
+
+	ids := make([]storage.ULID, 5)
+	for i := range ids {
+		id, err := eng.store.WriteEngram(ctx, ws, &storage.Engram{
+			Concept: "live offset", Content: "observation",
+			CreatedAt: time.Now().Add(time.Duration(i) * time.Minute),
+		})
+		require.NoError(t, err)
+		require.NoError(t, eng.store.WriteEntityEngramLink(ctx, ws, id, entity))
+		ids[i] = id
+	}
+	require.NoError(t, eng.UpdateLifecycleState(ctx, vault, ids[3].String(), "archived"))
+	require.NoError(t, eng.store.SoftDelete(ctx, ws, ids[4]))
+
+	res, err := eng.FindByEntity(ctx, vault, entity, 2, 1)
+	require.NoError(t, err)
+	require.Len(t, res.Engrams, 2)
+	require.Equal(t, ids[1], res.Engrams[0].ID)
+	require.Equal(t, ids[0], res.Engrams[1].ID)
 }
 
 func TestFindByEntity_ExcludesSoftDeleted(t *testing.T) {
@@ -128,7 +211,7 @@ func TestFindByEntity_ExcludesSoftDeleted(t *testing.T) {
 	err = eng.store.SoftDelete(ctx, ws, idB)
 	require.NoError(t, err)
 
-	res, err := eng.FindByEntity(ctx, vault, "SharedEntity2", 50)
+	res, err := eng.FindByEntity(ctx, vault, "SharedEntity2", 50, 0)
 	require.NoError(t, err)
 
 	var foundActive, foundDeleted bool

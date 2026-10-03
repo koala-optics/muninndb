@@ -33,14 +33,18 @@ PRODUCTION_MARKERS = ("muninn.koalalifestyle.com", "koalalifestyle.com", "produc
 REQUIRED_TOOLS = {
     "muninn_remember", "muninn_read", "muninn_forget", "muninn_restore",
     "muninn_state", "muninn_status", "muninn_find_by_entity",
-    "muninn_find_by_concept",
+    "muninn_find_by_concept", "muninn_read_batch",
 }
+# Koala-lineage tools the stock v0.9 baseline image does not serve.
+CANDIDATE_ONLY_TOOLS = {"muninn_find_by_concept", "muninn_read_batch"}
 REQUIRED_GATES = (
     "baseline_fixture", "migration_v4", "migration_v5_counts",
     "migration_idempotence", "exact_concept", "newest_first_entity",
-    "lifecycle_filtering", "clean_restart", "crash_restart",
+    "hydrated_reads", "lifecycle_filtering", "clean_restart", "crash_restart",
     "hard_delete_cleanup", "backup_restore",
 )
+# A valid ULID the synthetic fixture never writes, so read_batch must report it missing.
+ABSENT_ULID = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 
 
 class QualificationError(RuntimeError):
@@ -329,6 +333,44 @@ def verify_lookup_state(client: MCPClient, *, concept: str, entity: str, expecte
     return {"concept_ms": round(concept_ms, 3), "entity_ms": round(entity_ms, 3)}
 
 
+def assert_hydrated_entity_result(result: Any, expected_ids: list[str], contents: dict[str, str]) -> None:
+    assert_entity_result(result, expected_ids)
+    for item in result["engrams"]:
+        confidence = item.get("confidence")
+        if (
+            item.get("content") != contents[item["id"]]
+            or not item.get("created_at") or not item.get("updated_at")
+            or isinstance(confidence, bool) or not isinstance(confidence, (int, float))
+            or not 0 < confidence <= 1
+        ):
+            raise QualificationError(f"include_content did not hydrate engram {item['id']}: {item}")
+
+
+def assert_read_batch_result(result: Any, expected_ids: list[str], contents: dict[str, str]) -> None:
+    if not isinstance(result, dict) or result.get("found") != len(expected_ids):
+        raise QualificationError(f"read_batch envelope mismatch: {result}")
+    memories = result.get("memories") if isinstance(result.get("memories"), list) else []
+    actual = [str(item.get("id")) for item in memories if isinstance(item, dict)]
+    if actual != expected_ids:
+        raise QualificationError(f"read_batch IDs/order mismatch: {actual} != {expected_ids}")
+    for item in memories:
+        if item.get("content") != contents[item["id"]]:
+            raise QualificationError(f"read_batch returned wrong content for {item['id']}: {item}")
+    if result.get("missing") != [ABSENT_ULID]:
+        raise QualificationError(f"read_batch missing mismatch: {result.get('missing')} != {[ABSENT_ULID]}")
+
+
+def verify_hydrated_reads(client: MCPClient, *, entity: str, expected_ids: list[str],
+                          contents: dict[str, str]) -> dict[str, float]:
+    entity_result, entity_ms = client.call("muninn_find_by_entity", {
+        "vault": "rc-synthetic", "entity_name": entity, "limit": 50, "include_content": True})
+    batch_result, batch_ms = client.call("muninn_read_batch", {
+        "vault": "rc-synthetic", "ids": [*expected_ids, ABSENT_ULID]})
+    assert_hydrated_entity_result(entity_result, expected_ids, contents)
+    assert_read_batch_result(batch_result, expected_ids, contents)
+    return {"entity_ms": round(entity_ms, 3), "read_batch_ms": round(batch_ms, 3)}
+
+
 def vault_count(client: MCPClient, vault: str) -> int:
     result, _ = client.call("muninn_status", {"vault": vault})
     if not isinstance(result, dict):
@@ -450,7 +492,7 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         active = new_container(name="koala-rc-baseline", image=baseline, data_dir=data_dir,
             network=network, env_file=env_file, logs_dir=logs_dir)
         baseline_client = start_client(active, token, args)
-        missing = sorted((REQUIRED_TOOLS - {"muninn_find_by_concept"}) - baseline_client.list_tools())
+        missing = sorted((REQUIRED_TOOLS - CANDIDATE_ONLY_TOOLS) - baseline_client.list_tools())
         if missing:
             raise QualificationError(f"baseline is missing tools: {', '.join(missing)}")
         ids_oldest, write_ms = remember_fixture(baseline_client, manifest)
@@ -477,6 +519,8 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         if missing:
             raise QualificationError(f"candidate is missing tools: {', '.join(missing)}")
         timings = verify_lookup_state(client, concept=concept, entity=entity, expected_ids=expected)
+        contents = {memory_id: item["content"] for memory_id, item in zip(ids_oldest, manifest)}
+        hydrated = verify_hydrated_reads(client, entity=entity, expected_ids=expected, contents=contents)
         candidate_count = vault_count(client, "rc-synthetic")
         migration_logs = active.stop()
         active = None
@@ -492,6 +536,8 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
             repaired_count=candidate_count, logical_count=len(ids_oldest))
         gate(receipt, "exact_concept", latency_ms=timings["concept_ms"])
         gate(receipt, "newest_first_entity", latency_ms=timings["entity_ms"])
+        gate(receipt, "hydrated_reads", entity_latency_ms=hydrated["entity_ms"],
+            read_batch_latency_ms=hydrated["read_batch_ms"])
 
         active = new_container(name="koala-rc-idempotent", image=candidate, data_dir=data_dir,
             network=network, env_file=env_file, logs_dir=logs_dir)

@@ -174,6 +174,46 @@ class QualificationSafetyTests(unittest.TestCase):
                 ["new", "old"],
             )
 
+    def test_hydrated_entity_assertion_requires_content(self) -> None:
+        contents = {"new": "body-new", "old": "body-old"}
+        def entry(memory_id, **overrides):
+            item = {"id": memory_id, "content": contents[memory_id], "confidence": 1,
+                    "created_at": "2026-01-01T00:00:01Z", "updated_at": "2026-01-01T00:00:01Z"}
+            item.update(overrides)
+            return {key: value for key, value in item.items() if value is not None}
+
+        qualification.assert_hydrated_entity_result(
+            {"count": 2, "engrams": [entry("new"), entry("old")]}, ["new", "old"], contents)
+        incomplete = (
+            {"content": None, "confidence": None, "created_at": None, "updated_at": None},
+            {"confidence": None}, {"confidence": 0}, {"confidence": True},
+            {"updated_at": None}, {"created_at": None}, {"content": "other"},
+        )
+        for overrides in incomplete:
+            with self.subTest(overrides=overrides), self.assertRaises(qualification.QualificationError):
+                qualification.assert_hydrated_entity_result(
+                    {"count": 2, "engrams": [entry("new", **overrides), entry("old")]}, ["new", "old"], contents)
+
+    def test_read_batch_assertion_requires_order_content_and_missing(self) -> None:
+        contents = {"new": "body-new", "old": "body-old"}
+        good = {"found": 2, "missing": [qualification.ABSENT_ULID], "memories": [
+            {"id": "new", "content": "body-new"}, {"id": "old", "content": "body-old"}]}
+        qualification.assert_read_batch_result(good, ["new", "old"], contents)
+        bad_cases = (
+            {**good, "memories": list(reversed(good["memories"]))},
+            {**good, "missing": []},
+            {**good, "memories": [{"id": "new", "content": "x"}, {"id": "old", "content": "body-old"}]},
+            {"error": "unknown tool: muninn_read_batch"},
+        )
+        for result in bad_cases:
+            with self.assertRaises(qualification.QualificationError):
+                qualification.assert_read_batch_result(result, ["new", "old"], contents)
+
+    def test_hydrated_reads_gate_is_required_and_candidate_only(self) -> None:
+        self.assertIn("hydrated_reads", qualification.REQUIRED_GATES)
+        self.assertIn("muninn_read_batch", qualification.REQUIRED_TOOLS)
+        self.assertIn("muninn_read_batch", qualification.CANDIDATE_ONLY_TOOLS)
+
     def test_vault_count_requires_integer_status_count(self) -> None:
         client = mock.Mock()
         client.call.return_value = ({"total_memories": 3}, 1.0)

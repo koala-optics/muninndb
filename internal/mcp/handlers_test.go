@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1399,6 +1401,205 @@ func TestHandleFindByEntity_NegativeOffsetNormalized(t *testing.T) {
 	}
 	if content["limit"] != float64(20) || content["offset"] != float64(0) {
 		t.Errorf("expected response limit=20 and offset=0, got limit=%v offset=%v", content["limit"], content["offset"])
+	}
+}
+
+// findByEntityHydratedEngine returns one fully populated engram with a fixed
+// ID so responses are byte-comparable across calls.
+type findByEntityHydratedEngine struct{ fakeEngine }
+
+var hydratedEngramID = storage.NewULID()
+
+func (f *findByEntityHydratedEngine) FindByEntity(_ context.Context, _, name string, _, _ int) (*engine.FindByEntityResult, error) {
+	if name != "PostgreSQL" {
+		return &engine.FindByEntityResult{}, nil
+	}
+	return &engine.FindByEntityResult{
+		Engrams: []*storage.Engram{{
+			ID:         hydratedEngramID,
+			Concept:    "DB choice",
+			Summary:    "Chose PostgreSQL",
+			Content:    "PG is the chosen DB",
+			Confidence: 0.9,
+			CreatedAt:  time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC),
+			UpdatedAt:  time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC),
+		}},
+		MatchedEntity: "PostgreSQL",
+	}, nil
+}
+
+func findByEntityBody(extraArgs string) string {
+	return `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_find_by_entity","arguments":{"vault":"default","entity_name":"PostgreSQL"` + extraArgs + `}}}`
+}
+
+func TestHandleFindByEntity_IncludeContent(t *testing.T) {
+	srv := newTestServerWith(&findByEntityHydratedEngine{})
+	w := postRPC(t, srv, findByEntityBody(`,"include_content":true`))
+	content := extractInnerJSON(t, decodeResp(t, w.Body.String()))
+
+	if content["include_content"] != true {
+		t.Errorf("include_content not echoed; got %v", content["include_content"])
+	}
+	engrams, _ := content["engrams"].([]any)
+	if len(engrams) != 1 {
+		t.Fatalf("expected 1 engram, got %d", len(engrams))
+	}
+	entry, _ := engrams[0].(map[string]any)
+	if entry["content"] != "PG is the chosen DB" {
+		t.Errorf("content = %v, want hydrated content", entry["content"])
+	}
+	if conf, ok := entry["confidence"].(float64); !ok || math.Abs(conf-0.9) > 1e-6 {
+		t.Errorf("confidence = %v, want 0.9", entry["confidence"])
+	}
+	if entry["created_at"] != "2026-08-30T12:00:00Z" {
+		t.Errorf("created_at = %v, want 2026-08-30T12:00:00Z", entry["created_at"])
+	}
+	if entry["updated_at"] != "2026-08-31T12:00:00Z" {
+		t.Errorf("updated_at = %v, want 2026-08-31T12:00:00Z", entry["updated_at"])
+	}
+}
+
+// TestHandleFindByEntity_LeanShapeUnchanged pins the default response: with
+// include_content omitted (or false) neither the envelope nor the entries gain
+// keys, and false is byte-identical to omitted.
+func TestHandleFindByEntity_LeanShapeUnchanged(t *testing.T) {
+	srv := newTestServerWith(&findByEntityHydratedEngine{})
+	omitted := postRPC(t, srv, findByEntityBody("")).Body.String()
+	explicitFalse := postRPC(t, srv, findByEntityBody(`,"include_content":false`)).Body.String()
+	if omitted != explicitFalse {
+		t.Errorf("include_content=false differs from omitted:\n omitted: %s\n false:   %s", omitted, explicitFalse)
+	}
+
+	content := extractInnerJSON(t, decodeResp(t, omitted))
+	wantTop := []string{"count", "engrams", "entity", "limit", "matched_entity", "offset"}
+	if got := sortedKeys(content); strings.Join(got, ",") != strings.Join(wantTop, ",") {
+		t.Errorf("lean envelope keys = %v, want %v", got, wantTop)
+	}
+	engrams, _ := content["engrams"].([]any)
+	if len(engrams) != 1 {
+		t.Fatalf("expected 1 engram, got %d", len(engrams))
+	}
+	entry, _ := engrams[0].(map[string]any)
+	wantEntry := []string{"concept", "id", "state", "summary", "type"}
+	if got := sortedKeys(entry); strings.Join(got, ",") != strings.Join(wantEntry, ",") {
+		t.Errorf("lean entry keys = %v, want %v", got, wantEntry)
+	}
+}
+
+func sortedKeys(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// ── muninn_read_batch ────────────────────────────────────────────────────────
+
+// readBatchEngine resolves two known ULIDs, reports ErrEngramNotFound for any
+// other valid ULID, and fails with a storage error for failID.
+type readBatchEngine struct {
+	fakeEngine
+	found  map[string]bool
+	failID string
+	reads  int
+}
+
+func (e *readBatchEngine) Read(_ context.Context, req *mbp.ReadRequest) (*mbp.ReadResponse, error) {
+	e.reads++
+	if req.ID == e.failID {
+		return nil, errors.New("get engram: pebble: closed")
+	}
+	if e.found[req.ID] {
+		return &mbp.ReadResponse{ID: req.ID, Concept: "concept " + req.ID, Content: "body " + req.ID}, nil
+	}
+	return nil, engine.ErrEngramNotFound
+}
+
+func readBatchBody(ids string) string {
+	return `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_read_batch","arguments":{"vault":"default"` + ids + `}}}`
+}
+
+func TestHandleReadBatch_FoundAndMissing(t *testing.T) {
+	a, b, unknown := storage.NewULID().String(), storage.NewULID().String(), storage.NewULID().String()
+	eng := &readBatchEngine{found: map[string]bool{a: true, b: true}}
+	srv := newTestServerWith(eng)
+	w := postRPC(t, srv, readBatchBody(`,"ids":["`+a+`","`+unknown+`","not-a-ulid","`+b+`"]`))
+	content := extractInnerJSON(t, decodeResp(t, w.Body.String()))
+
+	if found, _ := content["found"].(float64); int(found) != 2 {
+		t.Errorf("found = %v, want 2", content["found"])
+	}
+	memories, _ := content["memories"].([]any)
+	if len(memories) != 2 {
+		t.Fatalf("expected 2 memories, got %d", len(memories))
+	}
+	first, _ := memories[0].(map[string]any)
+	if first["id"] != a || first["content"] != "body "+a {
+		t.Errorf("first memory = %v, want id %s with content", first, a)
+	}
+	missing, _ := content["missing"].([]any)
+	if len(missing) != 2 || missing[0] != unknown || missing[1] != "not-a-ulid" {
+		t.Errorf("missing = %v, want [%s not-a-ulid]", missing, unknown)
+	}
+	if eng.reads != 3 {
+		t.Errorf("engine reads = %d, want 3 (invalid ULID must not reach the engine)", eng.reads)
+	}
+}
+
+func TestHandleReadBatch_StorageErrorFailsCall(t *testing.T) {
+	a, bad := storage.NewULID().String(), storage.NewULID().String()
+	srv := newTestServerWith(&readBatchEngine{found: map[string]bool{a: true}, failID: bad})
+	w := postRPC(t, srv, readBatchBody(`,"ids":["`+a+`","`+bad+`"]`))
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error == nil || resp.Error.Code != -32000 {
+		t.Fatalf("expected -32000 for a storage error, got %v", resp.Error)
+	}
+	if !strings.Contains(resp.Error.Message, bad) {
+		t.Errorf("error message %q should name the failing id %s", resp.Error.Message, bad)
+	}
+}
+
+func TestHandleReadBatch_EmptyIDs(t *testing.T) {
+	srv := newTestServerWith(&readBatchEngine{})
+	w := postRPC(t, srv, readBatchBody(`,"ids":[]`))
+	content := extractInnerJSON(t, decodeResp(t, w.Body.String()))
+	if found, _ := content["found"].(float64); int(found) != 0 {
+		t.Errorf("found = %v, want 0", content["found"])
+	}
+	if memories, ok := content["memories"].([]any); !ok || len(memories) != 0 {
+		t.Errorf("memories = %v, want empty array", content["memories"])
+	}
+	if missing, ok := content["missing"].([]any); !ok || len(missing) != 0 {
+		t.Errorf("missing = %v, want empty array", content["missing"])
+	}
+}
+
+func TestHandleReadBatch_InvalidParams(t *testing.T) {
+	tooMany := make([]string, maxReadBatchIDs+1)
+	for i := range tooMany {
+		tooMany[i] = `"` + storage.NewULID().String() + `"`
+	}
+	cases := map[string]string{
+		"missing ids":      "",
+		"ids not an array": `,"ids":"01ARZ3NDEKTSV4RRFFQ69G5FAV"`,
+		"non-string entry": `,"ids":["01ARZ3NDEKTSV4RRFFQ69G5FAV",7]`,
+		"empty string":     `,"ids":[""]`,
+		"over the cap":     `,"ids":[` + strings.Join(tooMany, ",") + `]`,
+	}
+	for name, ids := range cases {
+		t.Run(name, func(t *testing.T) {
+			eng := &readBatchEngine{}
+			srv := newTestServerWith(eng)
+			resp := decodeResp(t, postRPC(t, srv, readBatchBody(ids)).Body.String())
+			if resp.Error == nil || resp.Error.Code != -32602 {
+				t.Errorf("expected -32602, got %v", resp.Error)
+			}
+			if eng.reads != 0 {
+				t.Errorf("engine reads = %d, want 0 on invalid params", eng.reads)
+			}
+		})
 	}
 }
 

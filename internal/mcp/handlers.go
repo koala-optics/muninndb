@@ -1130,10 +1130,11 @@ func (s *MCPServer) handleFindByEntity(ctx context.Context, w http.ResponseWrite
 const maxReadBatchIDs = 500
 
 // handleReadBatch hydrates a list of memory IDs in one call instead of one
-// muninn_read per ID. IDs that do not resolve (unknown, deleted, or not a
-// valid ULID) are reported in "missing" rather than erroring the batch; any
-// other read failure fails the whole call so storage errors are never
-// reported as missing memories.
+// muninn_read per ID, with the same visibility: soft-deleted and archived
+// memories are returned with their state. IDs with no stored record (never
+// written or hard-deleted) or that are not valid ULIDs are reported in
+// "missing" rather than erroring the batch; any other read failure fails the
+// whole call so storage errors are never reported as missing memories.
 func (s *MCPServer) handleReadBatch(ctx context.Context, w http.ResponseWriter, id json.RawMessage, vault string, args map[string]any) {
 	rawIDs, ok := args["ids"].([]any)
 	if !ok {

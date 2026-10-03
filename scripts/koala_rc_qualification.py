@@ -336,7 +336,13 @@ def verify_lookup_state(client: MCPClient, *, concept: str, entity: str, expecte
 def assert_hydrated_entity_result(result: Any, expected_ids: list[str], contents: dict[str, str]) -> None:
     assert_entity_result(result, expected_ids)
     for item in result["engrams"]:
-        if item.get("content") != contents[item["id"]] or not item.get("created_at"):
+        confidence = item.get("confidence")
+        if (
+            item.get("content") != contents[item["id"]]
+            or not item.get("created_at") or not item.get("updated_at")
+            or isinstance(confidence, bool) or not isinstance(confidence, (int, float))
+            or not 0 < confidence <= 1
+        ):
             raise QualificationError(f"include_content did not hydrate engram {item['id']}: {item}")
 
 

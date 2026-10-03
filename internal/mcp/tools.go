@@ -611,7 +611,7 @@ func allToolDefinitions() []ToolDefinition {
 		},
 		{
 			Name:        "muninn_read_batch",
-			Description: "Read multiple memories by ID in one call (max 500 IDs). Returns memories (the muninn_read shape) plus missing: IDs that are unknown, deleted, or not valid ULIDs. Use instead of one muninn_read per ID.",
+			Description: "Read multiple memories by ID in one call (max 500 IDs). Returns memories (the muninn_read shape) plus missing: IDs that do not exist (never written or hard-deleted) or are not valid ULIDs. Like muninn_read, soft-deleted and archived memories are returned with their state. Use instead of one muninn_read per ID.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{

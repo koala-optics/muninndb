@@ -176,14 +176,23 @@ class QualificationSafetyTests(unittest.TestCase):
 
     def test_hydrated_entity_assertion_requires_content(self) -> None:
         contents = {"new": "body-new", "old": "body-old"}
-        hydrated = {"count": 2, "engrams": [
-            {"id": "new", "content": "body-new", "created_at": "2026-01-01T00:00:02Z"},
-            {"id": "old", "content": "body-old", "created_at": "2026-01-01T00:00:01Z"},
-        ]}
-        qualification.assert_hydrated_entity_result(hydrated, ["new", "old"], contents)
-        lean = {"count": 2, "engrams": [{"id": "new"}, {"id": "old"}]}
-        with self.assertRaises(qualification.QualificationError):
-            qualification.assert_hydrated_entity_result(lean, ["new", "old"], contents)
+        def entry(memory_id, **overrides):
+            item = {"id": memory_id, "content": contents[memory_id], "confidence": 1,
+                    "created_at": "2026-01-01T00:00:01Z", "updated_at": "2026-01-01T00:00:01Z"}
+            item.update(overrides)
+            return {key: value for key, value in item.items() if value is not None}
+
+        qualification.assert_hydrated_entity_result(
+            {"count": 2, "engrams": [entry("new"), entry("old")]}, ["new", "old"], contents)
+        incomplete = (
+            {"content": None, "confidence": None, "created_at": None, "updated_at": None},
+            {"confidence": None}, {"confidence": 0}, {"confidence": True},
+            {"updated_at": None}, {"created_at": None}, {"content": "other"},
+        )
+        for overrides in incomplete:
+            with self.subTest(overrides=overrides), self.assertRaises(qualification.QualificationError):
+                qualification.assert_hydrated_entity_result(
+                    {"count": 2, "engrams": [entry("new", **overrides), entry("old")]}, ["new", "old"], contents)
 
     def test_read_batch_assertion_requires_order_content_and_missing(self) -> None:
         contents = {"new": "body-new", "old": "body-old"}

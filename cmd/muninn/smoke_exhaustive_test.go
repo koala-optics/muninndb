@@ -43,6 +43,7 @@ var allMCPTools = []string{
 	"muninn_guide",
 	"muninn_where_left_off",
 	"muninn_find_by_entity",
+	"muninn_read_batch",
 	"muninn_find_by_concept",
 	"muninn_entity_state",
 	"muninn_entity_state_batch",
@@ -807,6 +808,19 @@ func TestSmoke_AllMCPTools(t *testing.T) {
 		})
 		if errVal, hasErr := result["error"]; hasErr {
 			t.Errorf("muninn_find_by_entity returned error field: %v", errVal)
+		}
+	})
+
+	t.Run("muninn_read_batch", func(t *testing.T) {
+		result := mcpTool(t, tok, "muninn_read_batch", map[string]any{
+			"vault": vault,
+			"ids":   []string{"01ARZ3NDEKTSV4RRFFQ69G5FAV"},
+		})
+		if errVal, hasErr := result["error"]; hasErr {
+			t.Errorf("muninn_read_batch returned error field: %v", errVal)
+		}
+		if _, ok := result["missing"]; !ok {
+			t.Errorf("muninn_read_batch response missing 'missing' field: %v", result)
 		}
 	})
 

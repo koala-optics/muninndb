@@ -596,16 +596,29 @@ func allToolDefinitions() []ToolDefinition {
 		// Entity reverse index tool
 		{
 			Name:        "muninn_find_by_entity",
-			Description: "Return memories that mention a given named entity, newest-first. Use offset to page through results (default 0); limit is 1-500 (default 20). Uses the entity reverse index for fast O(matches) lookup. When the exact name has no matches, vault entity names are fuzzy-matched by token overlap (case/articles/separators ignored, e.g. 'knock' finds 'The Knock') and the response reports the resolution via matched_entity + fuzzy.",
+			Description: "Return memories that mention a given named entity, newest-first. Use offset to page through results (default 0); limit is 1-500 (default 20). Uses the entity reverse index for fast O(matches) lookup. When the exact name has no matches, vault entity names are fuzzy-matched by token overlap (case/articles/separators ignored, e.g. 'knock' finds 'The Knock') and the response reports the resolution via matched_entity + fuzzy. With include_content=true each engram also carries content, confidence, created_at, and updated_at, so no follow-up muninn_read per result is needed.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"entity_name": map[string]any{"type": "string", "description": "The entity name to look up (e.g. 'PostgreSQL', 'Alice')"},
-					"vault":       vaultProp,
-					"limit":       map[string]any{"type": "integer", "description": "Max results (1-500, default 20)"},
-					"offset":      map[string]any{"type": "integer", "description": "Number of live results to skip (default 0)"},
+					"entity_name":     map[string]any{"type": "string", "description": "The entity name to look up (e.g. 'PostgreSQL', 'Alice')"},
+					"vault":           vaultProp,
+					"limit":           map[string]any{"type": "integer", "description": "Max results (1-500, default 20)"},
+					"offset":          map[string]any{"type": "integer", "description": "Number of live results to skip (default 0)"},
+					"include_content": map[string]any{"type": "boolean", "description": "If true, return each engram with content, confidence, created_at, and updated_at. Default false: id/concept/summary/state/type only."},
 				},
 				"required": []string{"entity_name"},
+			},
+		},
+		{
+			Name:        "muninn_read_batch",
+			Description: "Read multiple memories by ID in one call (max 500 IDs). Returns memories (the muninn_read shape) plus missing: IDs that are unknown, deleted, or not valid ULIDs. Use instead of one muninn_read per ID.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"ids":   map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Memory ULIDs to read (max 500 per call)."},
+					"vault": vaultProp,
+				},
+				"required": []string{"ids"},
 			},
 		},
 		// Concept reverse index tool — direct exact-Concept lookup

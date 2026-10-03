@@ -1051,6 +1051,7 @@ func (s *MCPServer) handleFindByEntity(ctx context.Context, w http.ResponseWrite
 	if offset < 0 {
 		offset = 0
 	}
+	includeContent, _ := args["include_content"].(bool)
 	res, err := s.engine.FindByEntity(ctx, vault, entityName, limit, offset)
 	if err != nil {
 		sendError(w, id, -32000, "tool error: "+err.Error())
@@ -1060,24 +1061,44 @@ func (s *MCPServer) handleFindByEntity(ctx context.Context, w http.ResponseWrite
 		res = &engine.FindByEntityResult{}
 	}
 	engrams := res.Engrams
+	// The hydrated fields are populated only when include_content=true and use
+	// omitempty, so the default (lean) response is byte-identical to callers
+	// that never send the flag.
 	type engramEntry struct {
-		ID        string `json:"id"`
-		Concept   string `json:"concept"`
-		Summary   string `json:"summary,omitempty"`
-		State     string `json:"state"`
-		Type      string `json:"type"`
-		TypeLabel string `json:"type_label,omitempty"`
+		ID         string  `json:"id"`
+		Concept    string  `json:"concept"`
+		Summary    string  `json:"summary,omitempty"`
+		State      string  `json:"state"`
+		Type       string  `json:"type"`
+		TypeLabel  string  `json:"type_label,omitempty"`
+		Content    string  `json:"content,omitempty"`
+		Confidence float32 `json:"confidence,omitempty"`
+		CreatedAt  string  `json:"created_at,omitempty"`
+		UpdatedAt  string  `json:"updated_at,omitempty"`
 	}
 	entries := make([]engramEntry, 0, len(engrams))
 	for _, e := range engrams {
-		entries = append(entries, engramEntry{
+		entry := engramEntry{
 			ID:        e.ID.String(),
 			Concept:   e.Concept,
 			Summary:   e.Summary,
 			State:     lifecycleStateLabel(e.State),
 			Type:      e.MemoryType.String(),
 			TypeLabel: e.TypeLabel,
-		})
+		}
+		if includeContent {
+			// entityEngrams already loaded the full storage.Engram via
+			// GetEngram, so hydrating costs no extra storage round-trip.
+			entry.Content = e.Content
+			entry.Confidence = e.Confidence
+			if !e.CreatedAt.IsZero() {
+				entry.CreatedAt = e.CreatedAt.UTC().Format(time.RFC3339Nano)
+			}
+			if !e.UpdatedAt.IsZero() {
+				entry.UpdatedAt = e.UpdatedAt.UTC().Format(time.RFC3339Nano)
+			}
+		}
+		entries = append(entries, entry)
 	}
 	payload := map[string]any{
 		"entity":  entityName,
@@ -1085,6 +1106,9 @@ func (s *MCPServer) handleFindByEntity(ctx context.Context, w http.ResponseWrite
 		"count":   len(entries),
 		"limit":   limit,
 		"offset":  offset,
+	}
+	if includeContent {
+		payload["include_content"] = true
 	}
 	// Report the resolution when the serving entity differs from the query
 	// (fuzzy match) — never substitute silently (issue #571).
@@ -1098,6 +1122,60 @@ func (s *MCPServer) handleFindByEntity(ctx context.Context, w http.ResponseWrite
 		}
 	}
 	out, _ := json.Marshal(payload)
+	sendResult(w, id, textContent(string(out)))
+}
+
+// maxReadBatchIDs caps muninn_read_batch at the same 500 as a
+// muninn_find_by_entity page, so one page of IDs hydrates in one call.
+const maxReadBatchIDs = 500
+
+// handleReadBatch hydrates a list of memory IDs in one call instead of one
+// muninn_read per ID. IDs that do not resolve (unknown, deleted, or not a
+// valid ULID) are reported in "missing" rather than erroring the batch; any
+// other read failure fails the whole call so storage errors are never
+// reported as missing memories.
+func (s *MCPServer) handleReadBatch(ctx context.Context, w http.ResponseWriter, id json.RawMessage, vault string, args map[string]any) {
+	rawIDs, ok := args["ids"].([]any)
+	if !ok {
+		sendError(w, id, -32602, "invalid params: 'ids' must be an array of strings")
+		return
+	}
+	if len(rawIDs) > maxReadBatchIDs {
+		sendError(w, id, -32602, fmt.Sprintf("invalid params: 'ids' length %d exceeds max %d per batch", len(rawIDs), maxReadBatchIDs))
+		return
+	}
+	ids := make([]string, 0, len(rawIDs))
+	for _, raw := range rawIDs {
+		engramID, ok := raw.(string)
+		if !ok || engramID == "" {
+			sendError(w, id, -32602, "invalid params: every 'ids' entry must be a non-empty string")
+			return
+		}
+		ids = append(ids, engramID)
+	}
+	memories := make([]Memory, 0, len(ids))
+	missing := make([]string, 0)
+	for _, engramID := range ids {
+		if _, err := storage.ParseULID(engramID); err != nil {
+			missing = append(missing, engramID)
+			continue
+		}
+		resp, err := s.engine.Read(ctx, &mbp.ReadRequest{ID: engramID, Vault: vault})
+		if errors.Is(err, engine.ErrEngramNotFound) || (err == nil && (resp == nil || resp.ID == "")) {
+			missing = append(missing, engramID)
+			continue
+		}
+		if err != nil {
+			sendError(w, id, -32000, "tool error: read "+engramID+": "+err.Error())
+			return
+		}
+		memories = append(memories, readResponseToMemory(resp))
+	}
+	out, _ := json.Marshal(map[string]any{
+		"memories": memories,
+		"found":    len(memories),
+		"missing":  missing,
+	})
 	sendResult(w, id, textContent(string(out)))
 }
 

@@ -153,3 +153,63 @@ func TestStoreAdapter_ScanWithoutFlagNilStore(t *testing.T) {
 	// Verify the interface compliance.
 	var _ PluginStore = &pluginStoreAdapter{}
 }
+
+func TestStoreAdapter_ScanRecordsVaultPrefix(t *testing.T) {
+	store := openTestStore(t)
+	adapter := &pluginStoreAdapter{store: store}
+	ctx := context.Background()
+
+	ws := store.VaultPrefix("scan-vault")
+	id, err := store.WriteEngram(ctx, ws, &storage.Engram{Concept: "scan concept", Content: "scan content"})
+	if err != nil {
+		t.Fatalf("WriteEngram: %v", err)
+	}
+
+	iter := adapter.ScanWithoutFlag(ctx, DigestEmbed, 0)
+	if !iter.Next() {
+		t.Fatal("ScanWithoutFlag yielded no engram")
+	}
+	if got := iter.Engram().ID; got != id {
+		t.Fatalf("scan yielded %v, want %v", got, id)
+	}
+	adapter.seenMu.Lock()
+	recorded, ok := adapter.seenWS[id]
+	adapter.seenMu.Unlock()
+	if !ok || recorded != ws {
+		t.Fatalf("recorded prefix = %v (ok=%v), want %v", recorded, ok, ws)
+	}
+	if got, ok := adapter.vaultPrefix(ctx, id); !ok || got != ws {
+		t.Fatalf("vaultPrefix = %v (ok=%v), want %v", got, ok, ws)
+	}
+
+	if err := iter.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	adapter.seenMu.Lock()
+	left := len(adapter.seenWS)
+	adapter.seenMu.Unlock()
+	if left != 0 {
+		t.Fatalf("Close left %d recorded prefixes", left)
+	}
+	// With nothing recorded the adapter still resolves through FindVaultPrefix.
+	if got, ok := adapter.vaultPrefix(ctx, id); !ok || got != ws {
+		t.Fatalf("fallback vaultPrefix = %v (ok=%v), want %v", got, ok, ws)
+	}
+}
+
+func TestStoreAdapter_StaleRecordedPrefixFallsBack(t *testing.T) {
+	store := openTestStore(t)
+	adapter := &pluginStoreAdapter{store: store}
+	ctx := context.Background()
+
+	ws := store.VaultPrefix("home-vault")
+	id, err := store.WriteEngram(ctx, ws, &storage.Engram{Concept: "stale concept", Content: "stale content"})
+	if err != nil {
+		t.Fatalf("WriteEngram: %v", err)
+	}
+	// A recorded prefix that no longer holds the engram must not be trusted.
+	adapter.seenWS = map[ULID][8]byte{id: store.VaultPrefix("other-vault")}
+	if got, ok := adapter.vaultPrefix(ctx, id); !ok || got != ws {
+		t.Fatalf("vaultPrefix = %v (ok=%v), want %v", got, ok, ws)
+	}
+}

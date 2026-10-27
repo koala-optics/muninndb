@@ -3,6 +3,7 @@ package plugin
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	hnswpkg "github.com/scrypster/muninndb/internal/index/hnsw"
 	"github.com/scrypster/muninndb/internal/storage"
@@ -13,6 +14,15 @@ import (
 type pluginStoreAdapter struct {
 	store *storage.PebbleStore
 	hnsw  *hnswpkg.Registry
+
+	// seenWS holds the vault prefix of every engram an open ScanWithoutFlag
+	// iterator has yielded. The retroactive processor calls several per-engram
+	// methods right after the scan yields an engram; resolving the vault with
+	// FindVaultPrefix instead walks the whole 0x01 keyspace on every call (four
+	// walks per embedded engram), which made embedding O(N) per engram on large
+	// stores. Entries live only while the iterator that recorded them is open.
+	seenMu sync.Mutex
+	seenWS map[ULID][8]byte
 }
 
 // NewStoreAdapter returns a PluginStore backed by the given PebbleStore and HNSW registry.
@@ -31,7 +41,57 @@ func (a *pluginStoreAdapter) ScanWithoutFlag(ctx context.Context, flag, skipFlag
 		// interface value, which would cause a nil-dereference panic in the caller.
 		return nil
 	}
-	return iter
+	return &prefixRecordingIterator{PluginEngramIterator: iter, a: a}
+}
+
+// prefixRecordingIterator records the vault prefix of each engram the scan
+// yields so the adapter's per-engram calls resolve it with one point read.
+// Close drops the entries this iterator recorded.
+type prefixRecordingIterator struct {
+	*storage.PluginEngramIterator
+	a    *pluginStoreAdapter
+	seen []ULID
+}
+
+func (it *prefixRecordingIterator) Next() bool {
+	if !it.PluginEngramIterator.Next() {
+		return false
+	}
+	id := it.Engram().ID
+	it.a.seenMu.Lock()
+	if it.a.seenWS == nil {
+		it.a.seenWS = make(map[ULID][8]byte)
+	}
+	it.a.seenWS[id] = it.CurrentWS()
+	it.a.seenMu.Unlock()
+	it.seen = append(it.seen, id)
+	return true
+}
+
+func (it *prefixRecordingIterator) Close() error {
+	it.a.seenMu.Lock()
+	for _, id := range it.seen {
+		delete(it.a.seenWS, id)
+	}
+	it.a.seenMu.Unlock()
+	it.seen = nil
+	return it.PluginEngramIterator.Close()
+}
+
+// vaultPrefix resolves an engram's vault prefix: the prefix an open scan
+// recorded, confirmed with one point read, else a FindVaultPrefix keyspace walk.
+// minimal: two concurrent scans that yield the same engram share one entry, so
+// the first Close sends the other back to the walk (correct, only slower).
+func (a *pluginStoreAdapter) vaultPrefix(ctx context.Context, id ULID) ([8]byte, bool) {
+	a.seenMu.Lock()
+	ws, ok := a.seenWS[id]
+	a.seenMu.Unlock()
+	if ok {
+		if _, err := a.store.GetEngram(ctx, ws, storage.ULID(id)); err == nil {
+			return ws, true
+		}
+	}
+	return a.store.FindVaultPrefix(storage.ULID(id))
 }
 
 func (a *pluginStoreAdapter) SetDigestFlag(ctx context.Context, id ULID, flag uint8) error {
@@ -43,7 +103,7 @@ func (a *pluginStoreAdapter) GetDigestFlags(ctx context.Context, id ULID) (uint8
 }
 
 func (a *pluginStoreAdapter) UpdateEmbedding(ctx context.Context, id ULID, vec []float32) error {
-	ws, ok := a.store.FindVaultPrefix(storage.ULID(id))
+	ws, ok := a.vaultPrefix(ctx, id)
 	if !ok {
 		return fmt.Errorf("UpdateEmbedding: engram %s not found", id.String())
 	}
@@ -58,8 +118,8 @@ func (a *pluginStoreAdapter) UpdateEmbedding(ctx context.Context, id ULID, vec [
 }
 
 // CheckEmbedDim implements PluginStore (issue #582).
-func (a *pluginStoreAdapter) CheckEmbedDim(_ context.Context, id ULID, dim int) error {
-	ws, ok := a.store.FindVaultPrefix(storage.ULID(id))
+func (a *pluginStoreAdapter) CheckEmbedDim(ctx context.Context, id ULID, dim int) error {
+	ws, ok := a.vaultPrefix(ctx, id)
 	if !ok {
 		return fmt.Errorf("CheckEmbedDim: engram %s not found", id.String())
 	}
@@ -97,7 +157,7 @@ func (a *pluginStoreAdapter) UpsertEntity(ctx context.Context, entity ExtractedE
 }
 
 func (a *pluginStoreAdapter) LinkEngramToEntity(ctx context.Context, engramID ULID, entityName string) error {
-	ws, ok := a.store.FindVaultPrefix(storage.ULID(engramID))
+	ws, ok := a.vaultPrefix(ctx, engramID)
 	if !ok {
 		return fmt.Errorf("LinkEngramToEntity: engram %s not found", engramID.String())
 	}
@@ -105,7 +165,7 @@ func (a *pluginStoreAdapter) LinkEngramToEntity(ctx context.Context, engramID UL
 }
 
 func (a *pluginStoreAdapter) IncrementEntityCoOccurrence(ctx context.Context, engramID ULID, nameA, nameB string) error {
-	ws, ok := a.store.FindVaultPrefix(storage.ULID(engramID))
+	ws, ok := a.vaultPrefix(ctx, engramID)
 	if !ok {
 		return fmt.Errorf("IncrementEntityCoOccurrence: engram %s not found", engramID.String())
 	}
@@ -113,7 +173,7 @@ func (a *pluginStoreAdapter) IncrementEntityCoOccurrence(ctx context.Context, en
 }
 
 func (a *pluginStoreAdapter) UpsertRelationship(ctx context.Context, engramID ULID, rel ExtractedRelation) error {
-	ws, ok := a.store.FindVaultPrefix(storage.ULID(engramID))
+	ws, ok := a.vaultPrefix(ctx, engramID)
 	if !ok {
 		return fmt.Errorf("UpsertRelationship: engram %s not found", engramID.String())
 	}
@@ -128,7 +188,7 @@ func (a *pluginStoreAdapter) UpsertRelationship(ctx context.Context, engramID UL
 }
 
 func (a *pluginStoreAdapter) HNSWInsert(ctx context.Context, id ULID, vec []float32) error {
-	ws, ok := a.store.FindVaultPrefix(storage.ULID(id))
+	ws, ok := a.vaultPrefix(ctx, id)
 	if !ok {
 		return fmt.Errorf("HNSWInsert: engram %s not found", id.String())
 	}
@@ -136,7 +196,7 @@ func (a *pluginStoreAdapter) HNSWInsert(ctx context.Context, id ULID, vec []floa
 }
 
 func (a *pluginStoreAdapter) AutoLinkByEmbedding(ctx context.Context, id ULID, vec []float32) error {
-	ws, ok := a.store.FindVaultPrefix(storage.ULID(id))
+	ws, ok := a.vaultPrefix(ctx, id)
 	if !ok {
 		return nil // not a fatal error
 	}

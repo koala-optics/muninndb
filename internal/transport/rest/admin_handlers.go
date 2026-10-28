@@ -603,11 +603,11 @@ type EmbedStatusResponse struct {
 	Enabled       bool   `json:"enabled"`
 	EmbeddedCount int64  `json:"embedded_count"` // -1 = unknown
 	TotalCount    int64  `json:"total_count"`    // -1 = unknown
+	Indexing      bool   `json:"indexing"`
 	// FailedCount is the number of engrams permanently flagged embed-failed (never
 	// retried, absent from semantic recall); -1 = unknown or not supported.
 	// POST /api/admin/embed/retry-failed re-queues them.
 	FailedCount int64 `json:"failed_count"`
-	Indexing      bool   `json:"indexing"`
 	// RatePerSec is the current embedding rate in engrams per second; 0 when not indexing.
 	RatePerSec float64 `json:"rate_per_sec"`
 	// ETASeconds is the estimated seconds until indexing completes; 0 when not indexing or rate unknown.

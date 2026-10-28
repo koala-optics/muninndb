@@ -412,24 +412,35 @@ func (s *MCPServer) handleRecall(ctx context.Context, w http.ResponseWriter, id 
 	}
 
 	// Tag filters: tags_all (AND), tags_any (OR), tag_filter (prefix value range).
-	parseStringArrayArg := func(v any) []string {
+	// A present value that is not an array of non-empty strings is rejected: a bare
+	// string used to be dropped silently, so the recall ran with no tag filter.
+	parseStringArrayArg := func(v any) ([]string, bool) {
+		if v == nil {
+			return nil, true
+		}
 		arr, ok := v.([]any)
 		if !ok {
-			return nil
+			return nil, false
 		}
 		out := make([]string, 0, len(arr))
 		for _, e := range arr {
-			if s, ok := e.(string); ok && s != "" {
-				out = append(out, s)
+			s, ok := e.(string)
+			if !ok || s == "" {
+				return nil, false
 			}
+			out = append(out, s)
 		}
-		return out
+		return out, true
 	}
-	if tags := parseStringArrayArg(args["tags_all"]); len(tags) > 0 {
-		req.Filters = append(req.Filters, mbp.Filter{Field: "tags_all", Op: "all", Value: tags})
-	}
-	if tags := parseStringArrayArg(args["tags_any"]); len(tags) > 0 {
-		req.Filters = append(req.Filters, mbp.Filter{Field: "tags_any", Op: "any", Value: tags})
+	for _, tf := range []struct{ field, op string }{{"tags_all", "all"}, {"tags_any", "any"}} {
+		tags, ok := parseStringArrayArg(args[tf.field])
+		if !ok {
+			sendError(w, id, -32602, fmt.Sprintf("invalid '%s': must be an array of non-empty strings", tf.field))
+			return
+		}
+		if len(tags) > 0 {
+			req.Filters = append(req.Filters, mbp.Filter{Field: tf.field, Op: tf.op, Value: tags})
+		}
 	}
 	if tf, ok := args["tag_filter"].(map[string]any); ok {
 		prefix, _ := tf["prefix"].(string)

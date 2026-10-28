@@ -93,8 +93,8 @@ func TestRebuildVaultCounts_RejectsMalformedCountKey(t *testing.T) {
 }
 
 func TestRegisterMigrations_IncludesVaultCountRepairAndDowngradeBoundary(t *testing.T) {
-	if got := MaxRegisteredVersion(); got != 5 {
-		t.Fatalf("MaxRegisteredVersion = %d, want 5", got)
+	if got := MaxRegisteredVersion(); got != 6 {
+		t.Fatalf("MaxRegisteredVersion = %d, want 6", got)
 	}
 
 	db := openTestDB(t)

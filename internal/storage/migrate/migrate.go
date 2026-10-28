@@ -51,6 +51,7 @@ func RegisterMigrations(r *Runner) {
 	r.Register(Migration{Version: 3, Description: "relocate auth prefixes 0x11-0x14 to 0x42-0x45 (#611)", Up: RelocateAuthPrefixes})
 	r.Register(Migration{Version: 4, Description: "backfill exact-concept reverse index (0x2B)", Up: BackfillConceptIndex})
 	r.Register(Migration{Version: 5, Description: "rebuild exact per-vault engram counts (0x15)", Up: RebuildVaultCounts})
+	r.Register(Migration{Version: 6, Description: "clear DigestEmbedFailed stranded on never-embedded engrams by shutdown", Up: ClearStrandedEmbedFailed})
 }
 
 // MaxRegisteredVersion returns the highest migration version this binary knows.

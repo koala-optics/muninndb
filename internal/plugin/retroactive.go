@@ -304,6 +304,19 @@ func (rp *RetroactiveProcessor) processBatch(ctx context.Context) bool {
 			return
 		}
 		vecs, embedErr := embedPlugin.Embed(ctx, microTexts)
+		if embedErr != nil && ctx.Err() != nil {
+			// Shutdown or cancellation aborted inference: not an engram failure.
+			// Leave the batch pending (deliberately NO DigestEmbedFailed) so the
+			// next start embeds it. Flagging here permanently dropped every engram
+			// in flight at each graceful stop from semantic recall.
+			slog.Info("retroactive processor: embed batch cancelled, engrams left pending",
+				"plugin", rp.plugin.Name(),
+				"batch_size", len(microEngrams),
+				"error", embedErr)
+			microEngrams = microEngrams[:0]
+			microTexts = microTexts[:0]
+			return
+		}
 		if embedErr != nil {
 			ids := make([]string, len(microEngrams))
 			for i, e := range microEngrams {

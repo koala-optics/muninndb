@@ -26,10 +26,17 @@ const (
 // the 0x23 reverse index. Each such engram receives a score boost of
 // entityBoostFactor (or is added to the result set with that score if it was
 // not already returned by BFS). Results are re-sorted by score descending.
-func (e *Engine) applyEntityBoost(ctx context.Context, ws [8]byte, results []activation.ScoredEngram) []activation.ScoredEngram {
+//
+// Each engram is boosted at most once per query: without that, an engram
+// sharing several entities with several seeds stacked up to
+// entityBoostTopN x entities x entityBoostFactor and outranked strong direct
+// matches. An engram added here must also satisfy the request's filters and
+// threshold, exactly like one returned by Run.
+func (e *Engine) applyEntityBoost(ctx context.Context, ws [8]byte, results []activation.ScoredEngram, filters []activation.Filter, threshold float64) []activation.ScoredEngram {
 	if len(results) == 0 {
 		return results
 	}
+	boosted := make(map[storage.ULID]bool, len(results))
 
 	// Seed the boost from at most entityBoostTopN top results.
 	seedCount := len(results)
@@ -57,11 +64,19 @@ func (e *Engine) applyEntityBoost(ctx context.Context, ws [8]byte, results []act
 					return nil
 				}
 
+				if boosted[engramID] {
+					return nil
+				}
 				if idx, found := seenInResults[engramID]; found {
 					// Boost existing result.
 					results[idx].Score += entityBoostFactor
+					boosted[engramID] = true
 				} else {
-					// Fetch engram and add as a new entity-boosted result.
+					// A new result enters at entityBoostFactor, so it must clear the
+					// caller's threshold (checked before the fetch) and filters.
+					if entityBoostFactor < threshold {
+						return nil
+					}
 					eng, err := e.store.GetEngram(ctx, ws, engramID)
 					if err != nil || eng == nil {
 						return nil
@@ -69,11 +84,15 @@ func (e *Engine) applyEntityBoost(ctx context.Context, ws [8]byte, results []act
 					if eng.State == storage.StateSoftDeleted || eng.State == storage.StateArchived {
 						return nil
 					}
+					if !activation.PassesMetaFilter(eng, filters) {
+						return nil
+					}
 					results = append(results, activation.ScoredEngram{
 						Engram: eng,
 						Score:  entityBoostFactor,
 					})
 					seenInResults[engramID] = len(results) - 1
+					boosted[engramID] = true
 				}
 				return nil
 			})

@@ -315,7 +315,8 @@ func (s *MCPServer) handleRecall(ctx context.Context, w http.ResponseWriter, id 
 		return
 	}
 
-	threshold := float32(0.5)
+	// 0 = no caller threshold: the engine applies the vault recall-mode preset or its 0.1 default.
+	var threshold float32
 	if t, ok := args["threshold"].(float64); ok {
 		if t < 0 {
 			t = 0

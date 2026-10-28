@@ -1,6 +1,7 @@
 package rest
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -602,6 +603,10 @@ type EmbedStatusResponse struct {
 	Enabled       bool   `json:"enabled"`
 	EmbeddedCount int64  `json:"embedded_count"` // -1 = unknown
 	TotalCount    int64  `json:"total_count"`    // -1 = unknown
+	// FailedCount is the number of engrams permanently flagged embed-failed (never
+	// retried, absent from semantic recall); -1 = unknown or not supported.
+	// POST /api/admin/embed/retry-failed re-queues them.
+	FailedCount int64 `json:"failed_count"`
 	Indexing      bool   `json:"indexing"`
 	// RatePerSec is the current embedding rate in engrams per second; 0 when not indexing.
 	RatePerSec float64 `json:"rate_per_sec"`
@@ -621,6 +626,10 @@ func (s *Server) handleEmbedStatus(w http.ResponseWriter, r *http.Request) {
 
 	embeddedCount := s.engine.CountEmbedded(r.Context())
 	indexing := embeddedCount >= 0 && totalCount >= 0 && embeddedCount < totalCount
+	failedCount := int64(-1)
+	if fc, ok := s.engine.(embedFailureCounter); ok {
+		failedCount = fc.CountEmbedFailed(r.Context())
+	}
 
 	resp := EmbedStatusResponse{
 		Provider:            s.embedProvider,
@@ -628,6 +637,7 @@ func (s *Server) handleEmbedStatus(w http.ResponseWriter, r *http.Request) {
 		Enabled:             s.embedProvider != "" && s.embedProvider != "none",
 		EmbeddedCount:       embeddedCount,
 		TotalCount:          totalCount,
+		FailedCount:         failedCount,
 		Indexing:            indexing,
 		HardwareAccelerated: s.embedHardwareAccelerated,
 	}
@@ -640,6 +650,36 @@ func (s *Server) handleEmbedStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.sendJSON(w, http.StatusOK, resp)
+}
+
+// embedFailureCounter and embedFailureRetrier are optional EngineAPI extensions
+// (implemented by RESTEngineWrapper), asserted at runtime so engine mocks need
+// not implement them.
+type embedFailureCounter interface {
+	CountEmbedFailed(ctx context.Context) int64
+}
+
+type embedFailureRetrier interface {
+	RetryFailedEmbeds(ctx context.Context) (int, error)
+}
+
+// handleRetryFailedEmbeds re-queues every engram permanently flagged
+// embed-failed so the embed processor retries it on its next pass.
+// POST /api/admin/embed/retry-failed
+// Response 200: {"requeued": N}
+func (s *Server) handleRetryFailedEmbeds(w http.ResponseWriter, r *http.Request) {
+	rf, ok := s.engine.(embedFailureRetrier)
+	if !ok {
+		s.sendError(r, w, http.StatusNotImplemented, ErrInternal, "retry of failed embeds not supported by this engine")
+		return
+	}
+	n, err := rf.RetryFailedEmbeds(r.Context())
+	if err != nil {
+		s.sendError(r, w, http.StatusInternalServerError, ErrStorageError, err.Error())
+		return
+	}
+	s.EmitAudit(r, "embed.retry_failed", "embed", "all", "ok", map[string]string{"requeued": fmt.Sprint(n)})
+	s.sendJSON(w, http.StatusOK, map[string]int{"requeued": n})
 }
 
 // PluginStatusResponse is one entry in GET /api/admin/plugins.

@@ -242,6 +242,7 @@ func NewServer(addr string, engine EngineAPI, authStore *auth.Store, sessionSecr
 	mux.HandleFunc("PUT /api/admin/vaults/config", s.withAdminMiddleware(s.handleSetVaultConfig(authStore)))
 	mux.HandleFunc("PUT /api/admin/password", s.withAdminMiddleware(s.handleChangeAdminPassword(authStore)))
 	mux.HandleFunc("GET /api/admin/embed/status", s.withAdminMiddleware(s.handleEmbedStatus))
+	mux.HandleFunc("POST /api/admin/embed/retry-failed", s.withAdminMiddleware(s.handleRetryFailedEmbeds))
 	mux.HandleFunc("GET /api/admin/mcp-info", s.withAdminMiddleware(s.handleMCPInfo))
 	mux.HandleFunc("GET /api/admin/entity-graph", s.withAdminMiddleware(s.handleEntityGraph))
 	mux.HandleFunc("GET /api/admin/plugins", s.withAdminMiddleware(s.handlePlugins))

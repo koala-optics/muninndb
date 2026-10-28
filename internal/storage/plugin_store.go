@@ -38,7 +38,14 @@ func (ps *PebbleStore) CountWithoutFlag(ctx context.Context, flag, skipFlags uin
 		var id [16]byte
 		copy(id[:], k[9:25])
 
-		// Skip soft-deleted and archived engrams — mirrors ScanWithoutFlag so
+		// Digest flags first: a one-byte point read rules out nearly every engram
+		// (already processed or permanently failed) without decoding its record.
+		raw, err := ps.getDigestFlagsRaw(id)
+		if !((err != nil || raw&flag == 0) && (skipFlags == 0 || raw&skipFlags == 0)) {
+			continue
+		}
+
+		// Skip soft-deleted and archived engrams - mirrors ScanWithoutFlag so
 		// CountWithoutFlag and the scan agree on what is actually pending.
 		val := make([]byte, len(iter.Value()))
 		copy(val, iter.Value())
@@ -48,13 +55,89 @@ func (ps *PebbleStore) CountWithoutFlag(ctx context.Context, flag, skipFlags uin
 				continue
 			}
 		}
+		count++
+	}
+	return count, nil
+}
 
-		raw, err := ps.getDigestFlagsRaw(id)
-		if (err != nil || raw&flag == 0) && (skipFlags == 0 || raw&skipFlags == 0) {
+// digestEmbedded and digestEmbedFailed mirror plugin.DigestEmbed and
+// plugin.DigestEmbedFailed (storage cannot import plugin).
+const (
+	digestEmbedded    uint8 = 0x02
+	digestEmbedFailed uint8 = 0x80
+)
+
+// CountEmbedFailed returns the number of 0x11 digest records flagged
+// DigestEmbedFailed (0x80) that have no embedding (0x02 unset). The embed
+// processor skips these forever, so they are missing from semantic recall until
+// ClearEmbedFailed re-queues them. Where 0x02 is set the shared 0x80 bit can only
+// mean DigestEnrichFailed, so those records are not counted.
+func (ps *PebbleStore) CountEmbedFailed(ctx context.Context) (int64, error) {
+	iter, err := ps.db.NewIter(&pebble.IterOptions{
+		LowerBound: []byte{prefix.DigestFlags},
+		UpperBound: []byte{prefix.Coherence},
+	})
+	if err != nil {
+		return 0, err
+	}
+	defer iter.Close()
+
+	var count int64
+	for valid := iter.First(); valid; valid = iter.Next() {
+		val := iter.Value()
+		if len(val) > 0 && val[0]&digestEmbedFailed != 0 && val[0]&digestEmbedded == 0 {
 			count++
 		}
 	}
-	return count, nil
+	return count, iter.Error()
+}
+
+// ClearEmbedFailed clears DigestEmbedFailed on every digest record that has no
+// embedding, returning the embed-failed engrams to the embed queue (an engram
+// that genuinely fails again is re-flagged on its next attempt). Same rule as
+// migration v6 ClearStrandedEmbedFailed, available at runtime.
+// minimal: duplicates v6's loop because a migrate test imports storage; share a
+// helper package if a third caller appears.
+func (ps *PebbleStore) ClearEmbedFailed(ctx context.Context) (int, error) {
+	iter, err := ps.db.NewIter(&pebble.IterOptions{
+		LowerBound: []byte{prefix.DigestFlags},
+		UpperBound: []byte{prefix.Coherence},
+	})
+	if err != nil {
+		return 0, fmt.Errorf("clear embed-failed: iter: %w", err)
+	}
+	batch := ps.db.NewBatch()
+	defer func() { _ = batch.Close() }()
+
+	cleared := 0
+	for valid := iter.First(); valid; valid = iter.Next() {
+		val := iter.Value()
+		if len(val) == 0 || val[0]&digestEmbedFailed == 0 || val[0]&digestEmbedded != 0 {
+			continue
+		}
+		next := append([]byte(nil), val...)
+		next[0] &^= digestEmbedFailed
+		if err := batch.Set(iter.Key(), next, nil); err != nil {
+			_ = iter.Close()
+			return 0, fmt.Errorf("clear embed-failed: batch set: %w", err)
+		}
+		cleared++
+	}
+	if err := iter.Error(); err != nil {
+		_ = iter.Close()
+		return 0, fmt.Errorf("clear embed-failed: scan: %w", err)
+	}
+	if err := iter.Close(); err != nil {
+		return 0, fmt.Errorf("clear embed-failed: close iter: %w", err)
+	}
+	if cleared == 0 {
+		return 0, nil
+	}
+	if err := batch.Commit(pebble.Sync); err != nil {
+		return 0, fmt.Errorf("clear embed-failed: commit: %w", err)
+	}
+	ps.replicateBatch(batch)
+	return cleared, nil
 }
 
 // CountWithFlag returns the number of engrams across all vaults that have the

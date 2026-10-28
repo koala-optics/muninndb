@@ -858,6 +858,33 @@ func (e *Engine) CountEmbedded(ctx context.Context) int64 {
 	return count
 }
 
+// CountEmbedFailed returns the count of engrams permanently flagged
+// DigestEmbedFailed without an embedding: the embed processor skips them, so
+// they are absent from semantic recall. Returns -1 on error.
+func (e *Engine) CountEmbedFailed(ctx context.Context) int64 {
+	count, err := e.store.CountEmbedFailed(ctx)
+	if err != nil {
+		return -1
+	}
+	return count
+}
+
+// RetryFailedEmbeds clears DigestEmbedFailed on every engram without an
+// embedding and wakes the embed processor, so those engrams are embedded on its
+// next pass. Returns the number of engrams re-queued.
+func (e *Engine) RetryFailedEmbeds(ctx context.Context) (int, error) {
+	cleared, err := e.store.ClearEmbedFailed(ctx)
+	if err != nil {
+		return 0, err
+	}
+	for _, p := range e.retroProcessors {
+		if p != nil && p.Mode() == "embed" {
+			p.Notify()
+		}
+	}
+	return cleared, nil
+}
+
 // ActivityTracker returns the vault-level activity tracker.
 func (e *Engine) ActivityTracker() *cognitive.ActivityTracker {
 	return e.activity

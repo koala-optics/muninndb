@@ -250,6 +250,14 @@ func (w *RESTEngineWrapper) CountEmbedded(ctx context.Context) int64 {
 	return w.engine.CountEmbedded(ctx)
 }
 
+func (w *RESTEngineWrapper) CountEmbedFailed(ctx context.Context) int64 {
+	return w.engine.CountEmbedFailed(ctx)
+}
+
+func (w *RESTEngineWrapper) RetryFailedEmbeds(ctx context.Context) (int, error) {
+	return w.engine.RetryFailedEmbeds(ctx)
+}
+
 func (w *RESTEngineWrapper) RecordAccess(ctx context.Context, vault, id string) error {
 	return w.engine.RecordAccess(ctx, vault, id)
 }

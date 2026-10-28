@@ -178,7 +178,7 @@ func allToolDefinitions() []ToolDefinition {
 				"properties": map[string]any{
 					"vault":     vaultProp,
 					"context":   map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Search context phrases."},
-					"threshold": map[string]any{"type": "number", "description": "Minimum relevance score 0.0-1.0 (default 0.5)."},
+					"threshold": map[string]any{"type": "number", "description": "Minimum relevance score 0.0-1.0 (default: engine default 0.1, or the vault recall-mode preset)."},
 					"limit":     map[string]any{"type": "integer", "description": "Max results to return (default 10)."},
 					"profile": map[string]any{
 						"type":        "string",

@@ -1913,6 +1913,12 @@ func computeGatedActivation(vectorScore, normalizedFTS, decayFactor, hebbianBoos
 // passesMetaFilter evaluates filter predicates against a full engram.
 // Accepts *storage.Engram directly — avoids a separate GetMetadata call in phase6.
 func passesMetaFilter(eng *storage.Engram, filters []Filter) bool {
+	return PassesMetaFilter(eng, filters)
+}
+
+// PassesMetaFilter reports whether eng satisfies every filter predicate. It is
+// exported for post-Run phases (entity boost) that add engrams outside phase6.
+func PassesMetaFilter(eng *storage.Engram, filters []Filter) bool {
 	for _, f := range filters {
 		switch f.Field {
 		case "state":

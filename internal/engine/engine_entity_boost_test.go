@@ -158,7 +158,7 @@ func TestEntityBoost_ApplyEntityBoostDirect(t *testing.T) {
 	}
 
 	// Apply entity boost.
-	boosted := eng.applyEntityBoost(ctx, ws, initialResults)
+	boosted := eng.applyEntityBoost(ctx, ws, initialResults, nil, 0)
 
 	// Build ID set from boosted results.
 	idSet := make(map[storage.ULID]float64, len(boosted))

@@ -74,6 +74,28 @@ func TestHandleRecall_TagFilter_RequiresPrefix(t *testing.T) {
 	}
 }
 
+// TestHandleRecall_TagArgs_RejectNonArray verifies a tags_all / tags_any value
+// that is not an array of non-empty strings is rejected instead of being dropped
+// silently (the recall used to run with no tag filter at all).
+func TestHandleRecall_TagArgs_RejectNonArray(t *testing.T) {
+	for _, arg := range []string{
+		`"tags_all":"d2c"`,
+		`"tags_any":"d2c"`,
+		`"tags_all":["d2c",7]`,
+		`"tags_any":["d2c",""]`,
+	} {
+		eng := &filterCapturingEngine{}
+		srv := newTestServerWith(eng)
+		body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_recall","arguments":{
+			"vault":"default","context":["x"],` + arg + `
+		}}}`
+		w := postRPC(t, srv, body)
+		if resp := decodeResp(t, w.Body.String()); resp.Error == nil {
+			t.Errorf("%s: expected an invalid-params error, got filters %+v", arg, eng.lastFilters)
+		}
+	}
+}
+
 func asStrings(v interface{}) []string {
 	if s, ok := v.([]string); ok {
 		return s

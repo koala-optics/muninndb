@@ -3,8 +3,11 @@ package mcp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/scrypster/muninndb/internal/storage"
 )
 
 type ownerInventoryTestEngine struct {
@@ -21,6 +24,98 @@ func (e *ownerInventoryTestEngine) OwnerInventory(_ context.Context, vault strin
 	e.calls++
 	e.vault, e.limit, e.offset = vault, limit, offset
 	return e.result, e.err
+}
+
+type ownerInventoryCursorTestEngine struct {
+	fakeEngine
+	result *OwnerInventoryCursorResult
+	err    error
+	calls  int
+	vault  string
+	after  *storage.ULID
+	limit  int
+}
+
+func (e *ownerInventoryCursorTestEngine) OwnerInventoryAfter(_ context.Context, vault string, after *storage.ULID, limit int) (*OwnerInventoryCursorResult, error) {
+	e.calls++
+	e.vault, e.after, e.limit = vault, after, limit
+	return e.result, e.err
+}
+
+func TestHandleOwnerInventory_KeysetPage(t *testing.T) {
+	cursor := "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+	eng := &ownerInventoryCursorTestEngine{result: &OwnerInventoryCursorResult{
+		Engrams: []OwnerInventoryEngram{{ID: "01NEXT", Tags: []string{}, Vault: "inventory"}},
+		Limit:   2, AfterID: cursor, NextAfterID: "01NEXT",
+	}}
+	srv := New(":0", eng, "", nil, nil, nil)
+	w := postRPC(t, srv, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"muninn_owner_inventory","arguments":{"vault":"inventory","limit":2,"after_id":"`+cursor+`"}}}`)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+	content := extractInnerJSON(t, resp)
+	if content["next_after_id"] != "01NEXT" || content["after_id"] != cursor || content["limit"] != float64(2) {
+		t.Fatalf("keyset echo = %#v", content)
+	}
+	if _, hasTotal := content["total"]; hasTotal {
+		t.Fatalf("keyset page must not claim a total: %#v", content)
+	}
+	if eng.calls != 1 || eng.vault != "inventory" || eng.limit != 2 || eng.after == nil || eng.after.String() != cursor {
+		t.Fatalf("engine call = %#v", eng)
+	}
+}
+
+func TestHandleOwnerInventory_KeysetEmptyCursorStartsAtVaultStart(t *testing.T) {
+	eng := &ownerInventoryCursorTestEngine{result: &OwnerInventoryCursorResult{Engrams: []OwnerInventoryEngram{}, Limit: 100}}
+	srv := New(":0", eng, "", nil, nil, nil)
+	w := postRPC(t, srv, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"muninn_owner_inventory","arguments":{"after_id":""}}}`)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+	if eng.calls != 1 || eng.after != nil || eng.limit != defaultOwnerInventoryLimit {
+		t.Fatalf("engine call = %#v", eng)
+	}
+	if content := extractInnerJSON(t, resp); content["next_after_id"] != "" {
+		t.Fatalf("terminal keyset page = %#v", content)
+	}
+}
+
+func TestHandleOwnerInventory_KeysetInvalidArgumentsDoNotCallEngine(t *testing.T) {
+	cases := []string{
+		`{"after_id":7}`,
+		`{"after_id":"not-a-ulid"}`,
+		`{"after_id":"","offset":0}`,
+		`{"after_id":"","limit":201}`,
+	}
+	for _, args := range cases {
+		t.Run(args, func(t *testing.T) {
+			eng := &ownerInventoryCursorTestEngine{}
+			srv := New(":0", eng, "", nil, nil, nil)
+			w := postRPC(t, srv, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"muninn_owner_inventory","arguments":`+args+`}}`)
+			resp := decodeResp(t, w.Body.String())
+			if resp.Error == nil || resp.Error.Code != -32602 {
+				t.Fatalf("error = %#v, want invalid params", resp.Error)
+			}
+			if eng.calls != 0 {
+				t.Fatalf("engine called %d times", eng.calls)
+			}
+		})
+	}
+}
+
+func TestHandleOwnerInventory_KeysetErrorNamesClassWithoutLeaking(t *testing.T) {
+	eng := &ownerInventoryCursorTestEngine{err: fmt.Errorf("secret owner detail: %w", context.DeadlineExceeded)}
+	srv := New(":0", eng, "", nil, nil, nil)
+	w := postRPC(t, srv, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"muninn_owner_inventory","arguments":{"after_id":""}}}`)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error == nil || !strings.Contains(resp.Error.Message, "read failed (deadline exceeded)") {
+		t.Fatalf("error = %#v", resp.Error)
+	}
+	if strings.Contains(resp.Error.Message, "secret owner detail") {
+		t.Fatalf("owner error leaked: %s", resp.Error.Message)
+	}
 }
 
 func TestHandleOwnerInventory_HappyPath(t *testing.T) {

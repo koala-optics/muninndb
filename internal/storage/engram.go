@@ -983,6 +983,9 @@ func (ps *PebbleStore) ScanEngramsFrom(ctx context.Context, ws [8]byte, start *U
 
 		erfEng, decErr := erf.Decode(rawVal)
 		if decErr != nil {
+			var badID ULID
+			copy(badID[:], k[9:25])
+			slog.Warn("storage: scan engrams skipped undecodable record", "id", badID.String(), "err", decErr)
 			continue
 		}
 
@@ -1023,6 +1026,9 @@ func (ps *PebbleStore) ScanEngramsFrom(ctx context.Context, ws [8]byte, start *U
 		if err := fn(eng); err != nil {
 			return err
 		}
+	}
+	if err := embedIter.Error(); err != nil {
+		return fmt.Errorf("scan engrams: embedding iter: %w", err)
 	}
 	return iter.Error()
 }

@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"time"
 
@@ -154,13 +155,23 @@ var errKeysetPageDone = errors.New("keyset page done")
 // reached the end of the vault. A page may hold fewer than limit rows while
 // next is non-nil (the per-page scan budget ran out).
 func (e *Engine) ListEngramsAfter(ctx context.Context, vault string, after *storage.ULID, limit int) (page []*storage.Engram, next *storage.ULID, err error) {
+	if limit < 1 {
+		return nil, nil, errors.New("list engrams after: limit must be at least 1")
+	}
 	ws := e.store.ResolveVaultPrefix(vault)
 	page = []*storage.Engram{}
 	visited := 0
 	var last storage.ULID
 	err = e.store.ScanEngramsFrom(ctx, ws, after, func(eng *storage.Engram) error {
-		if after != nil && eng.ID == *after {
-			return nil
+		if after != nil {
+			// The scan seeks by key; the cursor is the decoded ID. A record whose
+			// ID sorts before the cursor would send the next page backwards, so
+			// fail loudly instead of looping or skipping.
+			if c := storage.CompareULIDs(eng.ID, *after); c == 0 {
+				return nil
+			} else if c < 0 {
+				return fmt.Errorf("list engrams after: record %s sorts before cursor %s", eng.ID, *after)
+			}
 		}
 		active := eng.State != storage.StateSoftDeleted && eng.State != storage.StateArchived
 		// A full page stops only at the next active row, so a vault whose

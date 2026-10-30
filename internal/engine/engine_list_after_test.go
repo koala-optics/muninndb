@@ -114,6 +114,16 @@ func TestListEngramsAfter_ScanBudgetReturnsShortPageWithCursor(t *testing.T) {
 	}
 }
 
+func TestListEngramsAfter_RejectsNonPositiveLimit(t *testing.T) {
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+	for _, limit := range []int{0, -1} {
+		if _, _, err := eng.ListEngramsAfter(context.Background(), "keyset-limit", nil, limit); err == nil {
+			t.Fatalf("limit %d: want error", limit)
+		}
+	}
+}
+
 func TestListEngramsAfter_CursorRowDeletedBetweenPages(t *testing.T) {
 	eng, cleanup := testEnv(t)
 	defer cleanup()

@@ -1052,6 +1052,7 @@ func TestSmoke_AllMCPTools(t *testing.T) {
 
 		// Keyset mode walks the same active set one row per page.
 		seen := map[string]bool{}
+		returned := 0
 		after := ""
 		for page := 0; page < 1000; page++ {
 			keyset := mcpTool(t, tok, "muninn_owner_inventory", map[string]any{
@@ -1062,6 +1063,7 @@ func TestSmoke_AllMCPTools(t *testing.T) {
 			rows, _ := keyset["engrams"].([]any)
 			for _, row := range rows {
 				seen[row.(map[string]any)["id"].(string)] = true
+				returned++
 			}
 			next, _ := keyset["next_after_id"].(string)
 			if next == "" {
@@ -1069,8 +1071,9 @@ func TestSmoke_AllMCPTools(t *testing.T) {
 			}
 			after = next
 		}
-		if total, _ := result["total"].(float64); len(seen) != int(total) {
-			t.Errorf("muninn_owner_inventory keyset rows = %d, want offset total %v", len(seen), result["total"])
+		if total, _ := result["total"].(float64); len(seen) != int(total) || returned != len(seen) {
+			t.Errorf("muninn_owner_inventory keyset rows = %d distinct of %d returned, want offset total %v once each",
+				len(seen), returned, result["total"])
 		}
 	})
 

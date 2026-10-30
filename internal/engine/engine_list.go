@@ -2,6 +2,8 @@ package engine
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sort"
 	"time"
 
@@ -135,4 +137,60 @@ func (e *Engine) ListEngrams(ctx context.Context, params ListEngramsParams) (*Li
 	page := matched[params.Offset:end]
 
 	return &ListEngramsResult{Engrams: page, Total: total}, nil
+}
+
+// maxKeysetScanRows bounds the rows one keyset page visits, so a long run of
+// soft-deleted or archived rows returns a short page with a cursor instead of
+// running into the request deadline.
+// minimal: fixed budget (a var only so tests can shrink it); make it a
+// parameter if callers need different latency.
+var maxKeysetScanRows = 20_000
+
+var errKeysetPageDone = errors.New("keyset page done")
+
+// ListEngramsAfter is a passive keyset page over a vault in ascending ID (ULID
+// key) order. It returns up to limit non-deleted, non-archived engrams whose ID
+// is greater than after (nil = vault start), the same active set OwnerCensus
+// counts. next is the cursor for the following page, or nil once the scan has
+// reached the end of the vault. A page may hold fewer than limit rows while
+// next is non-nil (the per-page scan budget ran out).
+func (e *Engine) ListEngramsAfter(ctx context.Context, vault string, after *storage.ULID, limit int) (page []*storage.Engram, next *storage.ULID, err error) {
+	if limit < 1 {
+		return nil, nil, errors.New("list engrams after: limit must be at least 1")
+	}
+	ws := e.store.ResolveVaultPrefix(vault)
+	page = []*storage.Engram{}
+	visited := 0
+	var last storage.ULID
+	err = e.store.ScanEngramsFrom(ctx, ws, after, func(eng *storage.Engram) error {
+		if after != nil {
+			// The scan seeks by key; the cursor is the decoded ID. A record whose
+			// ID sorts before the cursor would send the next page backwards, so
+			// fail loudly instead of looping or skipping.
+			if c := storage.CompareULIDs(eng.ID, *after); c == 0 {
+				return nil
+			} else if c < 0 {
+				return fmt.Errorf("list engrams after: record %s sorts before cursor %s", eng.ID, *after)
+			}
+		}
+		active := eng.State != storage.StateSoftDeleted && eng.State != storage.StateArchived
+		// A full page stops only at the next active row, so a vault whose
+		// remaining rows are all inactive reports nil next on this page.
+		if visited == maxKeysetScanRows || (active && len(page) == limit) {
+			return errKeysetPageDone
+		}
+		visited++
+		last = eng.ID
+		if active {
+			page = append(page, eng)
+		}
+		return nil
+	})
+	if errors.Is(err, errKeysetPageDone) {
+		return page, &last, nil
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	return page, nil, nil
 }

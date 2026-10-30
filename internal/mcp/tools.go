@@ -935,13 +935,14 @@ func allToolDefinitions() []ToolDefinition {
 		},
 		{
 			Name:        "muninn_owner_inventory",
-			Description: "Returns one passive engram inventory page plus the exact vault entity count. The response echoes limit and offset; continue until an explicit empty page at offset=total to prove complete enumeration.",
+			Description: "Returns one passive engram inventory page. Offset mode (offset): newest-first page plus total and the exact vault entity count; each page scans the whole vault, so deep passes are slow. Keyset mode (after_id, cannot be combined with offset): active engrams in ascending ID order after the cursor, with next_after_id; start with after_id=\"\", pass each next_after_id back, and stop when next_after_id is \"\". A keyset page can hold fewer than limit rows before the end. Keyset mode returns no total or entity_count; use muninn_owner_census for those.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"vault":  vaultProp,
-					"limit":  map[string]any{"type": "integer", "minimum": 1, "maximum": maxOwnerInventoryLimit, "default": defaultOwnerInventoryLimit, "description": "Page size (1-200, default 100)"},
-					"offset": map[string]any{"type": "integer", "minimum": 0, "maximum": maxOwnerInventoryOffset, "default": 0, "description": "Zero-based inventory offset"},
+					"vault":    vaultProp,
+					"limit":    map[string]any{"type": "integer", "minimum": 1, "maximum": maxOwnerInventoryLimit, "default": defaultOwnerInventoryLimit, "description": "Page size (1-200, default 100)"},
+					"offset":   map[string]any{"type": "integer", "minimum": 0, "maximum": maxOwnerInventoryOffset, "default": 0, "description": "Zero-based inventory offset"},
+					"after_id": map[string]any{"type": "string", "description": "Keyset cursor: \"\" to start, then the previous page's next_after_id"},
 				},
 				"required": []string{},
 			},

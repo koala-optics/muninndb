@@ -918,6 +918,14 @@ func fromERFEngram(e *erf.Engram) *Engram {
 // For ERF v2 records, populates Embedding from the parallel 0x18 key space using a forward-seek join.
 // Corrupt ERF records are skipped with a warning log.
 func (ps *PebbleStore) ScanEngrams(ctx context.Context, ws [8]byte, fn func(*Engram) error) error {
+	return ps.ScanEngramsFrom(ctx, ws, nil, fn)
+}
+
+// ScanEngramsFrom is ScanEngrams starting at the first engram whose ID is >= start
+// in key (ULID) order. A nil start scans the whole vault. Both iterators are
+// bounded at start, so the cost is proportional to the rows visited, not to the
+// rows before start.
+func (ps *PebbleStore) ScanEngramsFrom(ctx context.Context, ws [8]byte, start *ULID, fn func(*Engram) error) error {
 	wsNext := ws
 	for i := 7; i >= 0; i-- {
 		wsNext[i]++
@@ -932,6 +940,9 @@ func (ps *PebbleStore) ScanEngrams(ctx context.Context, ws [8]byte, fn func(*Eng
 	hi := make([]byte, 9)
 	hi[0] = prefix.Engram
 	copy(hi[1:], wsNext[:])
+	if start != nil {
+		lo = keys.EngramKey(ws, *start)
+	}
 
 	iter, err := ps.db.NewIter(&pebble.IterOptions{LowerBound: lo, UpperBound: hi})
 	if err != nil {
@@ -946,6 +957,9 @@ func (ps *PebbleStore) ScanEngrams(ctx context.Context, ws [8]byte, fn func(*Eng
 	eHi := make([]byte, 9)
 	eHi[0] = prefix.Embedding
 	copy(eHi[1:], wsNext[:])
+	if start != nil {
+		eLo = append(eLo, start[:]...)
+	}
 
 	embedIter, err := ps.db.NewIter(&pebble.IterOptions{LowerBound: eLo, UpperBound: eHi})
 	if err != nil {
@@ -969,6 +983,9 @@ func (ps *PebbleStore) ScanEngrams(ctx context.Context, ws [8]byte, fn func(*Eng
 
 		erfEng, decErr := erf.Decode(rawVal)
 		if decErr != nil {
+			var badID ULID
+			copy(badID[:], k[9:25])
+			slog.Warn("storage: scan engrams skipped undecodable record", "id", badID.String(), "err", decErr)
 			continue
 		}
 
@@ -1009,6 +1026,9 @@ func (ps *PebbleStore) ScanEngrams(ctx context.Context, ws [8]byte, fn func(*Eng
 		if err := fn(eng); err != nil {
 			return err
 		}
+	}
+	if err := embedIter.Error(); err != nil {
+		return fmt.Errorf("scan engrams: embedding iter: %w", err)
 	}
 	return iter.Error()
 }

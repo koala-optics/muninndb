@@ -1049,6 +1049,32 @@ func TestSmoke_AllMCPTools(t *testing.T) {
 		if entityCount, ok := result["entity_count"].(float64); !ok || entityCount < 3 {
 			t.Errorf("muninn_owner_inventory entity_count = %v, want at least 3", result["entity_count"])
 		}
+
+		// Keyset mode walks the same active set one row per page.
+		seen := map[string]bool{}
+		returned := 0
+		after := ""
+		for page := 0; page < 1000; page++ {
+			keyset := mcpTool(t, tok, "muninn_owner_inventory", map[string]any{
+				"vault":    vault,
+				"limit":    1,
+				"after_id": after,
+			})
+			rows, _ := keyset["engrams"].([]any)
+			for _, row := range rows {
+				seen[row.(map[string]any)["id"].(string)] = true
+				returned++
+			}
+			next, _ := keyset["next_after_id"].(string)
+			if next == "" {
+				break
+			}
+			after = next
+		}
+		if total, _ := result["total"].(float64); len(seen) != int(total) || returned != len(seen) {
+			t.Errorf("muninn_owner_inventory keyset rows = %d distinct of %d returned, want offset total %v once each",
+				len(seen), returned, result["total"])
+		}
 	})
 
 	t.Run("muninn_create_workflow_vault", func(t *testing.T) {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -1031,4 +1032,76 @@ func (ps *PebbleStore) ScanEngramsFrom(ctx context.Context, ws [8]byte, start *U
 		return fmt.Errorf("scan engrams: embedding iter: %w", err)
 	}
 	return iter.Error()
+}
+
+// ScanActiveEngrams iterates over the active engrams in the given vault
+// workspace (neither soft-deleted nor archived), calling fn for each, without
+// the 0x18 embedding join: only a v1 record's inline embedding is decoded. The
+// lifecycle state byte is read from the raw ERF record before any copy or
+// decode, so an inactive row costs one iterator step and a CRC32 check instead
+// of a full decode (zstd content, tags, associations). It yields exactly the
+// rows ScanEngrams yields with a state filter applied: those rows also decode
+// only when the same byte says active. Undecodable records are skipped with a
+// warning log, as in ScanEngrams.
+func (ps *PebbleStore) ScanActiveEngrams(ctx context.Context, ws [8]byte, fn func(*Engram) error) error {
+	wsNext := ws
+	for i := 7; i >= 0; i-- {
+		wsNext[i]++
+		if wsNext[i] != 0 {
+			break
+		}
+	}
+	lo := make([]byte, 9)
+	lo[0] = prefix.Engram
+	copy(lo[1:], ws[:])
+	hi := make([]byte, 9)
+	hi[0] = prefix.Engram
+	copy(hi[1:], wsNext[:])
+
+	iter, err := ps.db.NewIter(&pebble.IterOptions{LowerBound: lo, UpperBound: hi})
+	if err != nil {
+		return fmt.Errorf("scan active engrams: create iter: %w", err)
+	}
+	defer iter.Close()
+
+	for valid := iter.First(); valid; valid = iter.Next() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		k := iter.Key()
+		if len(k) < 25 { // 1 prefix + 8 ws + 16 ULID minimum
+			continue
+		}
+		value := iter.Value()
+		// A record too short to hold the state byte falls through to Decode,
+		// which rejects and logs it like ScanEngrams does.
+		if len(value) >= erf.FixedOverhead {
+			state := LifecycleState(value[erf.OffsetState])
+			if state == StateSoftDeleted || state == StateArchived {
+				// The state byte is not header-CRC protected, so a corrupt active
+				// row can read as inactive: keep the warning ScanEngrams logs.
+				if !erf.VerifyCRC32(value) {
+					logUndecodableScanRecord(k, errors.New("erf crc32 check failed"))
+				}
+				continue
+			}
+		}
+		rawVal := make([]byte, len(value))
+		copy(rawVal, value)
+		erfEng, decErr := erf.Decode(rawVal)
+		if decErr != nil {
+			logUndecodableScanRecord(k, decErr)
+			continue
+		}
+		if err := fn(fromERFEngram(erfEng)); err != nil {
+			return err
+		}
+	}
+	return iter.Error()
+}
+
+func logUndecodableScanRecord(key []byte, err error) {
+	var badID ULID
+	copy(badID[:], key[9:25])
+	slog.Warn("storage: scan active engrams skipped undecodable record", "id", badID.String(), "err", err)
 }

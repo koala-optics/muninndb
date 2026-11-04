@@ -164,7 +164,9 @@ func (s *MCPServer) handleRPC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), deadlineFor(&req))
+	// Detached from the POST connection so a client closing it early cannot
+	// cancel a tool call midway (the guarantee processAndPushSSE gives).
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), deadlineFor(&req))
 	defer cancel()
 
 	a := authFromContext(r.Context())
@@ -504,9 +506,12 @@ func (s *MCPServer) handleSSEMessage(w http.ResponseWriter, r *http.Request) {
 	s.processAndPushSSE(w, r, []chan []byte{sess.ch}, sessionID)
 }
 
-// handleStreamablePost handles POST /mcp requests. Supports both standalone
-// JSON-RPC (response in POST body) and the Streamable HTTP pattern where the
-// client also has an SSE connection open and expects responses on that stream.
+// handleStreamablePost handles POST /mcp requests. The response goes only in
+// this POST's body: the MCP Streamable HTTP spec forbids sending a response on
+// a GET-opened stream, and those streams are keyed by bearer token, which every
+// client of a shared token holds. Pushing replies there handed one client's
+// reply to every other client, where a colliding JSON-RPC id resolved the
+// wrong request (two sessions got the same error 3 ms apart, 2026-11-02).
 func (s *MCPServer) handleStreamablePost(w http.ResponseWriter, r *http.Request) {
 	if r.ContentLength > 1<<20 {
 		w.Header().Set("Content-Type", "application/json")
@@ -524,36 +529,7 @@ func (s *MCPServer) handleStreamablePost(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	r = r.WithContext(contextWithAuth(r.Context(), a))
-
-	// If the client also has SSE streams open, route through the async
-	// SSE handler so the response is pushed to ALL matching event streams
-	// (some clients read from SSE even when they POST to the base URL).
-	sseChannels := s.findSSEChannelsByToken(a.Token)
-	if len(sseChannels) > 0 {
-		s.processAndPushSSE(w, r, sseChannels, "streamable")
-		return
-	}
-
-	// No SSE stream — pure POST, return response in body.
 	s.handleRPC(w, r)
-}
-
-// findSSEChannelsByToken returns all SSE channels matching the given auth token.
-// Returns nil for empty tokens to prevent cross-session contamination on open
-// (no-auth) servers where every session has Token == "".
-func (s *MCPServer) findSSEChannelsByToken(token string) []chan []byte {
-	if token == "" {
-		return nil
-	}
-	s.sseSessionsMu.RLock()
-	defer s.sseSessionsMu.RUnlock()
-	var channels []chan []byte
-	for _, sess := range s.sseSessions {
-		if sess.auth.Token == token {
-			channels = append(channels, sess.ch)
-		}
-	}
-	return channels
 }
 
 // processAndPushSSE processes a JSON-RPC request, writes the response to the

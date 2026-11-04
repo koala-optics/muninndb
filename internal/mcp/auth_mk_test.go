@@ -879,22 +879,6 @@ func TestSSEMessage_RequiresAuth_WhenServerHasToken(t *testing.T) {
 	}
 }
 
-// --- findSSEChannelsByToken with empty token ---
-
-func TestFindSSEChannelsByToken_EmptyToken_ReturnsNil(t *testing.T) {
-	srv := New(":0", &fakeEngine{}, "", nil, nil, nil)
-
-	srv.sseSessionsMu.Lock()
-	srv.sseSessions["s1"] = &sseSession{ch: make(chan []byte, 4), auth: AuthContext{Token: ""}}
-	srv.sseSessions["s2"] = &sseSession{ch: make(chan []byte, 4), auth: AuthContext{Token: ""}}
-	srv.sseSessionsMu.Unlock()
-
-	channels := srv.findSSEChannelsByToken("")
-	if len(channels) != 0 {
-		t.Errorf("empty token should return no channels (prevents cross-session contamination), got %d", len(channels))
-	}
-}
-
 // --- Error message consistency ---
 
 func TestErrorMessages_NoInternalStateLeakage(t *testing.T) {

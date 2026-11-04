@@ -1,29 +1,31 @@
 package mcp
 
-// server_sse_test.go — concurrency tests for SSE session mutex (#174).
+// server_sse_test.go — SSE session locking (#174) and reply pairing.
 //
-// Root cause: sseSessionsMu was sync.Mutex; findSSEChannelsByToken and
-// handleSSEMessage held an exclusive write lock during read-only map
-// operations. Under rapid consecutive stores (e.g. Claude Code batch
-// remember calls), concurrent POST goroutines serialized at the mutex,
-// causing temporary MCP server unresponsiveness.
-//
-// Fix: sync.Mutex → sync.RWMutex; read paths use RLock/RUnlock.
-//
+// #174: sseSessionsMu was sync.Mutex, so read-only session lookups serialized
+// concurrent POSTs. Fix: sync.RWMutex; read paths use RLock/RUnlock.
 // Run with -race to verify correctness under concurrent read/write access.
+//
+// Reply pairing: a POST /mcp reply used to be pushed to every SSE stream opened
+// with the same bearer token. Clients sharing a token (every Claude Code
+// session) then received each other's replies, and a colliding JSON-RPC id
+// resolved the wrong request.
 
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
 
-// TestSSESessions_ConcurrentReadWrite is a race-detector test that exercises
-// concurrent reads (findSSEChannelsByToken) and writes (add/delete sessions)
-// simultaneously. Run with: go test -race ./internal/mcp/...
+// TestSSESessions_ConcurrentReadWrite is a race-detector test: SSE streams
+// connect and disconnect while concurrent /mcp/message POSTs look sessions up.
+// Run with: go test -race ./internal/mcp/...
 func TestSSESessions_ConcurrentReadWrite(t *testing.T) {
 	srv := newTestServer()
 
@@ -53,15 +55,15 @@ func TestSSESessions_ConcurrentReadWrite(t *testing.T) {
 		}
 	}()
 
-	// Readers: simulate concurrent POST /mcp requests each calling
-	// findSSEChannelsByToken. With the old sync.Mutex, these serialized.
-	// With sync.RWMutex, they run concurrently.
+	// Readers: concurrent /mcp/message POSTs, each looking up its session.
 	for r := 0; r < 10; r++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for ctx.Err() == nil {
-				_ = srv.findSSEChannelsByToken("tok")
+				req := httptest.NewRequest(http.MethodPost, "/mcp/message?sessionId=sess1",
+					strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"ping"}`))
+				srv.handleSSEMessage(httptest.NewRecorder(), req)
 				runtime.Gosched()
 			}
 		}()
@@ -71,68 +73,37 @@ func TestSSESessions_ConcurrentReadWrite(t *testing.T) {
 	// If this completes without -race warnings, lock discipline is correct.
 }
 
-// TestFindSSEChannelsByToken_ReturnsCorrectChannels verifies that
-// findSSEChannelsByToken returns only channels for the matching token.
-func TestFindSSEChannelsByToken_ReturnsCorrectChannels(t *testing.T) {
-	srv := newTestServer()
-
-	ch1 := make(chan []byte, 4)
-	ch2 := make(chan []byte, 4)
-	ch3 := make(chan []byte, 4)
-
+// TestStreamablePost_ReplyOnlyInPostBody: two clients share a token and each
+// holds an open SSE stream. Replies to POST /mcp, a valid call and an invalid
+// one, both with an id the other client also uses, go only in the POST body.
+func TestStreamablePost_ReplyOnlyInPostBody(t *testing.T) {
+	srv := New(":0", &fakeEngine{}, "mdb_shared", nil, nil, nil)
+	streams := []chan []byte{make(chan []byte, 8), make(chan []byte, 8)}
 	srv.sseSessionsMu.Lock()
-	srv.sseSessions["s1"] = &sseSession{ch: ch1, auth: AuthContext{Token: "token-a"}}
-	srv.sseSessions["s2"] = &sseSession{ch: ch2, auth: AuthContext{Token: "token-b"}}
-	srv.sseSessions["s3"] = &sseSession{ch: ch3, auth: AuthContext{Token: "token-a"}}
+	for i, ch := range streams {
+		srv.sseSessions[fmt.Sprintf("client%d", i)] = &sseSession{
+			ch:   ch,
+			auth: AuthContext{Token: "mdb_shared", Authorized: true},
+		}
+	}
 	srv.sseSessionsMu.Unlock()
 
-	got := srv.findSSEChannelsByToken("token-a")
-	if len(got) != 2 {
-		t.Errorf("expected 2 channels for token-a, got %d", len(got))
-	}
-
-	got = srv.findSSEChannelsByToken("token-b")
-	if len(got) != 1 {
-		t.Errorf("expected 1 channel for token-b, got %d", len(got))
-	}
-
-	got = srv.findSSEChannelsByToken("no-such-token")
-	if len(got) != 0 {
-		t.Errorf("expected 0 channels for unknown token, got %d", len(got))
-	}
-}
-
-// TestFindSSEChannelsByToken_EmptyMap verifies correct behavior when no
-// sessions exist.
-func TestFindSSEChannelsByToken_EmptyMap(t *testing.T) {
-	srv := newTestServer()
-	got := srv.findSSEChannelsByToken("any-token")
-	if len(got) != 0 {
-		t.Errorf("expected 0 channels from empty map, got %d", len(got))
-	}
-}
-
-// BenchmarkFindSSEChannelsByToken_Parallel measures throughput of concurrent
-// readers. With sync.Mutex (bug), goroutines serialize. With sync.RWMutex
-// (fix), readers run in parallel — throughput should scale with GOMAXPROCS.
-//
-// Run: go test -bench=BenchmarkFindSSEChannelsByToken_Parallel ./internal/mcp/...
-func BenchmarkFindSSEChannelsByToken_Parallel(b *testing.B) {
-	srv := newTestServer()
-
-	// Populate with 5 sessions (typical Claude Code usage: 1-3 SSE streams).
-	for i := 0; i < 5; i++ {
-		id := fmt.Sprintf("sess%d", i)
-		srv.sseSessions[id] = &sseSession{
-			ch:   make(chan []byte, 64),
-			auth: AuthContext{Token: "bench-token"},
+	for _, tc := range []struct{ body, want string }{
+		{`{"jsonrpc":"2.0","id":7,"method":"ping"}`, `"result":{}`},
+		{`{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"muninn_no_such_tool","arguments":{}}}`,
+			`unknown tool: muninn_no_such_tool`},
+	} {
+		r := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(tc.body))
+		r.Header.Set("Authorization", "Bearer mdb_shared")
+		w := httptest.NewRecorder()
+		srv.handleStreamablePost(w, r)
+		if got := w.Body.String(); !strings.Contains(got, `"id":7`) || !strings.Contains(got, tc.want) {
+			t.Fatalf("POST body = %q, want id 7 and %q", got, tc.want)
 		}
 	}
-
-	b.ResetTimer()
-	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
-			_ = srv.findSSEChannelsByToken("bench-token")
+	for i, ch := range streams {
+		if n := len(ch); n != 0 {
+			t.Fatalf("SSE stream %d received %d replies to POST /mcp, want 0: %q", i, n, <-ch)
 		}
-	})
+	}
 }

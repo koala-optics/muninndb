@@ -20,11 +20,13 @@ type ownerCensusTestEngine struct {
 	calls  int
 	vault  string
 	budget time.Duration
+	ctxErr error
 }
 
 func (e *ownerCensusTestEngine) OwnerCensus(ctx context.Context, vault string) (*OwnerCensusResult, error) {
 	e.calls++
 	e.vault = vault
+	e.ctxErr = ctx.Err()
 	if deadline, ok := ctx.Deadline(); ok {
 		e.budget = time.Until(deadline)
 	}
@@ -40,9 +42,9 @@ func TestHandleOwnerCensus_GetsLongerDeadline(t *testing.T) {
 	}
 }
 
-// A streamable POST whose token also holds an open SSE stream is dispatched by
-// processAndPushSSE, not handleRPC; the census must get the same deadline there
-// (rc.5 production: census cut off at 30.1s on this path).
+// A streamable POST whose token also holds an open SSE stream (every Claude
+// Code session) must get the census deadline too (rc.5 production: census cut
+// off at 30.1s on this path when it went through processAndPushSSE).
 func TestStreamablePost_OwnerCensusWithOpenSSE_GetsLongerDeadline(t *testing.T) {
 	eng := &ownerCensusTestEngine{result: &OwnerCensusResult{IdentitySHA256: strings.Repeat("ab", 32)}}
 	srv := New(":0", eng, "mdb_census", nil, nil, nil)
@@ -63,6 +65,22 @@ func TestStreamablePost_OwnerCensusWithOpenSSE_GetsLongerDeadline(t *testing.T) 
 	}
 	if eng.budget <= requestDeadline || eng.budget > ownerCensusDeadline {
 		t.Fatalf("census deadline budget via SSE = %v, want in (%v, %v]", eng.budget, requestDeadline, ownerCensusDeadline)
+	}
+}
+
+// A client closing its POST early must not cancel the tool call midway.
+func TestStreamablePost_ClientCancelDoesNotCancelToolCall(t *testing.T) {
+	eng := &ownerCensusTestEngine{result: &OwnerCensusResult{IdentitySHA256: strings.Repeat("ab", 32)}}
+	srv := New(":0", eng, "", nil, nil, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"muninn_owner_census","arguments":{}}}`
+	r := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body)).WithContext(ctx)
+	srv.handleStreamablePost(httptest.NewRecorder(), r)
+
+	if eng.calls != 1 || eng.ctxErr != nil {
+		t.Fatalf("census calls = %d, ctx err = %v; want 1 call on a live context", eng.calls, eng.ctxErr)
 	}
 }
 

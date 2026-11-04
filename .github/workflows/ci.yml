@@ -308,7 +308,8 @@ jobs:
   # ── Playwright E2E: browser-level UI regression tests ────────────────
   playwright-e2e:
     name: Playwright E2E tests
-    runs-on: ubuntu-latest
+    # Pinned: Playwright ships no chromium for ubuntu-latest's 26.04 image yet.
+    runs-on: ubuntu-24.04
     needs: go
 
     steps:

@@ -73,14 +73,15 @@ func ownerCensusRowHash(engram *storage.Engram) [32]byte {
 // the SHA-256 of the lexicographically sorted per-row hashes, so it is
 // independent of scan order and equal iff the active identity sets are
 // equal. Soft-deleted and archived engrams are excluded - the same active
-// filter ListEngrams applies by default.
+// filter ListEngrams applies by default. ScanActiveEngrams skips them before
+// decoding and joins no embeddings: production holds about 6x more
+// soft-deleted rows than active ones (897,729 rows, 140,415 active on
+// 2026-11-04), and the decode-everything scan was ~13 s of a 14 s census there
+// and exceeded the 55 s deadline on a longer-running machine.
 func (e *Engine) OwnerCensus(ctx context.Context, vault string) (*OwnerCensusResult, error) {
 	ws := e.store.ResolveVaultPrefix(vault)
 	rowHashes := make([][32]byte, 0, 1024)
-	err := e.store.ScanEngrams(ctx, ws, func(engram *storage.Engram) error {
-		if engram.State == storage.StateSoftDeleted || engram.State == storage.StateArchived {
-			return nil
-		}
+	err := e.store.ScanActiveEngrams(ctx, ws, func(engram *storage.Engram) error {
 		rowHashes = append(rowHashes, ownerCensusRowHash(engram))
 		return nil
 	})

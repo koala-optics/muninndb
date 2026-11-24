@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -73,6 +74,13 @@ type PebbleStore struct {
 	// recentActiveCache: [8]byte (wsPrefix) → *recentActiveCacheEntry
 	// Caches RecentActive results per vault with a 100ms TTL to avoid repeated SSTable scans.
 	recentActiveCache sync.Map
+	// entityNameCaches: [8]byte (wsPrefix) → *vaultEntityNameCache
+	// Distinct entity names per vault for the fuzzy entity resolver, maintained
+	// by the 0x20 link mutators (see entity_name_cache.go).
+	entityNameCaches   sync.Map
+	entityNameCacheOff atomic.Bool
+	// entityNameCacheBuilds counts full 0x20 scans done to (re)build a cache.
+	entityNameCacheBuilds atomic.Int64
 	// transCache is the tiered PAS transition cache (in-memory hot + Pebble warm).
 	// All transition reads/writes go through this layer; Pebble is only hit on
 	// cold-start loads and periodic flushes.
@@ -203,6 +211,9 @@ func NewPebbleStore(db *pebble.DB, cfg PebbleStoreConfig) *PebbleStore {
 	ps.transCache = NewTransitionCache(ps)
 	ps.archiveBloom = ps.RebuildArchiveBloom()
 	ps.repLogAppend = cfg.RepLogAppend
+	if os.Getenv("MUNINN_ENTITY_NAME_CACHE") == "0" {
+		ps.entityNameCacheOff.Store(true)
+	}
 	return ps
 }
 

@@ -230,6 +230,7 @@ func (ps *PebbleStore) WriteEntityEngramLink(ctx context.Context, ws [8]byte, en
 		return err
 	}
 	ps.replicateBatch(batch)
+	ps.noteEntityLinkWritten(ws, [16]byte(engramID), entityName)
 	return nil
 }
 
@@ -276,6 +277,8 @@ func (ps *PebbleStore) RelinkEntityEngramLink(ctx context.Context, ws [8]byte, e
 		return err
 	}
 	ps.replicateBatch(batch)
+	ps.noteEntityLinkDeleted(ws, id, fromEntity)
+	ps.noteEntityLinkWritten(ws, id, toEntity)
 	return nil
 }
 
@@ -300,6 +303,7 @@ func (ps *PebbleStore) DeleteEntityEngramLink(ctx context.Context, ws [8]byte, e
 		return err
 	}
 	ps.replicateBatch(batch)
+	ps.noteEntityLinkDeleted(ws, [16]byte(engramID), entityName)
 	return nil
 }
 

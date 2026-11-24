@@ -60,8 +60,10 @@ func entityTokens(name string) []string {
 // determinism; containment is the only threshold, so there is no similarity
 // number to tune.
 //
-// Vaults hold few distinct entity names, so this is an in-memory scan over
-// the 0x20 forward index (ScanVaultEntityNames) — no new index required.
+// The vault's distinct entity names come from the store's entity-name cache
+// (VaultEntityNames), not a per-call walk of the 0x20 forward index: that
+// index holds one key per engram-entity link, so walking it on every exact-name
+// miss cost seconds on a large vault.
 func (e *Engine) resolveEntityFuzzy(ctx context.Context, ws [8]byte, query string) []string {
 	qTokens := entityTokens(query)
 	if len(qTokens) == 0 {
@@ -78,10 +80,14 @@ func (e *Engine) resolveEntityFuzzy(ctx context.Context, ws [8]byte, query strin
 		score float64
 	}
 	var cands []candidate
-	_ = e.store.ScanVaultEntityNames(ctx, ws, func(name string) error {
+	// VaultEntityNames is the cached equivalent of ScanVaultEntityNames: the
+	// same names, without walking every 0x20 link on each miss. Its order is
+	// unspecified, which the total order of the sort below makes irrelevant.
+	vaultNames, _ := e.store.VaultEntityNames(ctx, ws)
+	for _, name := range vaultNames {
 		tokens := entityTokens(name)
 		if len(tokens) == 0 {
-			return nil
+			continue
 		}
 		set := make(map[string]struct{}, len(tokens))
 		for _, tok := range tokens {
@@ -98,15 +104,14 @@ func (e *Engine) resolveEntityFuzzy(ctx context.Context, ws [8]byte, query strin
 		// equals the size of whichever set is smaller.
 		contained := shared == len(set) || shared == len(qSet)
 		if !contained && !joinedEqual {
-			return nil
+			continue
 		}
 		score := float64(shared) / float64(len(set)+len(qSet)-shared)
 		if joinedEqual {
 			score = 1.0
 		}
 		cands = append(cands, candidate{name: name, score: score})
-		return nil
-	})
+	}
 
 	sort.Slice(cands, func(i, j int) bool {
 		if cands[i].score != cands[j].score {

@@ -1,7 +1,9 @@
 package engine
 
 import (
+	"bytes"
 	"context"
+	"sort"
 	"testing"
 
 	"github.com/scrypster/muninndb/internal/storage"
@@ -125,14 +127,17 @@ func TestFindByConcept_MultipleEngramsSameConcept(t *testing.T) {
 	id3, err := eng.store.WriteEngram(ctx, ws, &storage.Engram{Concept: concept, Content: "v3"})
 	require.NoError(t, err)
 
-	// Limit=2 should return the 2 newest (id3 + id2), not id1.
+	// "Newest" is ULID order, not write order: ULIDs minted in the same
+	// millisecond are not ordered by creation, so rank the three by ID.
+	ids := []storage.ULID{id1, id2, id3}
+	sort.Slice(ids, func(i, j int) bool { return bytes.Compare(ids[i][:], ids[j][:]) > 0 })
+
+	// Limit=2 should return the 2 newest by ULID, not the oldest.
 	results, err := eng.FindByConcept(ctx, vault, concept, 2)
 	require.NoError(t, err)
 	require.Len(t, results, 2, "limit should cap to 2")
-	require.Equal(t, id3, results[0].ID, "newest should come first")
-	require.Equal(t, id2, results[1].ID, "second-newest should come second")
-	require.NotEqual(t, id1, results[0].ID)
-	require.NotEqual(t, id1, results[1].ID)
+	require.Equal(t, ids[0], results[0].ID, "newest should come first")
+	require.Equal(t, ids[1], results[1].ID, "second-newest should come second")
 
 	// Limit=50 should return all 3.
 	results, err = eng.FindByConcept(ctx, vault, concept, 50)

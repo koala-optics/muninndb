@@ -151,11 +151,16 @@ jobs:
       - name: Fetch ORT DLL
         if: steps.asset-cache-win.outputs.cache-hit != 'true'
         run: |
-          Write-Host "Downloading ORT 1.24.2 for windows/amd64..."
-          Invoke-WebRequest -Uri "https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-win-x64-1.24.2.zip" -OutFile "$env:TEMP\ort-win-x64.zip"
-          Expand-Archive -Path "$env:TEMP\ort-win-x64.zip" -DestinationPath "$env:TEMP\ort-extract" -Force
-          $dll = Get-ChildItem -Path "$env:TEMP\ort-extract" -Recurse -Filter "onnxruntime.dll" | Select-Object -First 1
-          Copy-Item $dll.FullName -Destination "internal/plugin/embed/assets/onnxruntime_windows_amd64.dll"
+          # github.com/microsoft/onnxruntime has returned 404 since 2026-11-17, so the
+          # DLL comes from Microsoft's NuGet package, pinned by sha256 (package and DLL).
+          Write-Host "Downloading ORT 1.24.2 for windows/amd64 (NuGet)..."
+          $pkg = "$env:TEMP\ort-nuget.zip"
+          Invoke-WebRequest -Uri "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.24.2/microsoft.ml.onnxruntime.1.24.2.nupkg" -OutFile $pkg
+          if ((Get-FileHash $pkg -Algorithm SHA256).Hash -ne "782564d3d68e87269ea1812cc94710ad06fe014faf093f01a6f89d0bd58719d3") { throw "ORT NuGet package sha256 mismatch" }
+          Expand-Archive -Path $pkg -DestinationPath "$env:TEMP\ort-extract" -Force
+          $dll = "$env:TEMP\ort-extract\runtimes\win-x64\native\onnxruntime.dll"
+          if ((Get-FileHash $dll -Algorithm SHA256).Hash -ne "114947d633e6844ce3c4b51ef6678f776628571d08a5763859c61642c8dcca9c") { throw "ORT DLL sha256 mismatch" }
+          Copy-Item $dll -Destination "internal/plugin/embed/assets/onnxruntime_windows_amd64.dll"
           Write-Host "DLL size: $((Get-Item 'internal/plugin/embed/assets/onnxruntime_windows_amd64.dll').Length / 1MB) MB"
         shell: pwsh
 

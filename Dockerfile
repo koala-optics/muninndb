@@ -8,7 +8,7 @@ WORKDIR /src
 ARG TARGETARCH
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl make ca-certificates \
+    curl make ca-certificates unzip \
     && rm -rf /var/lib/apt/lists/*
 
 # Node.js for Tailwind/Vite CSS build

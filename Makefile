@@ -5,6 +5,14 @@ ORT_VERSION_DARWIN_AMD64 := 1.23.2
 MODEL_REPO  := Xenova/bge-small-en-v1.5
 HF_BASE     := https://huggingface.co/$(MODEL_REPO)/resolve/main
 ORT_BASE    := https://github.com/microsoft/onnxruntime/releases/download/v$(ORT_VERSION)
+# linux/amd64 comes from Microsoft's NuGet package: github.com/microsoft/onnxruntime
+# (releases included) has returned 404 since 2026-11-17. Both hashes are for
+# 1.24.2; the library hash equals the libonnxruntime.so.1.24.2 from the GitHub
+# release tarball that earlier builds embedded. Changing ORT_VERSION requires
+# new hashes; the fetch fails closed on a mismatch.
+ORT_NUGET_URL          := https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/$(ORT_VERSION)/microsoft.ml.onnxruntime.$(ORT_VERSION).nupkg
+ORT_NUGET_SHA256       := 782564d3d68e87269ea1812cc94710ad06fe014faf093f01a6f89d0bd58719d3
+ORT_LINUX_AMD64_SHA256 := ffc84d48e845cf0b562ba4ea5ca32aaafc0d4069019fef4f63095b307d0270ad
 
 .PHONY: fetch-assets fetch-model fetch-ort-libs clean-assets web css build test bench test-integration \
         eval-bible-setup eval-bible eval-bible-full eval-bible-quick eval-bible-export eval-bible-fast \
@@ -61,14 +69,13 @@ _ort-darwin-amd64:
 	@echo "    darwin/amd64: $$(du -sh $(ASSETS_DIR)/libonnxruntime_darwin_amd64.dylib | cut -f1)"
 
 _ort-linux-amd64:
-	@echo "    Fetching linux/amd64..."
-	@curl -fL --progress-bar \
-		"$(ORT_BASE)/onnxruntime-linux-x64-$(ORT_VERSION).tgz" \
-		-o "/tmp/ort-linux-amd64.tgz"
-	@tar -xzf /tmp/ort-linux-amd64.tgz -C /tmp onnxruntime-linux-x64-$(ORT_VERSION)/lib/libonnxruntime.so.$(ORT_VERSION) 2>/dev/null || \
-		tar -xzf /tmp/ort-linux-amd64.tgz -C /tmp --strip-components=2 --wildcards '*/lib/libonnxruntime.so.*'
-	@cp /tmp/onnxruntime-linux-x64-$(ORT_VERSION)/lib/libonnxruntime.so.$(ORT_VERSION) $(ASSETS_DIR)/libonnxruntime_linux_amd64.so 2>/dev/null || \
-		find /tmp -name 'libonnxruntime.so.*' | head -1 | xargs -I{} cp {} $(ASSETS_DIR)/libonnxruntime_linux_amd64.so
+	@echo "    Fetching linux/amd64 (NuGet, sha256-pinned)..."
+	@curl -fL --progress-bar "$(ORT_NUGET_URL)" -o /tmp/ort-nuget.nupkg
+	@echo "$(ORT_NUGET_SHA256)  /tmp/ort-nuget.nupkg" | sha256sum -c -
+	@unzip -p /tmp/ort-nuget.nupkg runtimes/linux-x64/native/libonnxruntime.so > $(ASSETS_DIR)/libonnxruntime_linux_amd64.so
+	@echo "$(ORT_LINUX_AMD64_SHA256)  $(ASSETS_DIR)/libonnxruntime_linux_amd64.so" | sha256sum -c - || \
+		{ rm -f $(ASSETS_DIR)/libonnxruntime_linux_amd64.so; exit 1; }
+	@rm -f /tmp/ort-nuget.nupkg
 	@echo "    linux/amd64: $$(du -sh $(ASSETS_DIR)/libonnxruntime_linux_amd64.so | cut -f1)"
 
 _ort-linux-arm64:

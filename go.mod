@@ -1,6 +1,6 @@
 module github.com/scrypster/muninndb
 
-go 1.26.10
+go 1.26.11
 
 require (
 	github.com/bits-and-blooms/bloom/v3 v3.7.1
@@ -8,7 +8,7 @@ require (
 	github.com/dchest/siphash v1.2.3
 	github.com/google/uuid v1.6.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
-	github.com/klauspost/compress v1.18.7
+	github.com/klauspost/compress v1.20.2
 	github.com/kljensen/snowball v0.10.0
 	github.com/oklog/ulid/v2 v2.1.1
 	github.com/pelletier/go-toml/v2 v2.2.4

@@ -15,7 +15,7 @@ on:
       baseline_image:
         description: Digest-pinned stock v0.9 baseline image
         required: true
-        default: ghcr.io/scrypster/muninndb@sha256:1c4995f489bbb21590190bf9bcc45b5ed25cd4f24c50b46d0297fcd8fdc37053
+        default: ghcr.io/koala-optics/muninndb@sha256:f9fb1c7753ef9958ff0f1e6f864280e866f79ff036935d0fd3b4a38b35546bfd
         type: string
 
 permissions:

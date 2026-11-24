@@ -591,6 +591,9 @@ func (ps *PebbleStore) DeleteEngram(ctx context.Context, wsPrefix [8]byte, id UL
 	}
 	mu.Unlock()
 	ps.replicateBatch(batch)
+	for _, name := range entityNames {
+		ps.noteEntityLinkDeleted(wsPrefix, [16]byte(id), name)
+	}
 
 	ps.cache.Delete(wsPrefix, id)
 

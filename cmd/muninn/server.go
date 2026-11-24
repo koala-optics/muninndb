@@ -1311,6 +1311,23 @@ func runServer() {
 		}
 	}
 	store := storage.NewPebbleStore(db, storeCfg)
+	if clusterCfg.Enabled {
+		// The replication applier writes entity links straight to Pebble,
+		// bypassing the hooks that keep the entity-name cache exact.
+		store.DisableEntityNameCache()
+	} else {
+		// Pre-build each vault's entity-name cache so the first fuzzy entity
+		// lookup after a restart does not pay the full link-index scan.
+		go func() {
+			names, err := store.ListVaultNames()
+			if err != nil {
+				return
+			}
+			for _, name := range names {
+				_, _ = store.VaultEntityNames(context.Background(), store.ResolveVaultPrefix(name))
+			}
+		}()
+	}
 
 	// Run startup migrations before the engine is built.
 	runStartupMigrations(context.Background(), store)
@@ -1635,6 +1652,7 @@ func runServer() {
 	// Wire coordinator factory so the admin enable endpoint can start cluster
 	// at runtime (without a restart) when cluster.yaml is written via the UI/CLI.
 	restServer.SetCoordinatorFactory(func(_ context.Context, cfg plugincfg.ClusterConfig) (*replication.ClusterCoordinator, error) {
+		store.DisableEntityNameCache() // the applier below bypasses its hooks
 		repLog := replication.NewReplicationLog(db)
 		applier := replication.NewApplier(db)
 		epochStore, err := replication.NewEpochStore(db)

@@ -226,3 +226,78 @@ func TestFindByEntity_ExcludesSoftDeleted(t *testing.T) {
 	require.True(t, foundActive, "active engram A should appear in FindByEntity results")
 	require.False(t, foundDeleted, "soft-deleted engram B should NOT appear in FindByEntity results")
 }
+
+// TestFindByEntity_MissDoesNotRescanLinkIndex covers the exact-name-miss path:
+// a near-variant resolves to the same engrams as the exact name, a name that
+// matches nothing returns nothing, the pager's end-of-data probe keeps the
+// resolution, and none of the misses after the first walks the vault's link
+// index again — including for an entity written after the first miss.
+func TestFindByEntity_MissDoesNotRescanLinkIndex(t *testing.T) {
+	t.Parallel()
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	const vault = "find-by-entity-miss"
+	ws := eng.store.ResolveVaultPrefix(vault)
+
+	link := func(entity string, n int) []storage.ULID {
+		ids := make([]storage.ULID, 0, n)
+		for i := 0; i < n; i++ {
+			id, err := eng.store.WriteEngram(ctx, ws, &storage.Engram{Concept: entity, Content: "about " + entity})
+			require.NoError(t, err)
+			require.NoError(t, eng.store.WriteEntityEngramLink(ctx, ws, id, entity))
+			ids = append(ids, id)
+		}
+		return ids
+	}
+	idsOf := func(res *FindByEntityResult) []storage.ULID {
+		ids := make([]storage.ULID, 0, len(res.Engrams))
+		for _, e := range res.Engrams {
+			ids = append(ids, e.ID)
+		}
+		return ids
+	}
+
+	link("cop:Tayyab Shahzad", 9)
+	link("cop:Walmart", 3)
+
+	exact, err := eng.FindByEntity(ctx, vault, "cop:Tayyab Shahzad", 500, 0)
+	require.NoError(t, err)
+	require.False(t, exact.Fuzzy)
+	require.Len(t, exact.Engrams, 9)
+
+	// First miss builds the vault's entity-name cache.
+	fuzzy, err := eng.FindByEntity(ctx, vault, "cop:Tayyab", 500, 0)
+	require.NoError(t, err)
+	require.True(t, fuzzy.Fuzzy)
+	require.Equal(t, "cop:Tayyab Shahzad", fuzzy.MatchedEntity)
+	require.Equal(t, idsOf(exact), idsOf(fuzzy), "a fuzzy hit must return the exact name's rows in the same order")
+	builds := eng.store.EntityNameCacheBuilds()
+
+	// Pager end-of-data probe: empty page, resolution kept.
+	probe, err := eng.FindByEntity(ctx, vault, "cop:Tayyab", 500, 9)
+	require.NoError(t, err)
+	require.Empty(t, probe.Engrams)
+	require.Equal(t, "cop:Tayyab Shahzad", probe.MatchedEntity)
+
+	// A name with no exact and no fuzzy entity.
+	for i := 0; i < 3; i++ {
+		none, err := eng.FindByEntity(ctx, vault, "cop:Zzqxv Nobody", 500, 0)
+		require.NoError(t, err)
+		require.Empty(t, none.Engrams)
+		require.Empty(t, none.MatchedEntity)
+		require.False(t, none.Fuzzy)
+	}
+
+	// An entity first written after the cache was built resolves fuzzily too.
+	newIDs := link("cop:Fross Zelnick", 2)
+	late, err := eng.FindByEntity(ctx, vault, "cop:Fross", 500, 0)
+	require.NoError(t, err)
+	require.True(t, late.Fuzzy)
+	require.Equal(t, "cop:Fross Zelnick", late.MatchedEntity)
+	require.ElementsMatch(t, newIDs, idsOf(late))
+
+	require.Equal(t, builds, eng.store.EntityNameCacheBuilds(),
+		"misses after the first must be served from the entity-name cache")
+}

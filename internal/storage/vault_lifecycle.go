@@ -122,6 +122,7 @@ func (ps *PebbleStore) clearVault(ctx context.Context, ws [8]byte) (int64, error
 	if err := batch.Commit(pebble.Sync); err != nil {
 		return 0, fmt.Errorf("clear vault: commit: %w", err)
 	}
+	ps.invalidateEntityNameCache(ws)
 	for name, count := range entityMentions {
 		for i := 0; i < count; i++ {
 			if err := ps.DecrementEntityMentionCount(ctx, name); err != nil {
